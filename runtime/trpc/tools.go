@@ -171,6 +171,12 @@ func (rt *Runtime) workspaceFrom(ctx context.Context, fallback string) string {
 
 func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 	ws := func(ctx context.Context) string { return rt.workspaceFrom(ctx, fallback) }
+	for _, name := range []string{
+		"read_file", "list_file", "search_file", "search_content", "read_multiple_files",
+		"save_file", "replace_content", "run_command", "git_status", "git_diff", "memory_recall",
+	} {
+		rt.noteSelfGated(name)
+	}
 	tools := []tool.Tool{
 		function.NewFunctionTool(func(ctx context.Context, in readIn) (map[string]any, error) {
 			text, err := coding.ReadLimited(ws(ctx), in.FileName, coding.ReadLimit{
@@ -346,7 +352,29 @@ func (t gatedTool) Call(ctx context.Context, args []byte) (any, error) {
 	return t.inner.Call(ctx, args)
 }
 
+func (rt *Runtime) noteSelfGated(name string) {
+	if rt == nil || name == "" {
+		return
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.selfGated == nil {
+		rt.selfGated = map[string]struct{}{}
+	}
+	rt.selfGated[name] = struct{}{}
+}
+
+func (rt *Runtime) isSelfGated(name string) bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	_, ok := rt.selfGated[name]
+	return ok
+}
+
 func (rt *Runtime) gate(item tool.Tool, kind string) tool.Tool {
+	if item != nil && item.Declaration() != nil {
+		rt.noteSelfGated(item.Declaration().Name)
+	}
 	callable, ok := item.(tool.CallableTool)
 	if !ok || rt == nil {
 		return rejectedTool{inner: item, rt: rt, kind: kind}

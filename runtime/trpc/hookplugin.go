@@ -78,6 +78,16 @@ func (p *hookPlugin) beforeTool(ctx context.Context, args *tool.BeforeToolArgs) 
 			"error":  err.Error(),
 		}}, nil
 	}
+	// Tools built by this runtime authorize themselves. A subagent's own
+	// tools do not, so they pass through the same permission gate here.
+	if p.rt != nil && !p.rt.isSelfGated(args.ToolName) {
+		if err := p.rt.authorize(ctx, "side_effect", args.ToolName, ""); err != nil {
+			return &tool.BeforeToolResult{CustomResult: map[string]any{
+				"denied": true,
+				"error":  err.Error(),
+			}}, nil
+		}
+	}
 	return nil, nil
 }
 

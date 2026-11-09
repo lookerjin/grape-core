@@ -91,6 +91,7 @@ type Runtime struct {
 	mcpStatus   []mcp.Status
 	decider     agent.Decider
 	reject      bool
+	selfGated   map[string]struct{}
 	journal     *journal.Writer
 	secrets     []string
 	maxField    int
@@ -197,9 +198,9 @@ func New(opts Options) (*Runtime, error) {
 		_ = sessions.Close()
 		return nil, err
 	}
-	runnerOpts := []runner.Option{runner.WithSessionService(sessions)}
-	if rt.hookRunner != nil {
-		runnerOpts = append(runnerOpts, runner.WithPlugins(&hookPlugin{rt: rt}))
+	runnerOpts := []runner.Option{
+		runner.WithSessionService(sessions),
+		runner.WithPlugins(&hookPlugin{rt: rt}),
 	}
 	if rt.evolution != nil {
 		runnerOpts = append(runnerOpts, runner.WithEvolutionService(rt.evolution))

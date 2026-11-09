@@ -153,6 +153,74 @@ func TestNonCallableToolIsRejected(t *testing.T) {
 	}
 }
 
+func TestApprovedHelperStillGatesChildTools(t *testing.T) {
+	for _, tc := range []struct {
+		perm string
+		mode agent.Mode
+	}{
+		{agent.PermissionWorkspaceWrite, agent.ModeDefault},
+		{agent.PermissionWorkspaceWrite, agent.ModePlan},
+		{agent.PermissionReadOnly, agent.ModeDefault},
+	} {
+		var danger atomic.Int32
+		dangerTool := function.NewFunctionTool(func(ctx context.Context, in struct {
+			Text string `json:"text"`
+		}) (string, error) {
+			danger.Add(1)
+			return "pwned", nil
+		}, function.WithName("child_danger"), function.WithDescription("side effect"))
+		cfg := config.Default()
+		cfg.Workspace.Permission = tc.perm
+		cfg.Approvals.Required = true
+		cfg.Journal.Enabled = false
+		cfg.Model.Generation.Stream = boolPtr(false)
+		mdl := mockmodel.New("child-gate", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+			if hasToolMessage(req) {
+				return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+			}
+			if strings.Contains(messagesText(req), "child-agent") {
+				return toolCall("child_danger", `{"text":"x"}`), nil
+			}
+			return toolCall("helper", `{"request":"child-task"}`), nil
+		})
+		child := llmagent.New("helper",
+			llmagent.WithModel(mdl),
+			llmagent.WithInstruction("child-agent"),
+			llmagent.WithEnableCodeExecutionResponseProcessor(false),
+			llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+			llmagent.WithTools([]tool.Tool{dangerTool}),
+		)
+		rt, err := New(Options{
+			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+			Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+				if req.Detail == "helper" {
+					return agent.Decision{ID: req.ID, Allow: true}, nil
+				}
+				return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+			}),
+			SubAgents: []trpcagent.Agent{child},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := rt.Start(context.Background(), agent.RunRequest{
+			UserID: "u", SessionID: "cg-" + tc.perm + string(tc.mode), Message: "delegate", Mode: tc.mode,
+		})
+		if err != nil {
+			rt.Close()
+			t.Fatal(err)
+		}
+		blob := eventBlob(collect(t, h))
+		rt.Close()
+		if danger.Load() != 0 || strings.Contains(blob, "pwned") {
+			t.Fatalf("%s %s ran child_danger %d: %s", tc.perm, tc.mode, danger.Load(), blob)
+		}
+		if tc.perm == agent.PermissionWorkspaceWrite && !strings.Contains(blob, "child_danger") {
+			t.Fatalf("%s %s did not gate child_danger: %s", tc.perm, tc.mode, blob)
+		}
+	}
+}
+
 func TestTransferToAgentCannotRunSubagentTools(t *testing.T) {
 	var danger atomic.Int32
 	dangerTool := function.NewFunctionTool(func(ctx context.Context, in struct {
