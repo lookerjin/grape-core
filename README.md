@@ -39,7 +39,7 @@ Sessions, plugin installs, memory notes, and the optional journal live under tha
 
 Linux bubblewrap was exercised here. Writes outside the workspace grant are denied, and restricted networking cannot reach a host loopback listener. Existing sensitive directories (such as `~/.ssh` and the grape-core data directory) are masked with `WithNoAccessPaths` and listed in `Capabilities.SensitivePathsMasked`. Ordinary host files stay readable, so `FilesystemIsolation` is false. macOS Seatbelt was not executed here. Windows managed sandbox is unsupported. See [docs/sandbox.md](docs/sandbox.md).
 
-Memory and evolution are off by default. Goal mode is per request (`agent.ModeGoal`) and uses the tRPC goal extension with `goal.max_iterations` as the retry budget. Shell hooks and stdio MCP commands go through the same permission check as `run_command`.
+Memory and evolution are off by default. Goal mode is per request (`agent.ModeGoal`) and uses the tRPC goal extension with `goal.max_iterations` as the retry budget. Shell hooks run through the sandbox executor. Stdio MCP does not: it starts on the host with isolation `none`, a minimal environment, and only when that server sets `trust: host`. A URL without `transport` is treated as HTTP (`sse` or `streamable`), not stdio.
 
 ## Docs
 

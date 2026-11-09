@@ -111,12 +111,18 @@ type MCPServerConfig struct {
 	CredentialRef string            `yaml:"credential_ref"`
 	Enabled       *bool             `yaml:"enabled"`
 	Timeout       string            `yaml:"timeout"`
+	// Trust must be "host" before a stdio server is launched. Stdio MCP
+	// runs on the host with isolation none; it is not the managed sandbox.
+	Trust string `yaml:"trust"`
 }
 
 // MCPConfig is the ordered server list. Later files replace the whole list
 // when they set mcp.servers.
 type MCPConfig struct {
 	Servers []MCPServerConfig `yaml:"servers"`
+	// Strict makes one failed MCP server fail Runtime construction.
+	// The default reports that server as failed and continues.
+	Strict bool `yaml:"strict"`
 }
 
 // MemoryConfig enables the Markdown memory root. It is off by default.

@@ -83,6 +83,7 @@ type Runtime struct {
 	subs        []trpcagent.Agent
 	evolution   evolution.Service
 	mcpSets     []tool.ToolSet
+	mcpStatus   []mcp.Status
 	decider     agent.Decider
 	reject      bool
 	journal     *journal.Writer
@@ -572,6 +573,17 @@ func (rt *Runtime) DeleteSession(ctx context.Context, userID, sessionID string) 
 		return agent.Wrap(agent.ErrSession, "delete", err)
 	}
 	return nil
+}
+
+// MCPStatus reports each configured server after New. Stdio servers that
+// were launched have Isolation "none".
+func (rt *Runtime) MCPStatus() []mcp.Status {
+	if rt == nil {
+		return nil
+	}
+	out := make([]mcp.Status, len(rt.mcpStatus))
+	copy(out, rt.mcpStatus)
+	return out
 }
 
 // Close releases the runner and the SQLite service.

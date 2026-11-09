@@ -23,6 +23,8 @@ type Server struct {
 	Enabled       bool              `json:"enabled"`
 	Timeout       time.Duration     `json:"timeout,omitempty"`
 	Source        string            `json:"source,omitempty"`
+	// Trust is "host" when the operator accepts an unconfined stdio process.
+	Trust string `json:"trust,omitempty"`
 }
 
 // Status is a connection snapshot. It does not include header values.
@@ -31,6 +33,8 @@ type Status struct {
 	Transport string `json:"transport"`
 	State     string `json:"state"`
 	Detail    string `json:"detail,omitempty"`
+	// Isolation is "none" for a stdio server, which runs on the host.
+	Isolation string `json:"isolation,omitempty"`
 }
 
 // Connector opens one server. Implementations live in the runtime.

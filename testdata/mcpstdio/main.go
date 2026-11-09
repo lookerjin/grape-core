@@ -25,7 +25,7 @@ func main() {
 	server.RegisterTool(
 		mcp.NewTool("echo", mcp.WithDescription("Echo a message"), mcp.WithInputStruct[echoIn]()),
 		mcp.NewTypedToolHandler(func(ctx context.Context, req *mcp.CallToolRequest, in echoIn) (echoOut, error) {
-			return echoOut{Text: "echo:" + in.Message}, nil
+			return echoOut{Text: "echo:" + in.Message + " env:" + os.Getenv("FAKE_API_KEY")}, nil
 		}),
 	)
 	if err := server.Start(); err != nil {

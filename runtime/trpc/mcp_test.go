@@ -26,8 +26,9 @@ func TestMCPStdioToolCallAndDeniedServerNotStarted(t *testing.T) {
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Journal.Enabled = false
 	cfg.Model.Generation.Stream = boolPtr(false)
+	t.Setenv("FAKE_API_KEY", "mcp-secret-key")
 	cfg.MCP.Servers = []config.MCPServerConfig{{
-		Name: "echo", Transport: "stdio", Command: bin,
+		Name: "echo", Transport: "stdio", Command: bin, Trust: "host",
 	}}
 	mdl := mockmodel.New("mcp", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if hasToolMessage(req) {
@@ -75,6 +76,21 @@ func TestMCPStdioToolCallAndDeniedServerNotStarted(t *testing.T) {
 	if !strings.Contains(blob, "echo:ping") {
 		t.Fatalf("mcp tool result missing: %s", blob)
 	}
+	if strings.Contains(blob, "mcp-secret-key") {
+		t.Fatal("stdio MCP inherited FAKE_API_KEY")
+	}
+	if !strings.Contains(blob, `isolation\":\"none`) && !strings.Contains(blob, `"isolation":"none"`) {
+		t.Fatalf("event stream missing isolation none: %s", blob)
+	}
+	var sawNone bool
+	for _, status := range rt.MCPStatus() {
+		if status.Name == "echo" && status.State == "connected" && status.Isolation == "none" {
+			sawNone = true
+		}
+	}
+	if !sawNone {
+		t.Fatalf("status missing isolation none: %+v", rt.MCPStatus())
+	}
 
 	marker := filepath.Join(t.TempDir(), "started")
 	enabled := false
@@ -97,13 +113,48 @@ func TestMCPStdioToolCallAndDeniedServerNotStarted(t *testing.T) {
 	}
 
 	deniedCfg := disabled
-	deniedCfg.Workspace.Permission = agent.PermissionReadOnly
+	deniedCfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	yes := true
 	deniedCfg.MCP.Servers[0].Enabled = &yes
-	if _, err := New(Options{Config: &deniedCfg, Model: mockmodel.New("deny", mockmodel.Echo), DataDir: t.TempDir()}); err == nil {
-		t.Fatal("expected denied stdio server to fail before start")
+	deniedCfg.MCP.Servers[0].Trust = ""
+	denied, err := New(Options{Config: &deniedCfg, Model: mockmodel.New("deny", mockmodel.Echo), DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer denied.Close()
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatal("denied MCP server started")
+		t.Fatal("untrusted MCP server started")
+	}
+	var deniedState string
+	for _, status := range denied.MCPStatus() {
+		if status.Name == "nope" {
+			deniedState = status.State
+		}
+	}
+	if deniedState != "denied" {
+		t.Fatalf("untrusted server state %q", deniedState)
+	}
+
+	urlCfg := config.Default()
+	urlCfg.Journal.Enabled = false
+	urlCfg.Model.Generation.Stream = boolPtr(false)
+	urlCfg.MCP.Servers = []config.MCPServerConfig{{
+		Name: "remote", URL: "http://127.0.0.1:1/mcp",
+	}}
+	urlRT, err := New(Options{Config: &urlCfg, Model: mockmodel.New("url", mockmodel.Echo), DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer urlRT.Close()
+	for _, status := range urlRT.MCPStatus() {
+		if status.Name != "remote" {
+			continue
+		}
+		if status.Transport == "stdio" || strings.Contains(status.Detail, "has no command") {
+			t.Fatalf("URL server classified as stdio: %+v", status)
+		}
+		if status.State != "failed" {
+			t.Fatalf("dead URL server state %q", status.State)
+		}
 	}
 }
