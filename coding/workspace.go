@@ -32,112 +32,102 @@ func Resolve(root string) (string, error) {
 	return resolved, nil
 }
 
-// Within resolves rel against root and rejects paths that escape it,
-// including symlink targets outside the workspace.
+// Within checks that rel stays inside root, including through symlinks.
+// The check opens the path with os.Root. Callers that read or write must use
+// Read, Save, or Replace, which perform the operation on that same root.
 func Within(root, rel string) (string, error) {
 	root, err := Resolve(root)
 	if err != nil {
 		return "", err
 	}
-	rel = strings.TrimSpace(rel)
-	if rel == "" || rel == "." {
+	rel, err = cleanRel(rel)
+	if err != nil {
+		return "", err
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	if rel == "." {
 		return root, nil
 	}
+	f, err := r.Open(rel)
+	if err != nil {
+		return "", err
+	}
+	f.Close()
+	return filepath.Join(root, rel), nil
+}
+
+func cleanRel(rel string) (string, error) {
+	rel = strings.TrimSpace(rel)
+	if rel == "" || rel == "." {
+		return ".", nil
+	}
 	if filepath.IsAbs(rel) {
-		return "", fmt.Errorf("absolute path %q is outside the workspace API", rel)
+		return "", fmt.Errorf("absolute path %q is outside the workspace", rel)
 	}
 	cleaned := filepath.Clean(rel)
 	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path escapes workspace")
 	}
-	full := filepath.Join(root, cleaned)
-	parent := filepath.Dir(full)
-	if err := walkExisting(root, parent); err != nil {
-		return "", err
-	}
-	if info, err := os.Lstat(full); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		target, err := filepath.EvalSymlinks(full)
-		if err != nil {
-			return "", err
-		}
-		if !inside(root, target) {
-			return "", fmt.Errorf("symlink escapes workspace")
-		}
-		return target, nil
-	}
-	return full, nil
+	return cleaned, nil
 }
 
-func walkExisting(root, path string) error {
-	path = filepath.Clean(path)
-	if !inside(root, path) && path != root {
-		return fmt.Errorf("path escapes workspace")
-	}
-	current := root
-	rest, err := filepath.Rel(root, path)
+func openWorkspace(root string) (string, *os.Root, error) {
+	root, err := Resolve(root)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
-	if rest == "." {
-		return nil
-	}
-	for _, part := range strings.Split(rest, string(filepath.Separator)) {
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			target, err := filepath.EvalSymlinks(current)
-			if err != nil {
-				return err
-			}
-			if !inside(root, target) {
-				return fmt.Errorf("symlink escapes workspace")
-			}
-		}
-	}
-	return nil
-}
-
-func inside(root, path string) bool {
-	rel, err := filepath.Rel(root, path)
+	r, err := os.OpenRoot(root)
 	if err != nil {
-		return false
+		return "", nil, err
 	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+	return root, r, nil
 }
 
-// Read returns the text of a workspace file.
+// Read returns the text of a workspace file. Symlinks that leave the
+// workspace, absolute symlinks, and dangling symlinks are errors.
 func Read(root, rel string) (string, error) {
-	full, err := Within(root, rel)
+	rel, err := cleanRel(rel)
 	if err != nil {
 		return "", err
 	}
-	info, err := os.Stat(full)
+	_, r, err := openWorkspace(root)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	info, err := r.Stat(rel)
 	if err != nil {
 		return "", err
 	}
 	if info.IsDir() {
 		return "", fmt.Errorf("is a directory")
 	}
-	b, err := os.ReadFile(full)
+	b, err := r.ReadFile(rel)
 	if err != nil {
 		return "", err
+	}
+	if !utf8.Valid(b) {
+		return "", fmt.Errorf("refusing to read non-UTF-8 file %s", rel)
 	}
 	return string(b), nil
 }
 
 // List returns names of entries in a workspace directory.
 func List(root, rel string) ([]string, error) {
-	full, err := Within(root, rel)
+	rel, err := cleanRel(rel)
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(full)
+	_, r, err := openWorkspace(root)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	entries, err := fs.ReadDir(r.FS(), rel)
 	if err != nil {
 		return nil, err
 	}
@@ -156,42 +146,42 @@ type Hit struct {
 }
 
 // Search walks the workspace for a literal substring. It skips directories
-// named .git.
+// named .git and does not follow symlinks that leave the workspace.
 func Search(root, substr string) ([]Hit, error) {
 	if substr == "" {
 		return nil, fmt.Errorf("empty search")
 	}
-	root, err := Resolve(root)
+	_, r, err := openWorkspace(root)
 	if err != nil {
 		return nil, err
 	}
+	defer r.Close()
 	var hits []Hit
-	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(r.FS(), ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
 			if d.Name() == ".git" {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
 			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
-		b, err := os.ReadFile(path)
-		if err != nil {
+		b, err := r.ReadFile(path)
+		if err != nil || !utf8.Valid(b) {
 			return nil
 		}
 		text := string(b)
 		if !strings.Contains(text, substr) {
 			return nil
 		}
-		rel, _ := filepath.Rel(root, path)
 		line := 1
 		for _, chunk := range strings.Split(text, "\n") {
 			if strings.Contains(chunk, substr) {
-				hits = append(hits, Hit{Path: rel, Line: line, Text: chunk})
+				hits = append(hits, Hit{Path: path, Line: line, Text: chunk})
 			}
 			line++
 		}
@@ -202,22 +192,29 @@ func Search(root, substr string) ([]Hit, error) {
 
 // Replace replaces old with new in a workspace file and keeps the file mode.
 // n is the maximum number of replacements. A non-positive n means one.
+// The read and write both go through os.Root, so a symlink cannot retarget
+// the write outside the workspace between the two steps.
 func Replace(root, rel, old, new string, n int) error {
 	if old == "" {
 		return fmt.Errorf("empty old string")
 	}
-	full, err := Within(root, rel)
+	rel, err := cleanRel(rel)
 	if err != nil {
 		return err
 	}
-	info, err := os.Stat(full)
+	_, r, err := openWorkspace(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	info, err := r.Stat(rel)
 	if err != nil {
 		return err
 	}
 	if info.IsDir() {
 		return fmt.Errorf("is a directory")
 	}
-	b, err := os.ReadFile(full)
+	b, err := r.ReadFile(rel)
 	if err != nil {
 		return err
 	}
@@ -228,10 +225,79 @@ func Replace(root, rel, old, new string, n int) error {
 		n = 1
 	}
 	text := string(b)
-	count := strings.Count(text, old)
-	if count == 0 {
+	if strings.Count(text, old) == 0 {
 		return fmt.Errorf("old string not found")
 	}
 	updated := strings.Replace(text, old, new, n)
-	return os.WriteFile(full, []byte(updated), info.Mode().Perm())
+	mode := info.Mode().Perm()
+	if err := r.WriteFile(rel, []byte(updated), mode); err != nil {
+		return err
+	}
+	return r.Chmod(rel, mode)
+}
+
+// Save writes a UTF-8 file inside the workspace.
+func Save(root, rel, contents string, overwrite bool) error {
+	if !utf8.ValidString(contents) {
+		return fmt.Errorf("refusing to write non-UTF-8 content")
+	}
+	rel, err := cleanRel(rel)
+	if err != nil {
+		return err
+	}
+	_, r, err := openWorkspace(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	if dir := filepath.Dir(rel); dir != "." {
+		if err := r.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	if !overwrite {
+		if _, err := r.Lstat(rel); err == nil {
+			return fmt.Errorf("file exists")
+		}
+	}
+	return r.WriteFile(rel, []byte(contents), 0o644)
+}
+
+// Match lists files and directories under rel whose path or base name matches
+// pattern. An empty pattern matches everything. Symlinks are not followed.
+func Match(root, rel, pattern string) (files, dirs []string, err error) {
+	rel, err = cleanRel(rel)
+	if err != nil {
+		return nil, nil, err
+	}
+	_, r, err := openWorkspace(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer r.Close()
+	if _, err := fs.Stat(r.FS(), rel); err != nil {
+		return nil, nil, err
+	}
+	err = fs.WalkDir(r.FS(), rel, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == rel && d.IsDir() {
+			return nil
+		}
+		if pattern != "" {
+			baseOK, _ := filepath.Match(pattern, d.Name())
+			pathOK, _ := filepath.Match(pattern, path)
+			if !baseOK && !pathOK {
+				return nil
+			}
+		}
+		if d.IsDir() {
+			dirs = append(dirs, path)
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	return files, dirs, err
 }

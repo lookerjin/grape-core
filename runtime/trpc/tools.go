@@ -13,7 +13,6 @@ import (
 	"github.com/lookerjin/grape-core/coding"
 	"github.com/lookerjin/grape-core/sandbox"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
-	"trpc.group/trpc-go/trpc-agent-go/tool/file"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
 
@@ -74,31 +73,123 @@ type pathIn struct {
 	Path string `json:"path,omitempty"`
 }
 
-func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) ([]tool.Tool, error) {
-	set, err := file.NewToolSet(
-		file.WithBaseDir(workspace),
-		file.WithSaveFileEnabled(allowWrite),
-		file.WithReplaceContentEnabled(allowWrite),
-	)
-	if err != nil {
-		return nil, err
+type readIn struct {
+	FileName string `json:"file_name"`
+}
+
+type saveIn struct {
+	FileName  string `json:"file_name"`
+	Contents  string `json:"contents"`
+	Overwrite bool   `json:"overwrite"`
+}
+
+type replaceIn struct {
+	FileName        string `json:"file_name"`
+	OldString       string `json:"old_string"`
+	NewString       string `json:"new_string"`
+	NumReplacements int    `json:"num_replacements"`
+}
+
+type searchIn struct {
+	Path           string `json:"path"`
+	Pattern        string `json:"pattern"`
+	FilePattern    string `json:"file_pattern"`
+	ContentPattern string `json:"content_pattern"`
+}
+
+type multiIn struct {
+	Patterns []string `json:"patterns"`
+}
+
+func (rt *Runtime) workspaceFrom(ctx context.Context, fallback string) string {
+	if v, ok := ctx.Value(workspaceKey{}).(string); ok && v != "" {
+		return v
 	}
-	var tools []tool.Tool
-	for _, tl := range set.Tools(context.Background()) {
-		name := ""
-		if tl.Declaration() != nil {
-			name = tl.Declaration().Name
-		}
-		if name == "save_file" || name == "replace_content" {
-			callable, ok := tl.(tool.CallableTool)
-			if !ok {
-				return nil, fmt.Errorf("write tool %s is not callable", name)
+	return fallback
+}
+
+func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
+	ws := func(ctx context.Context) string { return rt.workspaceFrom(ctx, fallback) }
+	tools := []tool.Tool{
+		function.NewFunctionTool(func(ctx context.Context, in readIn) (map[string]any, error) {
+			text, err := coding.Read(ws(ctx), in.FileName)
+			if err != nil {
+				return nil, err
 			}
-			tools = append(tools, &gatedTool{inner: callable, kind: "write", rt: rt})
-			continue
-		}
-		tools = append(tools, tl)
+			return map[string]any{"file_name": in.FileName, "contents": text}, nil
+		}, function.WithName("read_file"), function.WithDescription("Read a UTF-8 workspace file. Symlinks that leave the workspace are rejected.")),
+		function.NewFunctionTool(func(ctx context.Context, in pathIn) (map[string]any, error) {
+			names, err := coding.List(ws(ctx), in.Path)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"entries": names}, nil
+		}, function.WithName("list_file"), function.WithDescription("List a workspace directory without following escaping symlinks.")),
+		function.NewFunctionTool(func(ctx context.Context, in searchIn) (map[string]any, error) {
+			pattern := in.Pattern
+			if pattern == "" {
+				pattern = in.FilePattern
+			}
+			files, dirs, err := coding.Match(ws(ctx), in.Path, pattern)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"files": files, "folders": dirs}, nil
+		}, function.WithName("search_file"), function.WithDescription("Find workspace paths by name. Escaping symlinks are not followed.")),
+		function.NewFunctionTool(func(ctx context.Context, in searchIn) (map[string]any, error) {
+			hits, err := coding.Search(ws(ctx), in.ContentPattern)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"matches": hits}, nil
+		}, function.WithName("search_content"), function.WithDescription("Search UTF-8 workspace files. Escaping symlinks are not followed.")),
+		function.NewFunctionTool(func(ctx context.Context, in multiIn) (map[string]any, error) {
+			var files []map[string]string
+			for _, pattern := range in.Patterns {
+				matches, _, err := coding.Match(ws(ctx), ".", pattern)
+				if err != nil {
+					return nil, err
+				}
+				for _, name := range matches {
+					text, err := coding.Read(ws(ctx), name)
+					if err != nil {
+						files = append(files, map[string]string{"file_name": name, "error": err.Error()})
+						continue
+					}
+					files = append(files, map[string]string{"file_name": name, "contents": text})
+				}
+			}
+			return map[string]any{"files": files}, nil
+		}, function.WithName("read_multiple_files"), function.WithDescription("Read workspace files matched by glob patterns.")),
 	}
+	if !allowWrite {
+		return tools
+	}
+	tools = append(tools,
+		function.NewFunctionTool(func(ctx context.Context, in saveIn) (map[string]any, error) {
+			if err := rt.authorize(ctx, "write", in.FileName, in.FileName); err != nil {
+				return map[string]any{"denied": true, "error": err.Error()}, nil
+			}
+			if err := coding.Save(ws(ctx), in.FileName, in.Contents, in.Overwrite); err != nil {
+				return nil, err
+			}
+			return map[string]any{"file_name": in.FileName, "message": "saved"}, nil
+		}, function.WithName("save_file"), function.WithDescription("Write a UTF-8 file inside the workspace. Symlinks that leave the workspace are rejected.")),
+		function.NewFunctionTool(func(ctx context.Context, in replaceIn) (map[string]any, error) {
+			if err := rt.authorize(ctx, "write", in.FileName, in.FileName); err != nil {
+				return map[string]any{"denied": true, "error": err.Error()}, nil
+			}
+			if err := coding.Replace(ws(ctx), in.FileName, in.OldString, in.NewString, in.NumReplacements); err != nil {
+				return nil, err
+			}
+			return map[string]any{"file_name": in.FileName, "message": "replaced"}, nil
+		}, function.WithName("replace_content"), function.WithDescription("Replace text in a UTF-8 workspace file without following escaping symlinks.")),
+	)
+	return tools
+}
+
+func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) ([]tool.Tool, error) {
+	tools := rt.fileTools(workspace, allowWrite)
 	tools = append(tools,
 		function.NewFunctionTool(
 			rt.runCommand,
