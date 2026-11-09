@@ -169,6 +169,7 @@ func TestHooksFireOncePerLogicalEvent(t *testing.T) {
 	cfg.Sandbox.Mode = "managed"
 	cfg.Model.Generation.Stream = boolPtr(true)
 	cfg.Journal.Enabled = false
+	cfg.Hooks.MaxConcurrent = 1
 	cfg.Plugins.Enabled = []string{"once"}
 	mdl := mockmodel.New("once", mockmodel.Echo).WithStream()
 	rt, err := New(Options{
