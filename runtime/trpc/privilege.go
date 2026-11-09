@@ -3,7 +3,6 @@ package trpcruntime
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/lookerjin/grape-core/agent"
@@ -11,7 +10,6 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
-	skilltool "trpc.group/trpc-go/trpc-agent-go/tool/skill"
 )
 
 const rootAgentName = "grape"
@@ -54,9 +52,33 @@ func (rt *Runtime) asRead(item tool.Tool) tool.Tool {
 	if !ok {
 		return item
 	}
-	wrapped := &builtinReadTool{inner: callable}
-	rt.noteRead(wrapped)
-	return wrapped
+	return &builtinReadTool{inner: callable}
+}
+
+// grapeReadTool wraps a read-level tool grape constructed, such as a
+// knowledge skill tool. The type is unexported, so another module cannot
+// build a value that passes the nested read check.
+type grapeReadTool struct {
+	inner tool.CallableTool
+}
+
+func (t *grapeReadTool) Declaration() *tool.Declaration {
+	if t == nil || t.inner == nil {
+		return nil
+	}
+	return t.inner.Declaration()
+}
+
+func (t *grapeReadTool) Call(ctx context.Context, args []byte) (any, error) {
+	return t.inner.Call(ctx, args)
+}
+
+func wrapGrapeRead(item tool.Tool) tool.Tool {
+	callable, ok := item.(tool.CallableTool)
+	if !ok || item == nil {
+		return item
+	}
+	return &grapeReadTool{inner: callable}
 }
 
 func (t hostMCPTool) grapeReadLevel() bool {
@@ -128,11 +150,26 @@ func (rt *Runtime) nestedToolKind(ctx context.Context, name string) string {
 		return "side_effect"
 	}
 	for _, item := range matched {
-		if !rt.registeredRead(item) {
+		if !isGrapeRead(item) {
 			return "side_effect"
 		}
 	}
 	return "read"
+}
+
+// isGrapeRead reports whether the tool is one grape constructed. The check
+// is a type assertion on unexported types. It does not use pointer identity.
+func isGrapeRead(item tool.Tool) bool {
+	switch t := unwrapGrape(item).(type) {
+	case *builtinReadTool:
+		return t != nil
+	case *grapeReadTool:
+		return t != nil
+	case *hostMCPTool:
+		return t != nil && t.kind == "read"
+	default:
+		return false
+	}
 }
 
 func toolsNamed(inv *trpcagent.Invocation, name string) []tool.Tool {
@@ -171,61 +208,6 @@ func unwrapGrape(item tool.Tool) tool.Tool {
 		}
 	}
 	return item
-}
-
-func toolPointer(item tool.Tool) (uintptr, bool) {
-	v := reflect.ValueOf(item)
-	if !v.IsValid() || v.Kind() != reflect.Pointer || v.IsNil() {
-		return 0, false
-	}
-	return v.Pointer(), true
-}
-
-func (rt *Runtime) noteRead(item tool.Tool) {
-	if rt == nil {
-		return
-	}
-	ptr, ok := toolPointer(item)
-	if !ok {
-		return
-	}
-	rt.readMu.Lock()
-	defer rt.readMu.Unlock()
-	if rt.readID == nil {
-		rt.readID = map[uintptr]struct{}{}
-	}
-	rt.readID[ptr] = struct{}{}
-}
-
-func (rt *Runtime) registeredRead(item tool.Tool) bool {
-	if rt == nil {
-		return false
-	}
-	ptr, ok := toolPointer(unwrapGrape(item))
-	if !ok {
-		return false
-	}
-	rt.readMu.Lock()
-	defer rt.readMu.Unlock()
-	_, ok = rt.readID[ptr]
-	return ok
-}
-
-func (rt *Runtime) noteAgentReads(a trpcagent.Agent) {
-	if rt == nil || a == nil {
-		return
-	}
-	for _, item := range a.Tools() {
-		item = unwrapGrape(item)
-		switch item.(type) {
-		case *skilltool.LoadTool, *skilltool.ListDocsTool, *skilltool.SelectDocsTool, *builtinReadTool:
-			rt.noteRead(item)
-		case *hostMCPTool:
-			if mcp, ok := item.(*hostMCPTool); ok && mcp.kind == "read" {
-				rt.noteRead(item)
-			}
-		}
-	}
 }
 
 func (rt *Runtime) consumeLLMCall(ctx context.Context) error {

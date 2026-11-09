@@ -229,11 +229,7 @@ func (s hostMCPSet) Tools(ctx context.Context) []tool.Tool {
 	out := make([]tool.Tool, 0, len(inner))
 	for _, item := range inner {
 		if callable, ok := item.(tool.CallableTool); ok {
-			wrapped := &hostMCPTool{inner: callable, rt: s.rt, kind: s.kind}
-			if s.kind == "read" {
-				s.rt.noteRead(wrapped)
-			}
-			out = append(out, wrapped)
+			out = append(out, &hostMCPTool{inner: callable, rt: s.rt, kind: s.kind})
 			continue
 		}
 		out = append(out, item)

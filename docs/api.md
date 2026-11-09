@@ -23,7 +23,7 @@ for evt := range run.Events() {
 
 The stream keeps a soft buffer of 256 events. Only `text_delta` events are dropped when a consumer falls behind. One `dropped N events` marker is emitted per catch-up, not once per dropped delta. Tool calls, permission decisions, errors, hook failures, and the terminal event are not dropped while the consumer is still taking events; the buffer grows to hold them.
 
-Nested tool calls are authorized by the calling invocation, not by the tool's name or description. Read is granted only to the read-tool instances grape constructed, to a user-configured MCP server whose `level` is `read`, and to `Options.NestedReads` agent/tool pairs. A wrapper that exposes some other tool through `Original` does not inherit that privilege. A nested agent cannot take the root's place by naming itself `grape`.
+Nested tool calls are authorized by the calling invocation, not by the tool's name or description. Read is granted only by a type check on grape's own unexported tool types (builtin read tools, the private read wrapper, and a read-level MCP tool grape built) and to `Options.NestedReads` agent/tool pairs. A wrapper that exposes some other tool through `Original` does not inherit that privilege. A nested agent cannot take the root's place by naming itself `grape`.
 
 `context.max_llm_calls` (default 128) counts model calls for the whole run, including nested agents. `context.max_tool_iterations` (default 64) counts model turns that request tools, one round no matter how many calls run in parallel, also for the whole run. `context.max_tool_calls` counts individual executions and is unlimited when zero or negative. Exceeding a budget ends the run with terminal status `failed`.
 

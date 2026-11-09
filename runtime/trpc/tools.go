@@ -25,11 +25,12 @@ type runState struct {
 	tools    int
 	stopping bool
 	// rootInv is the invocation ID captured for the run's root agent.
-	rootInv    string
-	llmCalls   int
-	toolRounds int
-	toolCalls  int
-	failReason string
+	rootInv       string
+	llmCalls      int
+	toolRounds    int
+	toolCalls     int
+	failReason    string
+	finishClaimed bool
 }
 
 func newRunState(runID, session string, mode agent.Mode) *runState {
@@ -169,6 +170,22 @@ func (st *runState) markFailure(reason string) {
 	if st.failReason == "" {
 		st.failReason = reason
 	}
+}
+
+// claimFinish marks the run finished once. The first caller owns the
+// session lock. busy reports whether a tool is still inside Call.
+func (st *runState) claimFinish() (busy bool, owner bool) {
+	if st == nil {
+		return false, false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.finishClaimed {
+		return false, false
+	}
+	st.finishClaimed = true
+	st.stopping = true
+	return st.tools > 0, true
 }
 
 func (st *runState) failure() string {

@@ -3,9 +3,11 @@ package trpcruntime
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,8 +100,6 @@ type Runtime struct {
 	maxField    int
 	instruction string
 	nested      map[string]map[string]struct{}
-	readMu      sync.Mutex
-	readID      map[uintptr]struct{}
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -319,7 +319,6 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	// Subagents are exposed only as gated agent tools. WithSubAgents would
 	// also register transfer_to_agent, which bypasses that gate.
 	ag := llmagent.New("grape", opts...)
-	rt.noteAgentReads(ag)
 	return ag, nil
 }
 
@@ -507,10 +506,14 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 		if evt.SessionID == "" {
 			evt.SessionID = req.SessionID
 		}
-		if ctx.Err() != nil && !evt.Terminal() {
+		if ctx.Err() != nil && !evt.Terminal() && evt.Kind != agent.EventToolEnd {
 			return
 		}
+		noteUpstreamBudget(st, evt)
 		evt = failIfBudget(st, evt)
+		if evt.Terminal() {
+			rt.finishSession(req.SessionID, runID, st, unlock)
+		}
 		if rt.journal != nil {
 			_ = rt.journal.Append(evt)
 		}
@@ -564,6 +567,10 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 		case <-cancelled:
 			cancelled = nil
 			if !terminal {
+				pending := conv.closeOpenTools(nil, "cancelled")
+				for _, next := range pending {
+					emit(next)
+				}
 				emit(conv.stamp(agent.Event{
 					RunID:     runID,
 					SessionID: req.SessionID,
@@ -626,6 +633,20 @@ func (rt *Runtime) eventIdleTimeout() time.Duration {
 		return 5 * time.Minute
 	}
 	return d
+}
+
+func noteUpstreamBudget(st *runState, evt agent.Event) {
+	if st == nil || evt.Kind != agent.EventError {
+		return
+	}
+	var body agent.ErrorPayload
+	if err := json.Unmarshal(evt.Payload, &body); err != nil {
+		return
+	}
+	msg := body.Message
+	if strings.Contains(msg, "max LLM calls") || strings.Contains(msg, "max tool iterations") || strings.Contains(msg, "max tool calls") {
+		st.markFailure(msg)
+	}
 }
 
 func failIfBudget(st *runState, evt agent.Event) agent.Event {
@@ -693,7 +714,15 @@ type sessionHold struct {
 }
 
 func (rt *Runtime) finishSession(id, runID string, st *runState, unlock func()) {
-	if st == nil || !st.captureBusy() {
+	if st == nil {
+		unlock()
+		return
+	}
+	busy, owner := st.claimFinish()
+	if !owner {
+		return
+	}
+	if !busy {
 		unlock()
 		return
 	}

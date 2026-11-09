@@ -2,6 +2,7 @@ package trpcruntime
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -15,13 +16,16 @@ import (
 // converter turns one tRPC event stream into grape-core events.
 // Sequence numbers belong to this run only.
 type converter struct {
-	runID     string
-	sessionID string
-	seenTool  map[string]struct{}
-	openTool  map[string]string
-	maxField  int
-	secrets   []string
-	seq       uint64
+	runID       string
+	sessionID   string
+	seenTool    map[string]struct{}
+	openTool    map[string]string
+	emptyByName map[string][]string
+	emptySeq    int
+	panicMsg    string
+	maxField    int
+	secrets     []string
+	seq         uint64
 }
 
 func newConverter(runID, sessionID string, maxField int, secrets []string) *converter {
@@ -43,9 +47,12 @@ func (c *converter) convert(evt *event.Event) []agent.Event {
 		return nil
 	}
 	if evt.IsRunnerCompletion() {
-		out := c.closeOpenTools(evt)
+		out := c.closeOpenTools(evt, "")
 		out = append(out, c.terminal(evt))
 		return out
+	}
+	if evt.Error != nil {
+		c.notePanic(evt.Error.Message)
 	}
 	var out []agent.Event
 	if evt.Object == model.ObjectTypeToolResponse {
@@ -132,31 +139,59 @@ func (c *converter) toolStarts(evt *event.Event) []agent.Event {
 	}
 	var out []agent.Event
 	for _, call := range calls {
-		key := call.ID
-		if key == "" {
-			key = call.Function.Name + ":" + string(call.Function.Arguments)
-		}
-		if key == "" {
+		id := c.stableID(call.Function.Name, call.ID)
+		if id == "" {
 			continue
 		}
-		if _, ok := c.seenTool[key]; ok {
+		if _, ok := c.seenTool[id]; ok {
 			continue
 		}
-		c.seenTool[key] = struct{}{}
+		c.seenTool[id] = struct{}{}
 		if c.openTool == nil {
 			c.openTool = map[string]string{}
 		}
-		c.openTool[key] = call.Function.Name
+		c.openTool[id] = call.Function.Name
 		args := c.clipRaw(call.Function.Arguments)
 		ev := c.base(evt, agent.EventToolStart, agent.MustPayload(agent.ToolPayload{
 			Name:      call.Function.Name,
-			CallID:    call.ID,
+			CallID:    id,
 			Arguments: args,
 		}))
-		ev.ToolCallID = call.ID
+		ev.ToolCallID = id
 		out = append(out, ev)
 	}
 	return out
+}
+
+// stableID keeps a non-empty upstream id and assigns a grape id when the
+// model left the call id empty. Ends with an empty id are paired in order.
+func (c *converter) stableID(name, upstream string) string {
+	if upstream != "" {
+		return upstream
+	}
+	c.emptySeq++
+	id := fmt.Sprintf("grape-%d", c.emptySeq)
+	if c.emptyByName == nil {
+		c.emptyByName = map[string][]string{}
+	}
+	c.emptyByName[name] = append(c.emptyByName[name], id)
+	return id
+}
+
+func (c *converter) matchEmpty(name string) string {
+	if ids := c.emptyByName[name]; len(ids) > 0 {
+		c.emptyByName[name] = ids[1:]
+		return ids[0]
+	}
+	for toolName, ids := range c.emptyByName {
+		if len(ids) == 0 {
+			continue
+		}
+		c.emptyByName[toolName] = ids[1:]
+		return ids[0]
+	}
+	c.emptySeq++
+	return fmt.Sprintf("grape-%d", c.emptySeq)
 }
 
 func (c *converter) toolEnds(evt *event.Event) []agent.Event {
@@ -178,10 +213,10 @@ func (c *converter) toolEnds(evt *event.Event) []agent.Event {
 		if content == "" {
 			content = choice.Delta.Content
 		}
-		key := id
-		if key == "" {
-			key = name
+		if id == "" {
+			id = c.matchEmpty(name)
 		}
+		key := id
 		if key != "" {
 			if _, ok := seen[key]; ok {
 				continue
@@ -194,26 +229,42 @@ func (c *converter) toolEnds(evt *event.Event) []agent.Event {
 }
 
 func (c *converter) toolEndOne(evt *event.Event, name, id, content string) agent.Event {
-	key := id
-	if key == "" {
-		key = name
+	if id != "" {
+		delete(c.openTool, id)
 	}
-	if key != "" {
-		delete(c.openTool, key)
+	errField := ""
+	if strings.Contains(strings.ToLower(content), "panic") {
+		errField = c.clean(content)
+	}
+	if content == "" && c.panicMsg != "" {
+		content = c.panicMsg
+		errField = c.panicMsg
+		c.panicMsg = ""
 	}
 	cleaned, truncated := c.clip(content)
+	if errField != "" {
+		errField = c.clean(errField)
+	}
 	result := json.RawMessage(strconvQuote(cleaned))
 	ev := c.base(evt, agent.EventToolEnd, agent.MustPayload(agent.ToolPayload{
 		Name:      name,
 		CallID:    id,
 		Result:    result,
+		Error:     errField,
 		Truncated: truncated,
 	}))
 	ev.ToolCallID = id
 	return ev
 }
 
-func (c *converter) closeOpenTools(evt *event.Event) []agent.Event {
+func (c *converter) notePanic(msg string) {
+	msg = c.clean(msg)
+	if strings.Contains(strings.ToLower(msg), "panic") {
+		c.panicMsg = msg
+	}
+}
+
+func (c *converter) closeOpenTools(evt *event.Event, status string) []agent.Event {
 	if len(c.openTool) == 0 {
 		return nil
 	}
@@ -225,9 +276,24 @@ func (c *converter) closeOpenTools(evt *event.Event) []agent.Event {
 	var out []agent.Event
 	for _, id := range ids {
 		name := c.openTool[id]
-		out = append(out, c.toolEndOne(evt, name, id, ""))
+		ev := c.toolEndOne(evt, name, id, "")
+		if status != "" {
+			ev = withToolStatus(ev, status)
+		}
+		out = append(out, ev)
 	}
 	return out
+}
+
+func withToolStatus(evt agent.Event, status string) agent.Event {
+	var body agent.ToolPayload
+	_ = json.Unmarshal(evt.Payload, &body)
+	body.Error = status
+	if len(body.Result) == 0 || string(body.Result) == `""` {
+		body.Result = json.RawMessage(strconvQuote(status))
+	}
+	evt.Payload = agent.MustPayload(body)
+	return evt
 }
 
 func strconvQuote(s string) string {
@@ -249,28 +315,39 @@ func (c *converter) stamp(evt agent.Event) agent.Event {
 
 func (c *converter) base(evt *event.Event, kind agent.EventKind, payload json.RawMessage) agent.Event {
 	c.seq++
-	ts := evt.Timestamp
+	var ts time.Time
+	author := ""
+	trace := ""
+	requestID := ""
+	var usage *model.Usage
+	if evt != nil {
+		ts = evt.Timestamp
+		author = evt.Author
+		trace = evt.InvocationID
+		requestID = evt.RequestID
+		usage = evt.Usage
+	}
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
 	ev := agent.Event{
 		RunID:     c.runID,
 		SessionID: c.sessionID,
-		AgentID:   evt.Author,
-		TraceID:   evt.InvocationID,
+		AgentID:   author,
+		TraceID:   trace,
 		Kind:      kind,
 		Sequence:  c.seq,
 		Time:      ts,
 		Payload:   payload,
 	}
-	if evt.RequestID != "" {
-		ev.RunID = evt.RequestID
+	if requestID != "" {
+		ev.RunID = requestID
 	}
-	if evt.Usage != nil && (evt.Usage.TotalTokens > 0 || evt.Usage.PromptTokens > 0 || evt.Usage.CompletionTokens > 0) {
+	if usage != nil && (usage.TotalTokens > 0 || usage.PromptTokens > 0 || usage.CompletionTokens > 0) {
 		ev.Usage = &agent.Usage{
-			PromptTokens:     evt.Usage.PromptTokens,
-			CompletionTokens: evt.Usage.CompletionTokens,
-			TotalTokens:      evt.Usage.TotalTokens,
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			TotalTokens:      usage.TotalTokens,
 		}
 	}
 	return ev

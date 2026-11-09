@@ -173,8 +173,10 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx contex
 				finish(&evt)
 				return
 			case <-done:
-				finish(&evt)
-				return
+				if b.isClosed() {
+					finish(&evt)
+					return
+				}
 			case <-stop:
 				return
 			case <-pulse.C:
@@ -187,9 +189,6 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx contex
 		select {
 		case out <- evt:
 			sent = true
-		case <-done:
-			finish(&evt)
-			return
 		case <-stop:
 			return
 		}
@@ -224,10 +223,14 @@ func (b *eventBox) isClosed() bool {
 	return b.closed
 }
 
+func keepOnCancel(evt agent.Event) bool {
+	return evt.Terminal() || evt.Kind == agent.EventToolEnd
+}
+
 func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event) bool {
-	n, term := b.compact()
-	if held != nil && held.Terminal() {
-		term = held
+	n, kept := b.compact()
+	if held != nil && keepOnCancel(*held) {
+		kept = append(kept, *held)
 	} else if held != nil {
 		n++
 	}
@@ -237,26 +240,27 @@ func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event) bool 
 		default:
 		}
 	}
-	if term == nil {
-		return false
+	sentTerminal := false
+	for _, evt := range kept {
+		select {
+		case out <- evt:
+			if evt.Terminal() {
+				sentTerminal = true
+			}
+		default:
+		}
 	}
-	select {
-	case out <- *term:
-		return true
-	default:
-		return false
-	}
+	return sentTerminal
 }
 
-func (b *eventBox) compact() (int, *agent.Event) {
+func (b *eventBox) compact() (int, []agent.Event) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	var term *agent.Event
+	var kept []agent.Event
 	extra := 0
 	for i := range b.items {
-		if b.items[i].Terminal() {
-			evt := b.items[i]
-			term = &evt
+		if keepOnCancel(b.items[i]) {
+			kept = append(kept, b.items[i])
 			continue
 		}
 		extra++
@@ -266,7 +270,7 @@ func (b *eventBox) compact() (int, *agent.Event) {
 	n := b.dropped
 	b.dropped = 0
 	b.closed = true
-	return n, term
+	return n, kept
 }
 
 func (b *eventBox) pop(stop <-chan struct{}, done <-chan struct{}) (agent.Event, bool) {
@@ -292,7 +296,15 @@ func (b *eventBox) pop(stop <-chan struct{}, done <-chan struct{}) (agent.Event,
 		case <-stop:
 			return agent.Event{}, false
 		case <-done:
-			return agent.Event{}, false
+			if b.isClosed() {
+				return agent.Event{}, false
+			}
+			// The run has not closed the box yet. Wait for its final events.
+			select {
+			case <-b.wake:
+			case <-stop:
+				return agent.Event{}, false
+			}
 		}
 	}
 }

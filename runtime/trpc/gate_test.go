@@ -872,7 +872,6 @@ func TestBuiltinReadIdentityStaysUnprompted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rt.Close()
-	rt.noteRead(readTool)
 	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "ident", Message: "go"})
 	if err != nil {
 		t.Fatal(err)
