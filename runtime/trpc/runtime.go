@@ -60,6 +60,9 @@ type Options struct {
 	// Trusted tools skip the approval gate; Options.Tools are untrusted.
 	ToolSpecs         []ToolSpec
 	EvolutionReviewer evolution.Reviewer
+	// NestedReads are agent/tool pairs a nested caller may run as read.
+	// Privilege comes from this list, not from the tool's name or description.
+	NestedReads []NestedRead
 }
 
 // Runtime is a tRPC-backed agent.Runtime.
@@ -94,6 +97,7 @@ type Runtime struct {
 	secrets     []string
 	maxField    int
 	instruction string
+	nested      map[string]map[string]struct{}
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -113,6 +117,9 @@ func New(opts Options) (*Runtime, error) {
 		cfg = config.Normalize(*opts.Config)
 	}
 	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if err := rejectReservedAgents(opts.FixedAgent, opts.SubAgents, opts.Tools, specTools(opts.ToolSpecs)); err != nil {
 		return nil, err
 	}
 	dataDir := opts.DataDir
@@ -179,6 +186,7 @@ func New(opts Options) (*Runtime, error) {
 		holds:       map[string]*sessionHold{},
 		fixed:       opts.FixedAgent,
 		subs:        append([]trpcagent.Agent(nil), opts.SubAgents...),
+		nested:      nestedReadIndex(opts.NestedReads),
 	}
 	if cfg.Evolution.Enabled {
 		if err := os.MkdirAll(cfg.Evolution.Root, 0o755); err != nil {
@@ -312,7 +320,7 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 }
 
 func (rt *Runtime) memoryTool() tool.Tool {
-	return function.NewFunctionTool(
+	return asRead(function.NewFunctionTool(
 		func(ctx context.Context, in struct {
 			Query string `json:"query"`
 		}) ([]memory.Entry, error) {
@@ -324,7 +332,7 @@ func (rt *Runtime) memoryTool() tool.Tool {
 		},
 		function.WithName("memory_recall"),
 		function.WithDescription("Search Markdown memory notes. This does not write memories or call a model."),
-	)
+	))
 }
 
 // EvolutionEnabled reports whether an evolution service was constructed.

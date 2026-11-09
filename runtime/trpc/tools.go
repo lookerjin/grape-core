@@ -24,6 +24,10 @@ type runState struct {
 	mode     agent.Mode
 	tools    int
 	stopping bool
+	// rootInv is the invocation ID captured for the run's root agent.
+	rootInv   string
+	llmCalls  int
+	toolIters int
 }
 
 func newRunState(runID, session string, mode agent.Mode) *runState {
@@ -104,6 +108,55 @@ func (st *runState) captureBusy() bool {
 	return st.tools > 0
 }
 
+func (st *runState) noteRoot(id string) {
+	if st == nil || id == "" {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.rootInv == "" {
+		st.rootInv = id
+	}
+}
+
+func (st *runState) rootInvocation() string {
+	if st == nil {
+		return ""
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.rootInv
+}
+
+func (st *runState) addLLMCall() int {
+	if st == nil {
+		return 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.llmCalls++
+	return st.llmCalls
+}
+
+func (st *runState) addToolIteration() int {
+	if st == nil {
+		return 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.toolIters++
+	return st.toolIters
+}
+
+func (st *runState) toolIterations() int {
+	if st == nil {
+		return 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.toolIters
+}
+
 func (st *runState) drain() []agent.Event {
 	if st == nil {
 		return nil
@@ -172,7 +225,7 @@ func (rt *Runtime) workspaceFrom(ctx context.Context, fallback string) string {
 func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 	ws := func(ctx context.Context) string { return rt.workspaceFrom(ctx, fallback) }
 	tools := []tool.Tool{
-		function.NewFunctionTool(func(ctx context.Context, in readIn) (map[string]any, error) {
+		asRead(function.NewFunctionTool(func(ctx context.Context, in readIn) (map[string]any, error) {
 			text, err := coding.ReadLimited(ws(ctx), in.FileName, coding.ReadLimit{
 				MaxBytes:   rt.cfg.Workspace.MaxReadBytes,
 				LineOffset: in.Offset,
@@ -182,15 +235,15 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 				return nil, err
 			}
 			return map[string]any{"file_name": in.FileName, "contents": text}, nil
-		}, function.WithName("read_file"), function.WithDescription("Read a UTF-8 workspace file, with optional 1-based offset and line limit. Symlinks that leave the workspace are rejected.")),
-		function.NewFunctionTool(func(ctx context.Context, in pathIn) (map[string]any, error) {
+		}, function.WithName("read_file"), function.WithDescription("Read a UTF-8 workspace file, with optional 1-based offset and line limit. Symlinks that leave the workspace are rejected."))),
+		asRead(function.NewFunctionTool(func(ctx context.Context, in pathIn) (map[string]any, error) {
 			names, err := coding.List(ws(ctx), in.Path)
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"entries": names}, nil
-		}, function.WithName("list_file"), function.WithDescription("List a workspace directory without following escaping symlinks.")),
-		function.NewFunctionTool(func(ctx context.Context, in searchIn) (map[string]any, error) {
+		}, function.WithName("list_file"), function.WithDescription("List a workspace directory without following escaping symlinks."))),
+		asRead(function.NewFunctionTool(func(ctx context.Context, in searchIn) (map[string]any, error) {
 			pattern := in.Pattern
 			if pattern == "" {
 				pattern = in.FilePattern
@@ -200,8 +253,8 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 				return nil, err
 			}
 			return map[string]any{"files": files, "folders": dirs}, nil
-		}, function.WithName("search_file"), function.WithDescription("Find workspace paths by name. Escaping symlinks are not followed.")),
-		function.NewFunctionTool(func(ctx context.Context, in searchIn) (map[string]any, error) {
+		}, function.WithName("search_file"), function.WithDescription("Find workspace paths by name. Escaping symlinks are not followed."))),
+		asRead(function.NewFunctionTool(func(ctx context.Context, in searchIn) (map[string]any, error) {
 			path := in.Path
 			if path == "" {
 				path = "."
@@ -214,8 +267,8 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 				return nil, err
 			}
 			return map[string]any{"matches": hits, "skipped": skipped}, nil
-		}, function.WithName("search_content"), function.WithDescription("Search UTF-8 files under path. Escaping symlinks are not followed. Large files and excess matches are skipped.")),
-		function.NewFunctionTool(func(ctx context.Context, in multiIn) (map[string]any, error) {
+		}, function.WithName("search_content"), function.WithDescription("Search UTF-8 files under path. Escaping symlinks are not followed. Large files and excess matches are skipped."))),
+		asRead(function.NewFunctionTool(func(ctx context.Context, in multiIn) (map[string]any, error) {
 			var files []map[string]string
 			for _, pattern := range in.Patterns {
 				matches, _, err := coding.Match(ws(ctx), ".", pattern)
@@ -232,7 +285,7 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 				}
 			}
 			return map[string]any{"files": files}, nil
-		}, function.WithName("read_multiple_files"), function.WithDescription("Read workspace files matched by glob patterns.")),
+		}, function.WithName("read_multiple_files"), function.WithDescription("Read workspace files matched by glob patterns."))),
 	}
 	if !allowWrite {
 		return tools
@@ -268,7 +321,7 @@ func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) ([]tool.Too
 			function.WithName("run_command"),
 			function.WithDescription("Run an argv command in the workspace. argv is not a shell string. The result includes the isolation level that was actually used."),
 		),
-		function.NewFunctionTool(
+		asRead(function.NewFunctionTool(
 			func(ctx context.Context, in pathIn) (map[string]string, error) {
 				text, err := coding.GitStatus(ctx, workspace)
 				if err != nil {
@@ -278,8 +331,8 @@ func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) ([]tool.Too
 			},
 			function.WithName("git_status"),
 			function.WithDescription("Read-only git status. Does not add, commit, push, reset, or clean."),
-		),
-		function.NewFunctionTool(
+		)),
+		asRead(function.NewFunctionTool(
 			func(ctx context.Context, in pathIn) (map[string]string, error) {
 				text, err := coding.GitDiff(ctx, workspace)
 				if err != nil {
@@ -289,7 +342,7 @@ func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) ([]tool.Too
 			},
 			function.WithName("git_diff"),
 			function.WithDescription("Read-only git diff. Does not add, commit, push, reset, or clean."),
-		),
+		)),
 	)
 	return tools, nil
 }

@@ -3,7 +3,6 @@ package trpcruntime
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/lookerjin/grape-core/agent"
@@ -36,6 +35,11 @@ func (p *hookPlugin) Register(reg *trpcplugin.Registry) {
 }
 
 func (p *hookPlugin) beforeAgent(ctx context.Context, args *trpcagent.BeforeAgentArgs) (*trpcagent.BeforeAgentResult, error) {
+	if args != nil && args.Invocation != nil {
+		if st := stateFrom(ctx); st != nil {
+			st.noteRoot(args.Invocation.InvocationID)
+		}
+	}
 	if err := p.dispatch(ctx, hooks.BeforeRun, `{"event":"BeforeRun"}`); err != nil {
 		return nil, err
 	}
@@ -48,6 +52,11 @@ func (p *hookPlugin) afterAgent(ctx context.Context, args *trpcagent.AfterAgentA
 }
 
 func (p *hookPlugin) beforeModel(ctx context.Context, args *model.BeforeModelArgs) (*model.BeforeModelResult, error) {
+	if p.rt != nil {
+		if err := p.rt.consumeLLMCall(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if err := p.dispatch(ctx, hooks.BeforeModel, `{"event":"BeforeModel"}`); err != nil {
 		return nil, err
 	}
@@ -79,47 +88,21 @@ func (p *hookPlugin) beforeTool(ctx context.Context, args *tool.BeforeToolArgs) 
 			"error":  err.Error(),
 		}}, nil
 	}
-	if p.rt != nil && nestedCaller(ctx) {
-		kind := nestedToolKind(args.ToolName, args.Declaration)
-		if err := p.rt.authorize(ctx, kind, args.ToolName, ""); err != nil {
-			return &tool.BeforeToolResult{CustomResult: map[string]any{
-				"denied": true,
-				"error":  err.Error(),
-			}}, nil
+	if p.rt != nil {
+		if err := p.rt.consumeToolIteration(ctx); err != nil {
+			return nil, err
+		}
+		if p.rt.nestedCaller(ctx) {
+			kind := p.rt.nestedToolKind(ctx, args.ToolName)
+			if err := p.rt.authorize(ctx, kind, args.ToolName, ""); err != nil {
+				return &tool.BeforeToolResult{CustomResult: map[string]any{
+					"denied": true,
+					"error":  err.Error(),
+				}}, nil
+			}
 		}
 	}
 	return nil, nil
-}
-
-const rootAgentName = "grape"
-
-// nestedCaller reports whether the tool call is from a subagent or a
-// transferred agent. The root agent is "grape" and its tools already
-// authorize themselves. tRPC v1.12.0 puts the live invocation on the
-// BeforeTool context via agent.InvocationFromContext.
-func nestedCaller(ctx context.Context) bool {
-	inv, ok := trpcagent.InvocationFromContext(ctx)
-	if !ok || inv == nil {
-		return false
-	}
-	if inv.ParentMetadata != nil {
-		return true
-	}
-	return inv.AgentName != "" && inv.AgentName != rootAgentName
-}
-
-func nestedToolKind(name string, decl *tool.Declaration) string {
-	if strings.HasPrefix(name, "skill_") {
-		return "read"
-	}
-	switch name {
-	case "read_file", "list_file", "search_file", "search_content", "read_multiple_files", "git_status", "git_diff", "memory_recall":
-		return "read"
-	}
-	if decl != nil && strings.HasPrefix(strings.TrimSpace(decl.Description), "level:read") {
-		return "read"
-	}
-	return "side_effect"
 }
 
 func (p *hookPlugin) afterTool(ctx context.Context, args *tool.AfterToolArgs) (*tool.AfterToolResult, error) {

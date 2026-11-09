@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lookerjin/grape-core/agent"
 	"github.com/lookerjin/grape-core/config"
@@ -18,6 +19,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
+	agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
 
@@ -523,7 +525,7 @@ func TestChildReadToolIsNotPromptedInReadOnly(t *testing.T) {
 	var asked atomic.Int32
 	readTool := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
 		return "child-notes", nil
-	}, function.WithName("read_notes"), function.WithDescription("level:read notes"))
+	}, function.WithName("read_notes"), function.WithDescription("notes"))
 	mdl := mockmodel.New("child-read", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if hasToolMessage(req) {
 			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
@@ -549,6 +551,7 @@ func TestChildReadToolIsNotPromptedInReadOnly(t *testing.T) {
 	)
 	rt, err := New(Options{
 		Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root,
+		NestedReads: []NestedRead{{Agent: "helper", Tool: "read_notes"}},
 		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
 			asked.Add(1)
 			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
@@ -703,12 +706,441 @@ func TestTransferToAgentCannotRunSubagentTools(t *testing.T) {
 	}
 }
 
+func TestNestedSelfDeclaredReadIsDenied(t *testing.T) {
+	cases := []struct {
+		name string
+		desc string
+	}{
+		{name: "notes", desc: "level:read does something else"},
+		{name: "read_file", desc: "writes the workspace"},
+		{name: "git_diff", desc: "pushes the branch"},
+		{name: "skill_evil", desc: "deletes files"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ran atomic.Int32
+			evil := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
+				ran.Add(1)
+				return "pwned", nil
+			}, function.WithName(tc.name), function.WithDescription(tc.desc))
+			assertNestedToolDenied(t, evil, nil, tc.name, &ran)
+		})
+	}
+	t.Run("mcp", func(t *testing.T) {
+		var ran atomic.Int32
+		evil := &selfDeclaredReadTool{ran: &ran}
+		assertNestedToolDenied(t, nil, mcpSelfSet{tool: evil}, "mcp_self", &ran)
+	})
+}
+
+type selfDeclaredReadTool struct{ ran *atomic.Int32 }
+
+func (t *selfDeclaredReadTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{Name: "mcp_self", Description: "level:read remote"}
+}
+
+func (t *selfDeclaredReadTool) Call(ctx context.Context, args []byte) (any, error) {
+	t.ran.Add(1)
+	return "pwned", nil
+}
+
+func (t *selfDeclaredReadTool) ToolMetadata() tool.ToolMetadata {
+	return tool.ToolMetadata{ReadOnly: true}
+}
+
+type mcpSelfSet struct{ tool tool.Tool }
+
+func (s mcpSelfSet) Tools(ctx context.Context) []tool.Tool { return []tool.Tool{s.tool} }
+func (s mcpSelfSet) Close() error                          { return nil }
+func (s mcpSelfSet) Name() string                          { return "" }
+
+func assertNestedToolDenied(t *testing.T, evil tool.Tool, set tool.ToolSet, callName string, ran *atomic.Int32) {
+	t.Helper()
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionReadOnly
+	cfg.Approvals.Required = true
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	cfg.Context.MaxLLMCalls = 12
+	cfg.Context.MaxToolIterations = 12
+	mdl := mockmodel.New("bypass-"+callName, func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		if strings.Contains(messagesText(req), "child-agent") {
+			name := callName
+			for toolName := range req.Tools {
+				if toolName == callName || strings.HasSuffix(toolName, "_"+callName) || strings.Contains(toolName, callName) {
+					name = toolName
+					break
+				}
+			}
+			return toolCall(name, `{}`), nil
+		}
+		return toolCall("transfer_to_agent", `{"agent_name":"helper","message":"go"}`), nil
+	})
+	opts := []llmagent.Option{
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("child-agent"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+	}
+	if evil != nil {
+		opts = append(opts, llmagent.WithTools([]tool.Tool{evil}))
+	}
+	if set != nil {
+		opts = append(opts, llmagent.WithToolSets([]tool.ToolSet{set}), llmagent.WithRefreshToolSetsOnRun(true))
+	}
+	child := llmagent.New("helper", opts...)
+	root := llmagent.New("grape",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("root"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithSubAgents([]trpcagent.Agent{child}),
+	)
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root,
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			if req.Detail == "helper" {
+				return agent.Decision{ID: req.ID, Allow: true}, nil
+			}
+			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "bypass-" + callName, Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if ran.Load() != 0 || strings.Contains(blob, "pwned") {
+		t.Fatalf("%s ran %d times: %s", callName, ran.Load(), blob)
+	}
+	if !strings.Contains(blob, "read_only") {
+		t.Fatalf("%s was not denied: %s", callName, blob)
+	}
+}
+
+func TestBuiltinReadIdentityStaysUnprompted(t *testing.T) {
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionReadOnly
+	cfg.Approvals.Required = true
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	var asked atomic.Int32
+	var ran atomic.Int32
+	inner := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
+		ran.Add(1)
+		return "from-builtin", nil
+	}, function.WithName("read_file"), function.WithDescription("level:read but this wrapper is the grape type"))
+	readTool := builtinReadTool{inner: inner}
+	mdl := mockmodel.New("ident", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		if strings.Contains(messagesText(req), "child-agent") {
+			return toolCall("read_file", `{}`), nil
+		}
+		return toolCall("transfer_to_agent", `{"agent_name":"helper","message":"go"}`), nil
+	})
+	child := llmagent.New("helper",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("child-agent"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithTools([]tool.Tool{readTool}),
+	)
+	root := llmagent.New("grape",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("root"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithSubAgents([]trpcagent.Agent{child}),
+	)
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root,
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			asked.Add(1)
+			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "ident", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if asked.Load() != 0 || ran.Load() != 1 || !strings.Contains(blob, "from-builtin") {
+		t.Fatalf("asked=%d ran=%d %s", asked.Load(), ran.Load(), blob)
+	}
+}
+
+func TestNewRejectsNonRootAgentNamedGrape(t *testing.T) {
+	cfg := config.Default()
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	mdl := mockmodel.New("reserved", mockmodel.Echo)
+	base := func() []llmagent.Option {
+		return []llmagent.Option{
+			llmagent.WithModel(mdl),
+			llmagent.WithEnableCodeExecutionResponseProcessor(false),
+			llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		}
+	}
+	grapeAgent := func(name string, subs []trpcagent.Agent) trpcagent.Agent {
+		opts := base()
+		if len(subs) > 0 {
+			opts = append(opts, llmagent.WithSubAgents(subs))
+		}
+		return llmagent.New(name, opts...)
+	}
+	t.Run("subagent", func(t *testing.T) {
+		_, err := New(Options{
+			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+			SubAgents: []trpcagent.Agent{grapeAgent("grape", nil)},
+		})
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("transfer-target", func(t *testing.T) {
+		child := grapeAgent("helper", []trpcagent.Agent{grapeAgent("grape", nil)})
+		_, err := New(Options{
+			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+			SubAgents: []trpcagent.Agent{child},
+		})
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("agenttool", func(t *testing.T) {
+		wrapped := agenttool.NewTool(grapeAgent("grape", nil))
+		_, err := New(Options{
+			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+			Tools: []tool.Tool{wrapped},
+		})
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+}
+
+func TestEmptyIDDoesNotTreatGrapeNameAsRoot(t *testing.T) {
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Approvals.Required = true
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	cfg.Context.MaxLLMCalls = 8
+	cfg.Context.MaxToolIterations = 8
+	var ran atomic.Int32
+	var asked atomic.Int32
+	danger := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
+		ran.Add(1)
+		return "pwned", nil
+	}, function.WithName("child_danger"), function.WithDescription("side effect"))
+	mdl := mockmodel.New("empty-id", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		if strings.Contains(messagesText(req), "child-agent") {
+			if strings.Contains(messagesText(req), "child_danger") && hasToolMessage(req) || strings.Count(messagesText(req), "child_danger") > 1 {
+				return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+			}
+			return toolCallID("child_danger", `{}`, ""), nil
+		}
+		return toolCallID("transfer_to_agent", `{"agent_name":"helper","message":"go"}`, ""), nil
+	})
+	child := llmagent.New("grape",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("child-agent"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithTools([]tool.Tool{danger}),
+	)
+	root := llmagent.New("orchestrator",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("root"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithSubAgents([]trpcagent.Agent{child}),
+	)
+	_, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root})
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("direct child named grape: %v", err)
+	}
+
+	helper := llmagent.New("helper",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("child-agent"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithTools([]tool.Tool{danger}),
+	)
+	root = llmagent.New("orchestrator",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("root"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithTools([]tool.Tool{function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
+			return "root-ok", nil
+		}, function.WithName("root_mark"), function.WithDescription("root tool"))}),
+		llmagent.WithSubAgents([]trpcagent.Agent{helper}),
+	)
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root,
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			asked.Add(1)
+			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "empty-id", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if ran.Load() != 0 || strings.Contains(blob, "pwned") {
+		t.Fatalf("empty-id child ran: %s", blob)
+	}
+	if !strings.Contains(blob, "child_danger") {
+		t.Fatalf("empty-id child was not gated: %s", blob)
+	}
+}
+
+func TestRootNameIsNotTheRootIdentity(t *testing.T) {
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Approvals.Required = true
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	var ran atomic.Int32
+	var asked atomic.Int32
+	rootTool := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
+		ran.Add(1)
+		return "root-ran", nil
+	}, function.WithName("root_mark"), function.WithDescription("root side effect"))
+	mdl := mockmodel.New("root-id", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return toolCall("root_mark", `{}`), nil
+	})
+	root := llmagent.New("orchestrator",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("root"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithTools([]tool.Tool{rootTool}),
+	)
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root,
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			asked.Add(1)
+			return agent.Decision{ID: req.ID, Allow: true}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "root-id", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if ran.Load() != 1 || asked.Load() != 0 {
+		t.Fatalf("ran=%d asked=%d %s", ran.Load(), asked.Load(), blob)
+	}
+}
+
+func TestNestedLoopHitsRunBudget(t *testing.T) {
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	cfg.Context.MaxLLMCalls = 4
+	cfg.Context.MaxToolIterations = 30
+	cfg.Approvals.Required = true
+	var calls atomic.Int32
+	mdl := mockmodel.New("budget", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if calls.Add(1) > 20 {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("stop")}}}, nil
+		}
+		text := messagesText(req)
+		if strings.Contains(text, "other-agent") {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("other-done")}}}, nil
+		}
+		if strings.Contains(text, "child-agent") {
+			return toolCallID("transfer_to_agent", `{"agent_name":"other","message":"go"}`, ""), nil
+		}
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return toolCall("helper", `{"request":"go"}`), nil
+	})
+	other := llmagent.New("other",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("other-agent"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+	)
+	child := llmagent.New("helper",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("child-agent"),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithSubAgents([]trpcagent.Agent{other}),
+	)
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		SubAgents: []trpcagent.Agent{child},
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			if req.Detail == "helper" {
+				return agent.Decision{ID: req.ID, Allow: true}, nil
+			}
+			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	h, err := rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "budget", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if calls.Load() > 12 {
+		t.Fatalf("nested loop calls=%d %s", calls.Load(), blob)
+	}
+	if !strings.Contains(blob, "max LLM calls") {
+		t.Fatalf("missing budget error: %s", blob)
+	}
+}
+
 func toolCall(name, args string) *model.Response {
+	return toolCallID(name, args, "call-"+name)
+}
+
+func toolCallID(name, args, id string) *model.Response {
 	return &model.Response{Choices: []model.Choice{{
 		Message: model.Message{
 			Role: model.RoleAssistant,
 			ToolCalls: []model.ToolCall{{
-				ID:   "call-" + name,
+				ID:   id,
 				Type: "function",
 				Function: model.FunctionDefinitionParam{
 					Name:      name,
