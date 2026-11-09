@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+      - name: Install MinGW for cgo SQLite
+        if: runner.os == 'Windows'
+        run: choco install mingw -y --no-progress
+      - name: Build, vet, and test
+        env:
+          CGO_ENABLED: "1"
+          GOTOOLCHAIN: local
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./... -count=1
+        shell: bash

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +91,9 @@ func TestManagedSandboxDeniesOutsideWrite(t *testing.T) {
 }
 
 func TestDangerCancelKillsProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group cancellation is unverified on Windows")
+	}
 	dir := t.TempDir()
 	cfg := config.Default()
 	cfg.Workspace.Permission = agent.PermissionDangerFullAccess
