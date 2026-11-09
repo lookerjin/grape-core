@@ -43,4 +43,8 @@ Windows has no managed native backend. `commandExecutor` returns `agent.ErrSandb
 
 `run_command` takes an argv, not a shell string. The tool result includes `isolation`: `managed`, `none`, or `external`.
 
+Workspace file tools use `os.Root`. A symlink whose target is outside the workspace is rejected. An absolute symlink is also rejected, even when the target is inside the workspace. That is an `os.Root` limit, not a separate policy.
+
+Stdio MCP, after `trust: host`, is started with a minimal environment on Linux (`env -i` plus `PATH`, `HOME`, `LANG`, `TERM`, and the other shell startup names). On Windows the upstream stdio client is started as given, so the server still inherits the host environment. That path was not executed here.
+
 Git status and diff are fixed argv inspections. They are not the sandbox command path, and they do not stage files.
