@@ -95,8 +95,9 @@ type Runtime struct {
 	maxField    int
 	instruction string
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	mu       sync.Mutex
+	locks    map[string]*sync.Mutex
+	draining map[string]error
 
 	closeOnce sync.Once
 	closeErr  error
@@ -172,6 +173,7 @@ func New(opts Options) (*Runtime, error) {
 		maxField:    cfg.Journal.MaxFieldBytes,
 		instruction: instruction,
 		locks:       map[string]*sync.Mutex{},
+		draining:    map[string]error{},
 		fixed:       opts.FixedAgent,
 		subs:        append([]trpcagent.Agent(nil), opts.SubAgents...),
 	}
@@ -281,7 +283,7 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		llmagent.WithWorkspaceExecSurfaceEnabled(false),
 		llmagent.WithMaxLLMCalls(positiveLimit(rt.cfg.Context.MaxLLMCalls)),
 		llmagent.WithMaxToolIterations(positiveLimit(rt.cfg.Context.MaxToolIterations)),
-		llmagent.WithTools(tools),
+		llmagent.WithTools(trackTools(tools)),
 	}
 	if len(rt.mcpSets) > 0 {
 		opts = append(opts, llmagent.WithToolSets(rt.mcpSets))
@@ -444,7 +446,9 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		unlock()
 		return nil, classifyRunError(err)
 	}
-	ch := make(chan agent.Event, 256)
+	box := newEventBox(256)
+	ch := make(chan agent.Event)
+	go box.pump(ch)
 	h := &runHandle{
 		id:     runID,
 		events: ch,
@@ -459,7 +463,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 			return runner.EnqueueUserMessage(rt.runner, runID, model.NewUserMessage(message))
 		},
 	}
-	go rt.forward(runCtx, req, runID, st, events, ch, unlock)
+	go rt.forward(runCtx, req, runID, st, events, box, unlock)
 	return h, nil
 }
 
@@ -470,9 +474,9 @@ func classifyRunError(err error) error {
 	return agent.Wrap(agent.ErrModel, "run", err)
 }
 
-func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID string, st *runState, in <-chan *event.Event, out chan<- agent.Event, unlock func()) {
-	defer unlock()
-	defer close(out)
+func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID string, st *runState, in <-chan *event.Event, out *eventBox, unlock func()) {
+	defer rt.finishSession(req.SessionID, st, unlock)
+	defer out.close()
 	conv := newConverter(runID, req.SessionID, rt.maxField, rt.secrets)
 	terminal := false
 	emit := func(evt agent.Event) {
@@ -488,31 +492,8 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 		if rt.journal != nil {
 			_ = rt.journal.Append(evt)
 		}
-		if ctx.Err() != nil && evt.Terminal() {
-			timer := time.NewTimer(time.Second)
-			select {
-			case out <- evt:
-			case <-timer.C:
-			}
-			timer.Stop()
-			terminal = true
-			return
-		}
-		select {
-		case out <- evt:
-			if evt.Terminal() {
-				terminal = true
-			}
-		case <-ctx.Done():
-			if !evt.Terminal() {
-				return
-			}
-			timer := time.NewTimer(time.Second)
-			select {
-			case out <- evt:
-			case <-timer.C:
-			}
-			timer.Stop()
+		out.push(evt)
+		if evt.Terminal() {
 			terminal = true
 		}
 	}
@@ -609,8 +590,29 @@ drained:
 	}
 }
 
+func (rt *Runtime) finishSession(id string, st *runState, unlock func()) {
+	if st == nil || st.inflight.Load() == 0 {
+		unlock()
+		return
+	}
+	rt.mu.Lock()
+	rt.draining[id] = fmt.Errorf("session %s is still finishing tool execution", id)
+	rt.mu.Unlock()
+	go func() {
+		st.tools.Wait()
+		rt.mu.Lock()
+		delete(rt.draining, id)
+		rt.mu.Unlock()
+		unlock()
+	}()
+}
+
 func (rt *Runtime) lockSession(ctx context.Context, id string) (func(), error) {
 	rt.mu.Lock()
+	if err := rt.draining[id]; err != nil {
+		rt.mu.Unlock()
+		return nil, agent.Wrap(agent.ErrSession, "session", err)
+	}
 	mu := rt.locks[id]
 	if mu == nil {
 		mu = &sync.Mutex{}
@@ -628,15 +630,30 @@ func (rt *Runtime) lockSession(ctx context.Context, id string) (func(), error) {
 		mu.Lock()
 		close(locked)
 	}()
-	select {
-	case <-locked:
-		return mu.Unlock, nil
-	case <-ctx.Done():
-		go func() {
-			<-locked
-			mu.Unlock()
-		}()
-		return nil, agent.Wrap(agent.ErrRunCancelled, "session", ctx.Err())
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-locked:
+			return mu.Unlock, nil
+		case <-ctx.Done():
+			go func() {
+				<-locked
+				mu.Unlock()
+			}()
+			return nil, agent.Wrap(agent.ErrRunCancelled, "session", ctx.Err())
+		case <-ticker.C:
+			rt.mu.Lock()
+			err := rt.draining[id]
+			rt.mu.Unlock()
+			if err != nil {
+				go func() {
+					<-locked
+					mu.Unlock()
+				}()
+				return nil, agent.Wrap(agent.ErrSession, "session", err)
+			}
+		}
 	}
 }
 

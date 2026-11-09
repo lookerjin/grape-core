@@ -250,6 +250,10 @@ type hostMCPTool struct {
 func (t hostMCPTool) Declaration() *tool.Declaration { return t.inner.Declaration() }
 
 func (t hostMCPTool) Call(ctx context.Context, args []byte) (any, error) {
+	if st := stateFrom(ctx); st != nil {
+		st.enterTool()
+		defer st.leaveTool()
+	}
 	if t.rt != nil {
 		name := ""
 		if decl := t.Declaration(); decl != nil {

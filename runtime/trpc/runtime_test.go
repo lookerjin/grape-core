@@ -251,6 +251,128 @@ func TestCancelUnblocksSameSession(t *testing.T) {
 	}
 }
 
+func TestCancelDoesNotOverlapToolExecution(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Approvals.Required = false
+	release := make(chan struct{})
+	var current atomic.Int32
+	var overlapped atomic.Bool
+	blocker := function.NewFunctionTool(func(ctx context.Context, in echoIn) (echoOut, error) {
+		if current.Add(1) > 1 {
+			overlapped.Store(true)
+		}
+		defer current.Add(-1)
+		select {
+		case <-release:
+		case <-time.After(3 * time.Second):
+		}
+		return echoOut{Text: in.Text}, nil
+	}, function.WithName("block"), function.WithDescription("blocks"))
+	mdl := mockmodel.New("block", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return &model.Response{Choices: []model.Choice{{
+			Message: model.Message{
+				Role: model.RoleAssistant,
+				ToolCalls: []model.ToolCall{{
+					ID:   "call-block",
+					Type: "function",
+					Function: model.FunctionDefinitionParam{
+						Name:      "block",
+						Arguments: []byte(`{"text":"x"}`),
+					},
+				}},
+			},
+		}}}, nil
+	})
+	rt, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir(), Tools: []tool.Tool{blocker}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	defer close(release)
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "overlap", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for current.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if current.Load() == 0 {
+		t.Fatal("tool did not start")
+	}
+	if err := h.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(6 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "overlap", Message: "next"})
+	if err == nil {
+		t.Fatal("second run started while the first tool was still executing")
+	}
+	if !strings.Contains(err.Error(), "finishing tool execution") {
+		t.Fatalf("error %v", err)
+	}
+	if overlapped.Load() {
+		t.Fatal("tool executions overlapped")
+	}
+}
+
+func TestLateConsumerReceivesTerminalEvent(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Context.MaxLLMCalls = 800
+	cfg.Context.MaxToolIterations = 800
+	var calls atomic.Int32
+	mdl := mockmodel.New("flood2", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if hasToolMessage(req) {
+			if calls.Load() > 300 {
+				return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+			}
+		}
+		calls.Add(1)
+		return &model.Response{Choices: []model.Choice{{
+			Message: model.Message{
+				Role: model.RoleAssistant,
+				ToolCalls: []model.ToolCall{{
+					ID:   "call-flood",
+					Type: "function",
+					Function: model.FunctionDefinitionParam{
+						Name:      "echo",
+						Arguments: []byte(`{"text":"x"}`),
+					},
+				}},
+			},
+		}}}, nil
+	})
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "late", Message: "flood"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	for calls.Load() < 256 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls.Load() < 256 {
+		t.Fatalf("produced %d events before reading", calls.Load())
+	}
+	events := collect(t, h)
+	if len(events) == 0 || !events[len(events)-1].Terminal() {
+		t.Fatalf("late consumer last=%v len=%d", kinds(events), len(events))
+	}
+}
+
 func TestRejectConcurrentSession(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false

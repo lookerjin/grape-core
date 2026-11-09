@@ -60,6 +60,15 @@ func TestUntrustedToolsAndSubagentsAreGated(t *testing.T) {
 			if !strings.Contains(blob, "denied") {
 				t.Fatalf("%s %s ran the extra tool: %s", perm, mode, blob)
 			}
+			if perm == agent.PermissionReadOnly {
+				if asked != 0 {
+					t.Fatalf("%s %s asked the approver %d times", perm, mode, asked)
+				}
+				if !strings.Contains(blob, "read_only") {
+					t.Fatalf("%s %s missing read_only denial: %s", perm, mode, blob)
+				}
+				continue
+			}
 			if asked == 0 {
 				t.Fatalf("%s %s asked=0: %s", perm, mode, blob)
 			}
@@ -106,6 +115,41 @@ func TestUntrustedToolsAndSubagentsAreGated(t *testing.T) {
 	}
 	if !strings.Contains(blob, "denied") {
 		t.Fatalf("subagent was not gated: %s", blob)
+	}
+}
+
+type bareTool struct{}
+
+func (bareTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{Name: "bare"}
+}
+
+func TestNonCallableToolIsRejected(t *testing.T) {
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	mdl := mockmodel.New("bare", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return toolCall("bare", `{}`), nil
+	})
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Tools: []tool.Tool{bareTool{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "bare", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if !strings.Contains(blob, "not callable") {
+		t.Fatalf("non-callable tool was not rejected: %s", blob)
 	}
 }
 

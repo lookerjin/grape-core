@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,11 +17,13 @@ import (
 )
 
 type runState struct {
-	mu      sync.Mutex
-	events  []agent.Event
-	runID   string
-	session string
-	mode    agent.Mode
+	mu       sync.Mutex
+	events   []agent.Event
+	runID    string
+	session  string
+	mode     agent.Mode
+	inflight atomic.Int32
+	tools    sync.WaitGroup
 }
 
 type stateKey struct{}
@@ -42,6 +45,22 @@ func (st *runState) add(evt agent.Event) {
 	st.mu.Lock()
 	st.events = append(st.events, evt)
 	st.mu.Unlock()
+}
+
+func (st *runState) enterTool() {
+	if st == nil {
+		return
+	}
+	st.inflight.Add(1)
+	st.tools.Add(1)
+}
+
+func (st *runState) leaveTool() {
+	if st == nil {
+		return
+	}
+	st.inflight.Add(-1)
+	st.tools.Done()
 }
 
 func (st *runState) drain() []agent.Event {
@@ -276,9 +295,63 @@ func (t gatedTool) Call(ctx context.Context, args []byte) (any, error) {
 func (rt *Runtime) gate(item tool.Tool, kind string) tool.Tool {
 	callable, ok := item.(tool.CallableTool)
 	if !ok || rt == nil {
-		return item
+		return rejectedTool{inner: item, rt: rt, kind: kind}
 	}
 	return gatedTool{rt: rt, inner: callable, kind: kind}
+}
+
+// rejectedTool is a non-callable tool exposed as a callable denial so it
+// cannot skip the approval gate.
+type rejectedTool struct {
+	inner tool.Tool
+	rt    *Runtime
+	kind  string
+}
+
+func (t rejectedTool) Declaration() *tool.Declaration {
+	if t.inner != nil && t.inner.Declaration() != nil {
+		return t.inner.Declaration()
+	}
+	return &tool.Declaration{Name: "rejected"}
+}
+
+func (t rejectedTool) Call(ctx context.Context, args []byte) (any, error) {
+	name := t.Declaration().Name
+	if t.rt != nil {
+		if err := t.rt.authorize(ctx, t.kind, name, ""); err != nil {
+			return map[string]any{"denied": true, "error": err.Error()}, nil
+		}
+	}
+	return map[string]any{"denied": true, "error": "tool is not callable"}, nil
+}
+
+type trackingTool struct{ inner tool.CallableTool }
+
+func (t trackingTool) Declaration() *tool.Declaration { return t.inner.Declaration() }
+
+func (t trackingTool) Call(ctx context.Context, args []byte) (any, error) {
+	st := stateFrom(ctx)
+	if st != nil {
+		st.enterTool()
+		defer st.leaveTool()
+	}
+	return t.inner.Call(ctx, args)
+}
+
+func trackTool(item tool.Tool) tool.Tool {
+	callable, ok := item.(tool.CallableTool)
+	if !ok {
+		return item
+	}
+	return trackingTool{inner: callable}
+}
+
+func trackTools(tools []tool.Tool) []tool.Tool {
+	out := make([]tool.Tool, len(tools))
+	for i, item := range tools {
+		out[i] = trackTool(item)
+	}
+	return out
 }
 
 func mutatingKind(kind string) bool {
@@ -291,14 +364,14 @@ func mutatingKind(kind string) bool {
 }
 
 func (rt *Runtime) authorize(ctx context.Context, kind, detail, path string) error {
+	if rt.cfg.Workspace.Permission == agent.PermissionReadOnly && mutatingKind(kind) {
+		rt.recordDecision(ctx, kind, detail, path, false, "read_only")
+		return agent.Wrap(agent.ErrPermissionDenied, kind, fmt.Errorf("read_only workspace"))
+	}
 	if mutatingKind(kind) && rt.needsApproval(ctx) {
 		if err := rt.decide(ctx, kind, detail, path); err != nil {
 			return err
 		}
-	}
-	if rt.cfg.Workspace.Permission == agent.PermissionReadOnly && mutatingKind(kind) {
-		rt.recordDecision(ctx, kind, detail, path, false, "read_only")
-		return agent.Wrap(agent.ErrPermissionDenied, kind, fmt.Errorf("read_only workspace"))
 	}
 	return nil
 }
