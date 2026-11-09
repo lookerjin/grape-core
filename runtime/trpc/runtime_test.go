@@ -608,6 +608,57 @@ func runtimeMem() uint64 {
 	return m.HeapAlloc
 }
 
+func TestSlowLiveReaderKeepsToolEvents(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Approvals.Required = false
+	// 400ms between takes, hold 2s. The drain lasts about 8s, so a clock
+	// that starts when the run finishes drops tool events. The idle clock
+	// restarts on each take, and every tool_end arrives.
+	cfg.Context.EventHoldTimeout = "2s"
+	cfg.Context.MaxLLMCalls = 80
+	cfg.Context.MaxToolIterations = 80
+	var calls atomic.Int32
+	mdl := mockmodel.New("slow-reader", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if calls.Add(1) > 20 {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return &model.Response{Choices: []model.Choice{{
+			Message: model.Message{
+				Role: model.RoleAssistant,
+				ToolCalls: []model.ToolCall{{
+					ID:   fmt.Sprintf("call-%d", calls.Load()),
+					Type: "function",
+					Function: model.FunctionDefinitionParam{
+						Name:      "echo",
+						Arguments: []byte(`{"text":"e"}`),
+					},
+				}},
+			},
+		}}}, nil
+	})
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "slow", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ends := 0
+	var last agent.Event
+	for evt := range h.Events() {
+		last = evt
+		if evt.Kind != agent.EventToolEnd {
+			continue
+		}
+		ends++
+		time.Sleep(400 * time.Millisecond)
+	}
+	if ends != 20 || !last.Terminal() {
+		t.Fatalf("tool_end=%d last=%s", ends, last.Kind)
+	}
+}
+
 func TestLateReaderAfterHoldSeesTerminal(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false

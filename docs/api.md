@@ -19,9 +19,11 @@ for evt := range run.Events() {
 }
 ```
 
-`RunHandle.Events` closes after one terminal event: `completed`, `failed`, or `cancelled`. `Sequence` is monotonic for that process-local run. It is not a durable cursor. `RunHandle.Close` drops unread events and releases the pump. Call it when the consumer will not read. If a finished run is not drained within `context.event_hold_timeout` (default 30s), the pump discards the backlog, leaves the terminal event, and exits. `Runtime.Close` releases every pump.
+`RunHandle.Events` closes after one terminal event: `completed`, `failed`, or `cancelled`. `Sequence` is monotonic for that process-local run. It is not a durable cursor. `RunHandle.Close` drops unread events and releases the pump. Call it when the consumer will not read. After a run finishes, `context.event_hold_timeout` (default 30s) measures how long the consumer has gone without taking the next event. A reader that keeps taking events receives every tool, permission, and error event. When the idle gap elapses, the pump discards the remaining backlog, leaves the terminal event, and exits. `Runtime.Close` releases every pump.
 
-The stream keeps a soft buffer of 256 events. Only `text_delta` events are dropped when a consumer falls behind. One `dropped N events` marker is emitted per catch-up, not once per dropped delta. Tool calls, permission decisions, errors, hook failures, and the terminal event are not dropped; the buffer grows to hold them.
+The stream keeps a soft buffer of 256 events. Only `text_delta` events are dropped when a consumer falls behind. One `dropped N events` marker is emitted per catch-up, not once per dropped delta. Tool calls, permission decisions, errors, hook failures, and the terminal event are not dropped while the consumer is still taking events; the buffer grows to hold them.
+
+Nested tool calls are authorized by the calling invocation, not by the tool's name or description. Read is granted to grape's own read-tool types, to a user-configured MCP server whose `level` is `read`, and to `Options.NestedReads` agent/tool pairs. A nested agent cannot take the root's place by naming itself `grape`. `context.max_llm_calls` and `context.max_tool_iterations` bound the whole run, including nested model loops.
 
 `RunHandle.Cancel` cancels the caller context and the tRPC managed run. The session lock stays held until in-flight tool calls return. `context.tool_drain_timeout` (default 30s) bounds that wait. After it, the session is poisoned and `Start` returns that error until `ForceReleaseSession`. Releasing the lock does not stop a tool that ignores cancellation. `Enqueue` uses `SteerableRunner` when the runner supports it.
 

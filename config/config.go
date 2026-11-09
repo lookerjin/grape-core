@@ -188,8 +188,10 @@ type ContextConfig struct {
 	// to return before the session is marked poisoned. Zero uses 30s.
 	// ForceReleaseSession is the explicit recovery.
 	ToolDrainTimeout string `yaml:"tool_drain_timeout"`
-	// EventHoldTimeout is how long a finished run keeps unread events
-	// before the pump keeps only the terminal event and exits. Zero uses 30s.
+	// EventHoldTimeout is how long a finished run waits after the consumer
+	// last took an event before the pump drops non-terminal events and
+	// leaves the terminal event. A reader that keeps taking events keeps
+	// tool, permission, and error events. Zero uses 30s.
 	EventHoldTimeout string `yaml:"event_hold_timeout"`
 }
 

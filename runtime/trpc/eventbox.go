@@ -106,9 +106,11 @@ func (b *eventBox) abandon() {
 }
 
 // pump sends queued events until the box is drained, stop is closed, or
-// idle elapses after the run is finished without a consumer taking the
-// next event. On that timeout the backlog is discarded and only a drop
-// marker plus the terminal event are sent.
+// the consumer leaves an event unread for idle after the run has finished.
+// The idle clock starts when an event is sitting in out and restarts when
+// the consumer takes it. A reader that keeps taking events keeps every
+// tool, permission, and error event. On timeout the backlog is discarded
+// and only a drop marker plus the terminal event are sent.
 func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.Duration) {
 	defer close(out)
 	if idle <= 0 {
@@ -116,11 +118,19 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.
 	}
 	var timer *time.Timer
 	var timed <-chan time.Time
-	defer func() {
-		if timer != nil {
-			timer.Stop()
+	stopTimer := func() {
+		if timer == nil {
+			return
 		}
-	}()
+		if !timer.Stop() {
+			select {
+			case <-timed:
+			default:
+			}
+		}
+		timed = nil
+	}
+	defer stopTimer()
 	arm := func() {
 		if timer == nil {
 			timer = time.NewTimer(idle)
@@ -134,14 +144,17 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.
 			}
 		}
 		timer.Reset(idle)
+		timed = timer.C
 	}
+	pulse := time.NewTicker(10 * time.Millisecond)
+	defer pulse.Stop()
 	for {
 		evt, ok := b.pop(stop)
 		if !ok {
 			return
 		}
 		for len(out) > 0 {
-			if b.isClosed() && timer == nil {
+			if b.isClosed() && timed == nil {
 				arm()
 			}
 			select {
@@ -150,17 +163,17 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.
 				return
 			case <-stop:
 				return
-			case <-time.After(10 * time.Millisecond):
+			case <-pulse.C:
 			}
 		}
+		// The consumer took the previous event. Restart the idle clock
+		// only after the next event is unread.
+		stopTimer()
 		select {
 		case out <- evt:
 			if b.isClosed() {
 				arm()
 			}
-		case <-timed:
-			b.deliverFinal(out, &evt)
-			return
 		case <-stop:
 			return
 		}
