@@ -272,6 +272,9 @@ func TestPluginComponentNamesDoNotCollide(t *testing.T) {
 	if !sawAlpha || !sawBeta {
 		t.Fatalf("components %#v", resolved.Components)
 	}
+	if len(resolved.DiscoveryOnly) != 2 || resolved.DiscoveryOnly[0] != KindCommand || resolved.DiscoveryOnly[1] != KindAgent {
+		t.Fatalf("discovery %#v", resolved.DiscoveryOnly)
+	}
 }
 
 func run(t *testing.T, dir, name string, args ...string) {

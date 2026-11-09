@@ -61,6 +61,9 @@ type Record struct {
 type Resolved struct {
 	Plugins    []Record
 	Components []Component
+	// DiscoveryOnly kinds are listed in Components and are not assembled
+	// into the agent. command and agent are discovery-only.
+	DiscoveryOnly []Kind
 }
 
 // ErrConflict is returned when two components share a kind and name.
@@ -228,7 +231,11 @@ func Resolve(records []Record, policy string) (Resolved, error) {
 		}
 		return components[i].Kind < components[j].Kind
 	})
-	return Resolved{Plugins: enabled, Components: components}, nil
+	return Resolved{
+		Plugins:       enabled,
+		Components:    components,
+		DiscoveryOnly: []Kind{KindCommand, KindAgent},
+	}, nil
 }
 
 func (m *Manager) installTree(src, sourceLabel, revision string) (*Record, error) {

@@ -59,6 +59,8 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 					return err
 				}
 				hookSpecs = append(hookSpecs, specs...)
+			case plugin.KindCommand, plugin.KindAgent:
+				// Discovery only. There is no command template runner yet.
 			case plugin.KindMCP:
 				raw, err := os.ReadFile(comp.Path)
 				if err != nil {
