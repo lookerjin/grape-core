@@ -9,7 +9,7 @@ import "fmt"
 // The workspace write grant is an extra --bind. Files outside that grant
 // stay readable. Writes outside it are denied. This SDK does not report
 // that profile as filesystem isolation.
-const HostReadLimitation = "trpc-agent-go v1.12.0 WorkspaceWriteProfile mounts the host root read-only (--ro-bind / / on Linux); files outside the workspace remain readable, so FilesystemIsolation is false. Writes outside an explicit write grant are denied."
+const HostReadLimitation = "trpc-agent-go v1.12.0 WorkspaceWriteProfile mounts the host root read-only (--ro-bind / / on Linux). Files outside the workspace stay readable, so FilesystemIsolation is false. Existing sensitive paths in SensitivePathsMasked are covered with WithNoAccessPaths and are not readable. Writes outside an explicit write grant are denied."
 
 // WindowsUnavailable is the reason reported when the host has no managed backend.
 const WindowsUnavailable = "managed OS sandbox backend is not implemented on windows"
@@ -21,6 +21,8 @@ type Probe struct {
 	PreflightErr       error
 	NetworkRestricted  bool
 	ManagedImplemented bool
+	// SensitivePaths are existing host paths passed to WithNoAccessPaths.
+	SensitivePaths []string
 }
 
 // Assess converts a preflight into public capabilities.
@@ -49,6 +51,7 @@ func Assess(p Probe) Capabilities {
 	caps.FilesystemIsolation = false
 	caps.NetworkIsolation = p.NetworkRestricted
 	caps.Interactive = true
+	caps.SensitivePathsMasked = append([]string(nil), p.SensitivePaths...)
 	caps.Reason = HostReadLimitation
 	return caps
 }

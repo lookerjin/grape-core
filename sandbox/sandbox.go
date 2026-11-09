@@ -21,13 +21,14 @@ const (
 
 // Capabilities is the result of a backend preflight.
 type Capabilities struct {
-	Platform            string `json:"platform"`
-	ManagedIsolation    bool   `json:"managed_isolation"`
-	FilesystemIsolation bool   `json:"filesystem_isolation"`
-	NetworkIsolation    bool   `json:"network_isolation"`
-	PTY                 bool   `json:"pty"`
-	Interactive         bool   `json:"interactive"`
-	Reason              string `json:"reason,omitempty"`
+	Platform             string   `json:"platform"`
+	ManagedIsolation     bool     `json:"managed_isolation"`
+	FilesystemIsolation  bool     `json:"filesystem_isolation"`
+	NetworkIsolation     bool     `json:"network_isolation"`
+	PTY                  bool     `json:"pty"`
+	Interactive          bool     `json:"interactive"`
+	SensitivePathsMasked []string `json:"sensitive_paths_masked,omitempty"`
+	Reason               string   `json:"reason,omitempty"`
 }
 
 // Request is one command. Argv is executed directly. It is not a shell string.
