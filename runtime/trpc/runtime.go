@@ -51,11 +51,14 @@ type Options struct {
 	Instruction             string
 	// Platform overrides GOOS for sandbox preflight. Leave it empty in
 	// production. Tests set "windows" to exercise the fail-closed path.
-	Platform          string
-	External          sandbox.Backend
-	PluginManager     *plugin.Manager
-	FixedAgent        trpcagent.Agent
-	SubAgents         []trpcagent.Agent
+	Platform      string
+	External      sandbox.Backend
+	PluginManager *plugin.Manager
+	FixedAgent    trpcagent.Agent
+	SubAgents     []trpcagent.Agent
+	// ToolSpecs classifies extra tools. An empty Kind is side_effect.
+	// Trusted tools skip the approval gate; Options.Tools are untrusted.
+	ToolSpecs         []ToolSpec
 	EvolutionReviewer evolution.Reviewer
 }
 
@@ -72,6 +75,7 @@ type Runtime struct {
 	model       model.Model
 	exec        *commandExecutor
 	tools       []tool.Tool
+	specs       []ToolSpec
 	skillRoots  []string
 	ruleText    string
 	ruleSources []rules.Source
@@ -161,6 +165,7 @@ func New(opts Options) (*Runtime, error) {
 		model:       mdl,
 		exec:        newCommandExecutor(cfg, filepath.Join(os.TempDir(), "grape-core-sandbox"), dataDir, opts.Platform, opts.External),
 		tools:       append([]tool.Tool(nil), opts.Tools...),
+		specs:       append([]ToolSpec(nil), opts.ToolSpecs...),
 		decider:     opts.Decider,
 		reject:      opts.RejectConcurrentSession,
 		secrets:     secretValues(cfg),
@@ -235,14 +240,30 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	if err != nil {
 		return nil, err
 	}
-	tools = append(tools, rt.tools...)
+	for _, spec := range rt.specs {
+		if spec.Tool == nil {
+			continue
+		}
+		if spec.Trusted {
+			tools = append(tools, spec.Tool)
+			continue
+		}
+		kind := spec.Kind
+		if kind == "" {
+			kind = "side_effect"
+		}
+		tools = append(tools, rt.gate(spec.Tool, kind))
+	}
+	for _, item := range rt.tools {
+		tools = append(tools, rt.gate(item, "side_effect"))
+	}
 	mode := ""
 	if ro.RuntimeState != nil {
 		mode, _ = ro.RuntimeState["mode"].(string)
 	}
 	if len(rt.subs) > 0 {
 		for _, sub := range rt.subs {
-			tools = append(tools, agenttool.NewTool(sub))
+			tools = append(tools, rt.gate(agenttool.NewTool(sub), "side_effect"))
 		}
 	}
 	if rt.cfg.Memory.Enabled {
@@ -390,7 +411,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	default:
 		return nil, agent.Invalid("mode", fmt.Errorf("unsupported mode %q", req.Mode))
 	}
-	unlock, err := rt.lockSession(req.SessionID)
+	unlock, err := rt.lockSession(ctx, req.SessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -462,11 +483,37 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 		if evt.SessionID == "" {
 			evt.SessionID = req.SessionID
 		}
+		if ctx.Err() != nil && !evt.Terminal() {
+			return
+		}
 		if rt.journal != nil {
 			_ = rt.journal.Append(evt)
 		}
-		out <- evt
-		if evt.Terminal() {
+		if ctx.Err() != nil && evt.Terminal() {
+			timer := time.NewTimer(time.Second)
+			select {
+			case out <- evt:
+			case <-timer.C:
+			}
+			timer.Stop()
+			terminal = true
+			return
+		}
+		select {
+		case out <- evt:
+			if evt.Terminal() {
+				terminal = true
+			}
+		case <-ctx.Done():
+			if !evt.Terminal() {
+				return
+			}
+			timer := time.NewTimer(time.Second)
+			select {
+			case out <- evt:
+			case <-timer.C:
+			}
+			timer.Stop()
 			terminal = true
 		}
 	}
@@ -478,28 +525,62 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 			}
 		}
 	}
-	for evt := range in {
+	cancelled := ctx.Done()
+	for {
 		if terminal {
-			continue
+			go func() {
+				for range in {
+				}
+			}()
+			break
 		}
-		flush()
-		if terminal {
-			continue
-		}
-		for _, next := range conv.convert(evt) {
-			if next.Kind == agent.EventCompleted && ctx.Err() != nil {
-				next.Kind = agent.EventCancelled
-				next.Payload = agent.MustPayload(agent.TerminalPayload{
-					Status: string(agent.EventCancelled),
-					Error:  ctx.Err().Error(),
-				})
+		select {
+		case evt, ok := <-in:
+			if !ok {
+				goto drained
 			}
-			emit(next)
+			if ctx.Err() != nil {
+				continue
+			}
+			flush()
 			if terminal {
-				break
+				continue
 			}
+			for _, next := range conv.convert(evt) {
+				if next.Kind == agent.EventCompleted && ctx.Err() != nil {
+					next.Kind = agent.EventCancelled
+					next.Payload = agent.MustPayload(agent.TerminalPayload{
+						Status: string(agent.EventCancelled),
+						Error:  ctx.Err().Error(),
+					})
+				}
+				emit(next)
+				if terminal {
+					break
+				}
+			}
+		case <-cancelled:
+			cancelled = nil
+			if !terminal {
+				emit(conv.stamp(agent.Event{
+					RunID:     runID,
+					SessionID: req.SessionID,
+					Kind:      agent.EventCancelled,
+					Time:      time.Now().UTC(),
+					Payload: agent.MustPayload(agent.TerminalPayload{
+						Status: string(agent.EventCancelled),
+						Error:  ctx.Err().Error(),
+					}),
+				}))
+			}
+			go func() {
+				for range in {
+				}
+			}()
+			return
 		}
 	}
+drained:
 	if !terminal {
 		flush()
 	}
@@ -529,7 +610,7 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 	}
 }
 
-func (rt *Runtime) lockSession(id string) (func(), error) {
+func (rt *Runtime) lockSession(ctx context.Context, id string) (func(), error) {
 	rt.mu.Lock()
 	mu := rt.locks[id]
 	if mu == nil {
@@ -541,10 +622,23 @@ func (rt *Runtime) lockSession(id string) (func(), error) {
 		if !mu.TryLock() {
 			return nil, agent.Wrap(agent.ErrSession, "session", fmt.Errorf("session %s already has an active run", id))
 		}
-	} else {
-		mu.Lock()
+		return mu.Unlock, nil
 	}
-	return mu.Unlock, nil
+	locked := make(chan struct{})
+	go func() {
+		mu.Lock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+		return mu.Unlock, nil
+	case <-ctx.Done():
+		go func() {
+			<-locked
+			mu.Unlock()
+		}()
+		return nil, agent.Wrap(agent.ErrRunCancelled, "session", ctx.Err())
+	}
 }
 
 // ListSessions returns session metadata for a user.

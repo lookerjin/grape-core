@@ -2,7 +2,6 @@ package trpcruntime
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -246,14 +245,65 @@ func (rt *Runtime) runCommand(ctx context.Context, in cmdIn) (cmdOut, error) {
 	return out, err
 }
 
+// ToolSpec classifies a tool supplied by the caller.
+type ToolSpec struct {
+	Tool tool.Tool
+	// Kind is read, write, command, or side_effect. Empty means side_effect.
+	Kind string
+	// Trusted skips the approval and read_only gate.
+	Trusted bool
+}
+
+type gatedTool struct {
+	rt    *Runtime
+	inner tool.CallableTool
+	kind  string
+}
+
+func (t gatedTool) Declaration() *tool.Declaration { return t.inner.Declaration() }
+
+func (t gatedTool) Call(ctx context.Context, args []byte) (any, error) {
+	name := ""
+	if decl := t.Declaration(); decl != nil {
+		name = decl.Name
+	}
+	if err := t.rt.authorize(ctx, t.kind, name, ""); err != nil {
+		return map[string]any{"denied": true, "error": err.Error()}, nil
+	}
+	return t.inner.Call(ctx, args)
+}
+
+func (rt *Runtime) gate(item tool.Tool, kind string) tool.Tool {
+	callable, ok := item.(tool.CallableTool)
+	if !ok || rt == nil {
+		return item
+	}
+	return gatedTool{rt: rt, inner: callable, kind: kind}
+}
+
+func mutatingKind(kind string) bool {
+	switch kind {
+	case "command", "write", "side_effect":
+		return true
+	default:
+		return false
+	}
+}
+
 func (rt *Runtime) authorize(ctx context.Context, kind, detail, path string) error {
-	if rt.cfg.Workspace.Permission == agent.PermissionReadOnly && (kind == "command" || kind == "write") {
+	if mutatingKind(kind) && rt.needsApproval(ctx) {
+		if err := rt.decide(ctx, kind, detail, path); err != nil {
+			return err
+		}
+	}
+	if rt.cfg.Workspace.Permission == agent.PermissionReadOnly && mutatingKind(kind) {
 		rt.recordDecision(ctx, kind, detail, path, false, "read_only")
 		return agent.Wrap(agent.ErrPermissionDenied, kind, fmt.Errorf("read_only workspace"))
 	}
-	if !rt.needsApproval(ctx) {
-		return nil
-	}
+	return nil
+}
+
+func (rt *Runtime) decide(ctx context.Context, kind, detail, path string) error {
 	if rt.decider == nil {
 		rt.recordDecision(ctx, kind, detail, path, false, "no decider")
 		return agent.Wrap(agent.ErrPermissionDenied, kind, fmt.Errorf("approval required"))
@@ -313,26 +363,4 @@ func (rt *Runtime) recordDecision(ctx context.Context, kind, detail, path string
 			Reason:  reason,
 		}),
 	})
-}
-
-type gatedTool struct {
-	inner tool.CallableTool
-	kind  string
-	rt    *Runtime
-}
-
-func (g *gatedTool) Declaration() *tool.Declaration { return g.inner.Declaration() }
-
-func (g *gatedTool) Call(ctx context.Context, args []byte) (any, error) {
-	path := ""
-	var body map[string]any
-	if json.Unmarshal(args, &body) == nil {
-		if v, ok := body["file_name"].(string); ok {
-			path = v
-		}
-	}
-	if err := g.rt.authorize(ctx, g.kind, string(args), path); err != nil {
-		return map[string]any{"denied": true, "error": err.Error()}, nil
-	}
-	return g.inner.Call(ctx, args)
 }

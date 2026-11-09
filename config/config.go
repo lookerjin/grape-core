@@ -114,6 +114,9 @@ type MCPServerConfig struct {
 	// Trust must be "host" before a stdio server is launched. Stdio MCP
 	// runs on the host with isolation none; it is not the managed sandbox.
 	Trust string `yaml:"trust"`
+	// Level is "write" (default) or "read". Write-level MCP tools are gated
+	// like other workspace writes.
+	Level string `yaml:"level"`
 }
 
 // MCPConfig is the ordered server list. Later files replace the whole list

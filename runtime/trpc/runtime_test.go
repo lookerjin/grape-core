@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,6 +186,68 @@ func TestCancelClosesChannel(t *testing.T) {
 	last := events[len(events)-1].Kind
 	if last != agent.EventCancelled && last != agent.EventFailed {
 		t.Fatalf("last %s", last)
+	}
+}
+
+func TestCancelUnblocksSameSession(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Context.MaxLLMCalls = 1000
+	cfg.Context.MaxToolIterations = 1000
+	var phase atomic.Int32
+	mdl := mockmodel.New("flood", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if phase.Load() == 0 {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return &model.Response{Choices: []model.Choice{{
+				Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{{
+						ID:   "call-flood",
+						Type: "function",
+						Function: model.FunctionDefinitionParam{
+							Name:      "echo",
+							Arguments: []byte(`{"text":"x"}`),
+						},
+					}},
+				},
+			}}}, nil
+		}
+		return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+	})
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	before := goruntime.NumGoroutine()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "again", Message: "flood"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if err := h.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	phase.Store(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	h2, err := rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "again", Message: "next"})
+	if err != nil {
+		t.Fatalf("same session did not start after cancel: %v", err)
+	}
+	events := collect(t, h2)
+	if time.Since(start) > 3*time.Second {
+		t.Fatal("restart exceeded the bound")
+	}
+	if len(events) == 0 || !events[len(events)-1].Terminal() {
+		t.Fatalf("second run %#v", kinds(events))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for goruntime.NumGoroutine() > before+12 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if goruntime.NumGoroutine() > before+12 {
+		t.Fatalf("goroutines %d baseline %d", goruntime.NumGoroutine(), before)
 	}
 }
 

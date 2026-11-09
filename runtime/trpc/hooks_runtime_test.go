@@ -93,7 +93,7 @@ func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
 		Model:         mockmodel.New("ro", mockmodel.ToolThenText("echo", `{"text":"x"}`, "done")),
 		DataDir:       t.TempDir(),
 		PluginManager: roMgr,
-		Tools:         []tool.Tool{echoTool()},
+		ToolSpecs:     []ToolSpec{{Tool: echoTool(), Trusted: true}},
 	})
 	if err != nil {
 		t.Fatal(err)

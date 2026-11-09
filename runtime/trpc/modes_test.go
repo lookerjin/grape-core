@@ -112,6 +112,7 @@ func TestGoalModeRegistersExtensionAndDefaultDoesNot(t *testing.T) {
 func TestSubagentToolUsesIsolatedReply(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	mdl := mockmodel.New("parent", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		last := lastUserText(req)
 		if strings.Contains(last, "child-task") {

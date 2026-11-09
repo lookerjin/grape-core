@@ -25,6 +25,8 @@ type Server struct {
 	Source        string            `json:"source,omitempty"`
 	// Trust is "host" when the operator accepts an unconfined stdio process.
 	Trust string `json:"trust,omitempty"`
+	// Level is "write" or "read". Empty means write.
+	Level string `json:"level,omitempty"`
 }
 
 // Status is a connection snapshot. It does not include header values.

@@ -39,6 +39,7 @@ func serversFromConfig(cfg config.Config) ([]mcp.Server, error) {
 			Timeout:       timeout,
 			Source:        "config",
 			Trust:         item.Trust,
+			Level:         item.Level,
 		})
 	}
 	return out, nil
@@ -74,7 +75,7 @@ func (rt *Runtime) openMCP(ctx context.Context) error {
 			}
 			continue
 		}
-		sets = append(sets, hostMCPSet{inner: set})
+		sets = append(sets, hostMCPSet{inner: set, rt: rt, kind: mcpKind(server)})
 		rt.mcpStatus = append(rt.mcpStatus, mcp.Status{
 			Name: server.Name, Transport: transportOf(server), State: "connected",
 			Isolation: isolationOf(server),
@@ -194,14 +195,25 @@ func minimalStdioEnv(command string, args []string) (string, []string) {
 
 // hostMCPSet marks every stdio tool result with isolation none so the
 // event stream records that the call ran on the host.
-type hostMCPSet struct{ inner tool.ToolSet }
+func mcpKind(server mcp.Server) string {
+	if strings.EqualFold(strings.TrimSpace(server.Level), "read") {
+		return "read"
+	}
+	return "write"
+}
+
+type hostMCPSet struct {
+	inner tool.ToolSet
+	rt    *Runtime
+	kind  string
+}
 
 func (s hostMCPSet) Tools(ctx context.Context) []tool.Tool {
 	inner := s.inner.Tools(ctx)
 	out := make([]tool.Tool, 0, len(inner))
 	for _, item := range inner {
 		if callable, ok := item.(tool.CallableTool); ok {
-			out = append(out, hostMCPTool{inner: callable})
+			out = append(out, hostMCPTool{inner: callable, rt: s.rt, kind: s.kind})
 			continue
 		}
 		out = append(out, item)
@@ -213,11 +225,24 @@ func (s hostMCPSet) Close() error { return s.inner.Close() }
 
 func (s hostMCPSet) Name() string { return s.inner.Name() }
 
-type hostMCPTool struct{ inner tool.CallableTool }
+type hostMCPTool struct {
+	inner tool.CallableTool
+	rt    *Runtime
+	kind  string
+}
 
 func (t hostMCPTool) Declaration() *tool.Declaration { return t.inner.Declaration() }
 
 func (t hostMCPTool) Call(ctx context.Context, args []byte) (any, error) {
+	if t.rt != nil {
+		name := ""
+		if decl := t.Declaration(); decl != nil {
+			name = decl.Name
+		}
+		if err := t.rt.authorize(ctx, t.kind, name, ""); err != nil {
+			return map[string]any{"isolation": "none", "denied": true, "error": err.Error()}, nil
+		}
+	}
 	res, err := t.inner.Call(ctx, args)
 	body := map[string]any{"isolation": "none", "result": res}
 	if err != nil {
