@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	stdruntime "runtime"
 	"sync"
 	"time"
 
@@ -473,7 +472,6 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		},
 	}
 	go box.pump(ch, h.stop)
-	stdruntime.SetFinalizer(h, func(h *runHandle) { h.Close() })
 	go rt.forward(runCtx, req, runID, st, events, box, unlock)
 	return h, nil
 }
@@ -804,7 +802,9 @@ type runHandle struct {
 }
 
 // Close unblocks the event pump and drops events still buffered.
-// The handle is also finalized this way if the caller abandons it.
+// A live consumer should read Events until the terminal event. Close is
+// for an abandoned handle. The pump also exits after the run finishes
+// and the queued events have been delivered.
 func (h *runHandle) Close() error {
 	if h == nil || h.stop == nil {
 		return nil

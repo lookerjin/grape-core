@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -404,7 +405,6 @@ func TestAbandonedHandlesReleasePumps(t *testing.T) {
 	rt := newTestRuntime(t, mdl, cfg)
 	defer rt.Close()
 	before := goruntime.NumGoroutine()
-	var handles []agent.RunHandle
 	for i := 0; i < 5; i++ {
 		h, err := rt.Start(context.Background(), agent.RunRequest{
 			UserID: "u", SessionID: fmt.Sprintf("ab%d", i), Message: "hi",
@@ -412,20 +412,61 @@ func TestAbandonedHandlesReleasePumps(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		handles = append(handles, h)
+		time.Sleep(20 * time.Millisecond)
+		if err := h.(*runHandle).Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
-	time.Sleep(100 * time.Millisecond)
-	handles = nil
-	goruntime.GC()
-	goruntime.GC()
 	deadline := time.Now().Add(2 * time.Second)
 	for goruntime.NumGoroutine() > before+4 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
-		goruntime.GC()
 	}
 	if goruntime.NumGoroutine() > before+4 {
 		t.Fatalf("goroutines %d baseline %d", goruntime.NumGoroutine(), before)
 	}
+}
+
+func TestRangeEventsSurvivesGC(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	old := debug.SetGCPercent(1)
+	defer debug.SetGCPercent(old)
+	rt := newTestRuntime(t, mockmodel.New("gc", mockmodel.Echo), cfg)
+	defer rt.Close()
+	for i := 0; i < 3; i++ {
+		h, err := rt.Start(context.Background(), agent.RunRequest{
+			UserID: "u", SessionID: fmt.Sprintf("gc%d", i), Message: "hello",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, last := consumeWithGC(h.Events())
+		if n < 1 || !last.Terminal() {
+			t.Fatalf("run %d events=%d last=%s", i, n, last.Kind)
+		}
+	}
+}
+
+func consumeWithGC(events <-chan agent.Event) (int, agent.Event) {
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				goruntime.GC()
+			}
+		}
+	}()
+	var last agent.Event
+	n := 0
+	for evt := range events {
+		n++
+		last = evt
+	}
+	return n, last
 }
 
 func TestCancelDuringToolStartNoRace(t *testing.T) {
