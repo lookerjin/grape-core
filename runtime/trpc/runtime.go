@@ -90,7 +90,6 @@ type Runtime struct {
 	mcpStatus   []mcp.Status
 	decider     agent.Decider
 	reject      bool
-	selfGated   map[string]struct{}
 	journal     *journal.Writer
 	secrets     []string
 	maxField    int
@@ -252,9 +251,6 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 			continue
 		}
 		if spec.Trusted {
-			if spec.Tool != nil && spec.Tool.Declaration() != nil {
-				rt.noteSelfGated(spec.Tool.Declaration().Name)
-			}
 			tools = append(tools, spec.Tool)
 			continue
 		}
@@ -273,6 +269,7 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	}
 	if len(rt.subs) > 0 {
 		for _, sub := range rt.subs {
+			rt.wrapSubAgentTools(sub)
 			tools = append(tools, rt.gate(agenttool.NewTool(sub), "side_effect"))
 		}
 	}

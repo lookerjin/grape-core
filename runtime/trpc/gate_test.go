@@ -2,6 +2,9 @@ package trpcruntime
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -218,6 +221,150 @@ func TestApprovedHelperStillGatesChildTools(t *testing.T) {
 		if tc.perm == agent.PermissionWorkspaceWrite && !strings.Contains(blob, "child_danger") {
 			t.Fatalf("%s %s did not gate child_danger: %s", tc.perm, tc.mode, blob)
 		}
+	}
+}
+
+func TestChildToolNamedLikeParentIsStillGated(t *testing.T) {
+	for _, mode := range []agent.Mode{agent.ModeDefault, agent.ModePlan} {
+		var ran atomic.Int32
+		childCmd := function.NewFunctionTool(func(ctx context.Context, in struct {
+			Argv []string `json:"argv"`
+		}) (string, error) {
+			ran.Add(1)
+			return "child-ran", nil
+		}, function.WithName("run_command"), function.WithDescription("child command"))
+		cfg := config.Default()
+		cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+		cfg.Approvals.Required = true
+		cfg.Journal.Enabled = false
+		cfg.Model.Generation.Stream = boolPtr(false)
+		mdl := mockmodel.New("same-name", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+			if hasToolMessage(req) {
+				return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+			}
+			if strings.Contains(messagesText(req), "child-agent") {
+				return toolCall("run_command", `{"argv":["true"]}`), nil
+			}
+			return toolCall("helper", `{"request":"child-task"}`), nil
+		})
+		child := llmagent.New("helper",
+			llmagent.WithModel(mdl),
+			llmagent.WithInstruction("child-agent"),
+			llmagent.WithEnableCodeExecutionResponseProcessor(false),
+			llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+			llmagent.WithTools([]tool.Tool{childCmd}),
+		)
+		var asked []string
+		rt, err := New(Options{
+			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+			Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+				asked = append(asked, req.Detail)
+				if req.Detail == "helper" {
+					return agent.Decision{ID: req.ID, Allow: true}, nil
+				}
+				return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+			}),
+			SubAgents: []trpcagent.Agent{child},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := rt.Start(context.Background(), agent.RunRequest{
+			UserID: "u", SessionID: "name-" + string(mode), Message: "delegate", Mode: mode,
+		})
+		if err != nil {
+			rt.Close()
+			t.Fatal(err)
+		}
+		blob := eventBlob(collect(t, h))
+		rt.Close()
+		if ran.Load() != 0 || strings.Contains(blob, "child-ran") {
+			t.Fatalf("%s child run_command ran %d asked=%v %s", mode, ran.Load(), asked, blob)
+		}
+		if !strings.Contains(blob, `"detail":"run_command"`) || !strings.Contains(blob, `"allowed":false`) {
+			t.Fatalf("%s did not gate the child tool asked=%v %s", mode, asked, blob)
+		}
+	}
+}
+
+func TestReadToolsAreNotPromptedInReadOnly(t *testing.T) {
+	root := t.TempDir()
+	skillDir := filepath.Join(root, "skills", "review")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "---\nname: review\ndescription: Review code\n---\nRead the diff.\n"
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "mcpstdio")
+	build := exec.Command("go", "build", "-o", bin, "./testdata/mcpstdio")
+	build.Dir = moduleRoot(t)
+	build.Env = append(os.Environ(), "CGO_ENABLED=1", "GOTOOLCHAIN=local")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build server: %v\n%s", err, out)
+	}
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionReadOnly
+	cfg.Approvals.Required = true
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	cfg.Skills.Paths = []string{filepath.Join(root, "skills")}
+	cfg.MCP.Servers = []config.MCPServerConfig{{
+		Name: "echo", Transport: "stdio", Command: bin, Trust: "host", Level: "read",
+	}}
+	var asked atomic.Int32
+	mdl := mockmodel.New("reads", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if hasToolMessage(req) {
+			text := messagesText(req)
+			if strings.Contains(text, "echo:") && !strings.Contains(text, "skill_list_docs") {
+				name := "skill_list_docs"
+				for toolName := range req.Tools {
+					if strings.Contains(toolName, "skill_list_docs") {
+						name = toolName
+					}
+				}
+				return toolCall(name, `{"skill":"review"}`), nil
+			}
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		name := "echo"
+		for toolName := range req.Tools {
+			if strings.Contains(toolName, "echo") {
+				name = toolName
+			}
+		}
+		return toolCall(name, `{"message":"ping"}`), nil
+	})
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			asked.Add(1)
+			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{
+		UserID: "u", SessionID: "reads", Message: "list",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if asked.Load() != 0 {
+		t.Fatalf("read tools asked %d: %s", asked.Load(), blob)
+	}
+	if strings.Contains(blob, "read_only") {
+		t.Fatalf("read tools denied: %s", blob)
+	}
+	if !strings.Contains(blob, "echo:ping") {
+		t.Fatalf("read MCP did not run: %s", blob)
+	}
+	if strings.Contains(blob, "unknown skill") && strings.Contains(blob, "denied") {
+		t.Fatalf("skill tool denied: %s", blob)
 	}
 }
 
