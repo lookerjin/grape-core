@@ -253,6 +253,9 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 			continue
 		}
 		if spec.Trusted {
+			if spec.Tool != nil && spec.Tool.Declaration() != nil {
+				rt.noteSelfGated(spec.Tool.Declaration().Name)
+			}
 			tools = append(tools, spec.Tool)
 			continue
 		}

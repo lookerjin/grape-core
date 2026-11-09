@@ -23,13 +23,13 @@ func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	mgr := installHooks(t, root, "trace", `[
-		{"event":"BeforeRun","command":"sh","args":["-c","echo BeforeRun >> hook.log"],"blocking":false},
-		{"event":"AfterRun","command":"sh","args":["-c","echo AfterRun >> hook.log"],"blocking":false},
-		{"event":"BeforeModel","command":"sh","args":["-c","echo BeforeModel >> hook.log"],"blocking":false},
-		{"event":"AfterModel","command":"sh","args":["-c","echo AfterModel >> hook.log"],"blocking":false},
-		{"event":"BeforeTool","command":"sh","args":["-c","printf '%s\n' \"$GRAPE_HOOK_INPUT\" >> hook.log"],"blocking":false},
-		{"event":"AfterTool","command":"sh","args":["-c","echo AfterTool >> hook.log"],"blocking":false},
-		{"event":"OnEvent","command":"sh","args":["-c","echo OnEvent >> hook.log"],"blocking":false},
+		{"event":"BeforeRun","command":"sh","args":["-c","echo BeforeRun > BeforeRun.log"],"blocking":false},
+		{"event":"AfterRun","command":"sh","args":["-c","echo AfterRun > AfterRun.log"],"blocking":false},
+		{"event":"BeforeModel","command":"sh","args":["-c","echo BeforeModel > BeforeModel.log"],"blocking":false},
+		{"event":"AfterModel","command":"sh","args":["-c","echo AfterModel > AfterModel.log"],"blocking":false},
+		{"event":"BeforeTool","command":"sh","args":["-c","printf '%s\n' \"$GRAPE_HOOK_INPUT\" > BeforeTool.log"],"blocking":false},
+		{"event":"AfterTool","command":"sh","args":["-c","echo AfterTool > AfterTool.log"],"blocking":false},
+		{"event":"OnEvent","command":"sh","args":["-c","echo OnEvent > OnEvent.log"],"blocking":false},
 		{"event":"BeforeTool","command":"false","blocking":false}
 	]`)
 	cfg := config.Default()
@@ -58,18 +58,21 @@ func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
 	}
 	events := collect(t, h)
 	blob := eventBlob(events)
-	log, err := os.ReadFile(filepath.Join(ws, "hook.log"))
+	for _, want := range []string{"BeforeRun", "BeforeModel", "AfterModel", "AfterTool", "OnEvent", "AfterRun"} {
+		raw, err := os.ReadFile(filepath.Join(ws, want+".log"))
+		if err != nil {
+			t.Fatalf("log missing %s: %v", want, err)
+		}
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("log %s has %q", want, raw)
+		}
+	}
+	toolLog, err := os.ReadFile(filepath.Join(ws, "BeforeTool.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(log)
-	for _, want := range []string{"BeforeRun", "BeforeModel", "AfterModel", "AfterTool", "OnEvent", "AfterRun"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("log missing %s:\n%s", want, text)
-		}
-	}
-	if !strings.Contains(text, "text") || !strings.Contains(text, "x") {
-		t.Fatalf("BeforeTool payload missing tool arguments:\n%s", text)
+	if !strings.Contains(string(toolLog), "text") || !strings.Contains(string(toolLog), "x") {
+		t.Fatalf("BeforeTool payload missing tool arguments:\n%s", toolLog)
 	}
 	if !strings.Contains(blob, "exited") {
 		t.Fatalf("non-blocking hook failure was not an event: %s", blob)
