@@ -3,6 +3,8 @@ package trpcruntime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,6 +59,94 @@ func TestReadOnlyRejectsCommand(t *testing.T) {
 	}
 	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
 		t.Fatal("read_only command ran")
+	}
+}
+
+func TestManagedSandboxDoesNotHideHostReads(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Fatal("bubblewrap is required to verify host-read behavior")
+	}
+	dir := t.TempDir()
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	const secretText = "super-secret-value"
+	if err := os.WriteFile(secret, []byte(secretText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Sandbox.Mode = sandbox.ModeManaged
+	cfg.Sandbox.Network = "restricted"
+	execer := newCommandExecutor(cfg, filepath.Join(t.TempDir(), "sb"), "linux", nil)
+	res, err := execer.Execute(context.Background(), sandbox.Request{
+		Workspace: dir,
+		Argv:      []string{"cat", secret},
+		Timeout:   20 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("cat returned %v stderr %s", err, res.Stderr)
+	}
+	if !strings.Contains(res.Stdout, secretText) {
+		t.Fatalf("expected the upstream profile to allow the host read, stdout %q stderr %s", res.Stdout, res.Stderr)
+	}
+	caps, err := execer.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caps.FilesystemIsolation {
+		t.Fatal("FilesystemIsolation is true even though the secret was readable")
+	}
+	if caps.ManagedIsolation != true || !strings.Contains(caps.Reason, "--ro-bind") {
+		t.Fatalf("caps %#v", caps)
+	}
+}
+
+func TestManagedSandboxDeniesHostListener(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Fatal("bubblewrap is required to verify network isolation")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Fatal("python3 is required to dial the test listener")
+	}
+	dir := t.TempDir()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			conn.Close()
+			accepted <- struct{}{}
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Sandbox.Mode = sandbox.ModeManaged
+	cfg.Sandbox.Network = "restricted"
+	execer := newCommandExecutor(cfg, filepath.Join(t.TempDir(), "sb"), "linux", nil)
+	script := fmt.Sprintf("python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", %d), 2)'", port)
+	res, err := execer.Execute(context.Background(), sandbox.Request{
+		Workspace: dir,
+		Argv:      []string{"sh", "-c", script},
+		Timeout:   15 * time.Second,
+	})
+	if err == nil && res.ExitCode == 0 {
+		t.Fatalf("restricted sandbox connected, stdout %q stderr %s", res.Stdout, res.Stderr)
+	}
+	select {
+	case <-accepted:
+		t.Fatal("host listener accepted a connection from the sandbox")
+	case <-time.After(500 * time.Millisecond):
+	}
+	caps, err := execer.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !caps.NetworkIsolation {
+		t.Fatalf("network isolation flag false: %#v", caps)
 	}
 }
 

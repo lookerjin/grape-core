@@ -37,7 +37,7 @@ Sessions, plugin installs, memory notes, and the optional journal live under tha
 
 `workspace_write` with `sandbox.mode: managed` runs commands through the tRPC OS sandbox after a preflight. Failure returns `agent.ErrSandboxUnavailable` and does not fall back to a host shell. `danger_full_access` is explicit and reports isolation `none`.
 
-Linux bubblewrap was exercised in this repo's tests, including a denial of a write outside the workspace. macOS Seatbelt was not executed here. Windows managed sandbox is unsupported. See [docs/sandbox.md](docs/sandbox.md).
+Linux bubblewrap was exercised here. Writes outside the workspace grant are denied, and restricted networking cannot reach a host loopback listener. Host reads are not isolated: v1.12.0 mounts `/` read-only, so `Capabilities.FilesystemIsolation` is false. macOS Seatbelt was not executed here. Windows managed sandbox is unsupported. See [docs/sandbox.md](docs/sandbox.md).
 
 Memory and evolution are off by default. Goal mode is per request (`agent.ModeGoal`) and uses the tRPC goal extension with `goal.max_iterations` as the retry budget. Shell hooks and stdio MCP commands go through the same permission check as `run_command`.
 

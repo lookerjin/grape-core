@@ -63,11 +63,11 @@ func (e *commandExecutor) probe(ctx context.Context) (sandbox.Capabilities, erro
 		return e.caps, nil
 	}
 	e.probed = true
-	e.caps = sandbox.Capabilities{Platform: e.platform, PTY: false}
 	if e.platform == "windows" {
-		e.caps.Reason = "managed OS sandbox backend is not implemented on windows"
+		e.caps = sandbox.Assess(sandbox.Probe{Platform: "windows"})
 		return e.caps, nil
 	}
+	var preflight error
 	rt := trpcsandbox.NewRuntime(
 		trpcsandbox.WithWorkspaceRoot(e.sandboxRoot),
 		trpcsandbox.WithPermissionProfile(e.profile("")),
@@ -75,22 +75,19 @@ func (e *commandExecutor) probe(ctx context.Context) (sandbox.Capabilities, erro
 	defer rt.Close()
 	ws, err := rt.CreateWorkspace(ctx, "probe", codeexecutor.WorkspacePolicy{})
 	if err != nil {
-		e.caps.Reason = err.Error()
-		return e.caps, nil
-	}
-	_, err = rt.RunProgram(ctx, ws, codeexecutor.RunProgramSpec{
+		preflight = err
+	} else if _, err = rt.RunProgram(ctx, ws, codeexecutor.RunProgramSpec{
 		Cmd:     "/bin/true",
 		Timeout: 20 * time.Second,
-	})
-	if err != nil {
-		e.caps.Reason = err.Error()
-		return e.caps, nil
+	}); err != nil {
+		preflight = err
 	}
-	e.caps.ManagedIsolation = true
-	e.caps.FilesystemIsolation = true
-	e.caps.NetworkIsolation = e.cfg.Sandbox.Network != "enabled"
-	e.caps.Interactive = true
-	e.caps.Reason = ""
+	e.caps = sandbox.Assess(sandbox.Probe{
+		Platform:           e.platform,
+		ManagedImplemented: true,
+		PreflightErr:       preflight,
+		NetworkRestricted:  e.cfg.Sandbox.Network != "enabled",
+	})
 	return e.caps, nil
 }
 

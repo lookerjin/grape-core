@@ -10,7 +10,11 @@
 | `danger_full_access` | any | host process, isolation `none` |
 | any write mode | `external` | the named `sandbox.Backend` after `Healthy` |
 
-Managed mode on Linux uses tRPC bubblewrap. The user workspace is a write grant. The preflight runs `/bin/true` inside the sandbox. If bubblewrap is missing or the preflight fails, `Execute` returns `agent.ErrSandboxUnavailable` and does not run the command on the host.
+Managed mode on Linux uses tRPC bubblewrap. The preflight runs `/bin/true` inside the sandbox. If bubblewrap is missing or the preflight fails, `Execute` returns `agent.ErrSandboxUnavailable` and does not run the command on the host.
+
+`FilesystemIsolation` is false for this profile. trpc-agent-go v1.12.0 `WorkspaceWriteProfile` starts bubblewrap with `--ro-bind / /` and then adds a writable bind for the workspace grant. A managed command can `cat` a file outside the workspace. Writes outside that grant are denied. grape-core reports that split in `Capabilities.Reason` instead of claiming host reads are blocked.
+
+`NetworkIsolation` is true when `sandbox.network` is `restricted` and the preflight succeeded. The Linux backend uses a fresh network namespace, so a connect to a listener on the host loopback is refused. `sandbox.network: enabled` sets `NetworkIsolation` false.
 
 Managed mode on macOS is the tRPC Seatbelt path in upstream `codeexecutor/sandbox`. This repository's Linux VM did not execute Seatbelt. Treat macOS isolation as implemented by the pinned tRPC code and unverified here.
 
