@@ -93,6 +93,8 @@ type pathIn struct {
 
 type readIn struct {
 	FileName string `json:"file_name"`
+	Offset   int    `json:"offset,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
 }
 
 type saveIn struct {
@@ -130,12 +132,16 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 	ws := func(ctx context.Context) string { return rt.workspaceFrom(ctx, fallback) }
 	tools := []tool.Tool{
 		function.NewFunctionTool(func(ctx context.Context, in readIn) (map[string]any, error) {
-			text, err := coding.Read(ws(ctx), in.FileName)
+			text, err := coding.ReadLimited(ws(ctx), in.FileName, coding.ReadLimit{
+				MaxBytes:   rt.cfg.Workspace.MaxReadBytes,
+				LineOffset: in.Offset,
+				LineLimit:  in.Limit,
+			})
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"file_name": in.FileName, "contents": text}, nil
-		}, function.WithName("read_file"), function.WithDescription("Read a UTF-8 workspace file. Symlinks that leave the workspace are rejected.")),
+		}, function.WithName("read_file"), function.WithDescription("Read a UTF-8 workspace file, with optional 1-based offset and line limit. Symlinks that leave the workspace are rejected.")),
 		function.NewFunctionTool(func(ctx context.Context, in pathIn) (map[string]any, error) {
 			names, err := coding.List(ws(ctx), in.Path)
 			if err != nil {
@@ -155,12 +161,19 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 			return map[string]any{"files": files, "folders": dirs}, nil
 		}, function.WithName("search_file"), function.WithDescription("Find workspace paths by name. Escaping symlinks are not followed.")),
 		function.NewFunctionTool(func(ctx context.Context, in searchIn) (map[string]any, error) {
-			hits, err := coding.Search(ws(ctx), in.ContentPattern)
+			path := in.Path
+			if path == "" {
+				path = "."
+			}
+			hits, err := coding.SearchLimited(ws(ctx), path, in.ContentPattern, coding.SearchLimit{
+				MaxBytes: rt.cfg.Workspace.MaxReadBytes,
+				MaxHits:  rt.cfg.Workspace.MaxSearchHits,
+			})
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"matches": hits}, nil
-		}, function.WithName("search_content"), function.WithDescription("Search UTF-8 workspace files. Escaping symlinks are not followed.")),
+		}, function.WithName("search_content"), function.WithDescription("Search UTF-8 files under path. Escaping symlinks are not followed. Large files and excess matches are skipped.")),
 		function.NewFunctionTool(func(ctx context.Context, in multiIn) (map[string]any, error) {
 			var files []map[string]string
 			for _, pattern := range in.Patterns {
@@ -169,7 +182,7 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 					return nil, err
 				}
 				for _, name := range matches {
-					text, err := coding.Read(ws(ctx), name)
+					text, err := coding.ReadLimited(ws(ctx), name, coding.ReadLimit{MaxBytes: rt.cfg.Workspace.MaxReadBytes})
 					if err != nil {
 						files = append(files, map[string]string{"file_name": name, "error": err.Error()})
 						continue

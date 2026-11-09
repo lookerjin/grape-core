@@ -69,6 +69,11 @@ type SessionConfig struct {
 type WorkspaceConfig struct {
 	Root       string `yaml:"root"`
 	Permission string `yaml:"permission"`
+	// MaxReadBytes caps read_file and each file search_content opens.
+	// Zero uses 1 MiB.
+	MaxReadBytes int `yaml:"max_read_bytes"`
+	// MaxSearchHits caps search_content matches. Zero uses 100.
+	MaxSearchHits int `yaml:"max_search_hits"`
 }
 
 // SandboxConfig selects isolation. Mode "managed" asks for the OS sandbox.
@@ -205,6 +210,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Workspace.Permission == "" {
 		c.Workspace.Permission = "read_only"
+	}
+	if c.Workspace.MaxReadBytes == 0 {
+		c.Workspace.MaxReadBytes = 1 << 20
+	}
+	if c.Workspace.MaxSearchHits == 0 {
+		c.Workspace.MaxSearchHits = 100
 	}
 	if c.Sandbox.Mode == "" {
 		c.Sandbox.Mode = "managed"

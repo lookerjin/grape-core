@@ -1,7 +1,9 @@
 package coding
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -87,9 +89,24 @@ func openWorkspace(root string) (string, *os.Root, error) {
 	return root, r, nil
 }
 
+// ReadLimit selects a line window and a byte cap. LineOffset is 1-based.
+// LineLimit zero means the rest of the capped bytes. MaxBytes zero means
+// no extra cap beyond what the caller already applied.
+type ReadLimit struct {
+	MaxBytes   int
+	LineOffset int
+	LineLimit  int
+}
+
 // Read returns the text of a workspace file. Symlinks that leave the
 // workspace, absolute symlinks, and dangling symlinks are errors.
 func Read(root, rel string) (string, error) {
+	return ReadLimited(root, rel, ReadLimit{})
+}
+
+// ReadLimited reads at most lim.MaxBytes and optionally a line window.
+// It does not load the rest of a larger file.
+func ReadLimited(root, rel string, lim ReadLimit) (string, error) {
 	rel, err := cleanRel(rel)
 	if err != nil {
 		return "", err
@@ -106,14 +123,69 @@ func Read(root, rel string) (string, error) {
 	if info.IsDir() {
 		return "", fmt.Errorf("is a directory")
 	}
-	b, err := r.ReadFile(rel)
+	f, err := r.Open(rel)
 	if err != nil {
 		return "", err
+	}
+	defer f.Close()
+	if lim.LineOffset > 1 || lim.LineLimit > 0 {
+		return readLineWindow(f, rel, lim)
+	}
+	var reader io.Reader = f
+	if lim.MaxBytes > 0 {
+		reader = io.LimitReader(f, int64(lim.MaxBytes)+1)
+	}
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+	if lim.MaxBytes > 0 && len(b) > lim.MaxBytes {
+		return "", fmt.Errorf("file %s exceeds %d bytes", rel, lim.MaxBytes)
 	}
 	if !utf8.Valid(b) {
 		return "", fmt.Errorf("refusing to read non-UTF-8 file %s", rel)
 	}
 	return string(b), nil
+}
+
+func readLineWindow(r io.Reader, rel string, lim ReadLimit) (string, error) {
+	sc := bufio.NewScanner(r)
+	start := 1
+	if lim.LineOffset > 1 {
+		start = lim.LineOffset
+	}
+	end := 0
+	if lim.LineLimit > 0 {
+		end = start + lim.LineLimit - 1
+	}
+	var b strings.Builder
+	var read int
+	line := 0
+	for sc.Scan() {
+		line++
+		text := sc.Text()
+		read += len(text) + 1
+		if lim.MaxBytes > 0 && read > lim.MaxBytes {
+			return "", fmt.Errorf("file %s exceeds %d bytes", rel, lim.MaxBytes)
+		}
+		if line < start {
+			continue
+		}
+		if end > 0 && line > end {
+			break
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(text)
+	}
+	if err := sc.Err(); err != nil {
+		return "", err
+	}
+	if !utf8.ValidString(b.String()) {
+		return "", fmt.Errorf("refusing to read non-UTF-8 file %s", rel)
+	}
+	return b.String(), nil
 }
 
 // List returns names of entries in a workspace directory.
@@ -145,11 +217,28 @@ type Hit struct {
 	Text string
 }
 
+// SearchLimit caps how much of each file is read and how many hits are
+// returned. Zero MaxBytes skips files that cannot be fully read under the
+// caller's cap by using no cap. Zero MaxHits means no hit cap.
+type SearchLimit struct {
+	MaxBytes int
+	MaxHits  int
+}
+
 // Search walks the workspace for a literal substring. It skips directories
 // named .git and does not follow symlinks that leave the workspace.
 func Search(root, substr string) ([]Hit, error) {
+	return SearchLimited(root, ".", substr, SearchLimit{})
+}
+
+// SearchLimited searches under rel. rel may be a file or a directory.
+func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, error) {
 	if substr == "" {
 		return nil, fmt.Errorf("empty search")
+	}
+	rel, err := cleanRel(rel)
+	if err != nil {
+		return nil, err
 	}
 	_, r, err := openWorkspace(root)
 	if err != nil {
@@ -157,9 +246,12 @@ func Search(root, substr string) ([]Hit, error) {
 	}
 	defer r.Close()
 	var hits []Hit
-	err = fs.WalkDir(r.FS(), ".", func(path string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(r.FS(), rel, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if lim.MaxHits > 0 && len(hits) >= lim.MaxHits {
+			return fs.SkipAll
 		}
 		if d.IsDir() {
 			if d.Name() == ".git" {
@@ -170,8 +262,18 @@ func Search(root, substr string) ([]Hit, error) {
 		if d.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if lim.MaxBytes > 0 && info.Size() > int64(lim.MaxBytes) {
+			return nil
+		}
 		b, err := r.ReadFile(path)
 		if err != nil || !utf8.Valid(b) {
+			return nil
+		}
+		if lim.MaxBytes > 0 && len(b) > lim.MaxBytes {
 			return nil
 		}
 		text := string(b)
@@ -182,11 +284,17 @@ func Search(root, substr string) ([]Hit, error) {
 		for _, chunk := range strings.Split(text, "\n") {
 			if strings.Contains(chunk, substr) {
 				hits = append(hits, Hit{Path: path, Line: line, Text: chunk})
+				if lim.MaxHits > 0 && len(hits) >= lim.MaxHits {
+					return fs.SkipAll
+				}
 			}
 			line++
 		}
 		return nil
 	})
+	if err == fs.SkipAll {
+		err = nil
+	}
 	return hits, err
 }
 
