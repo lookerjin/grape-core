@@ -215,13 +215,14 @@ func TestHooksRunAgainAcrossSessions(t *testing.T) {
 	if err := os.MkdirAll(ws, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mgr := installHooks(t, root, "again", `[{"event":"BeforeTool","command":"sh","args":["-c","echo hit >> hits.log"],"blocking":true}]`)
+	mgr := installHooks(t, root, "again", `[{"event":"BeforeTool","command":"flock","args":["-x","hits.lock","-c","echo hit >> hits.log"],"blocking":true}]`)
 	cfg := config.Default()
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Workspace.Root = ws
 	cfg.Sandbox.Mode = "managed"
 	cfg.Model.Generation.Stream = boolPtr(false)
 	cfg.Journal.Enabled = false
+	cfg.Hooks.MaxConcurrent = 1
 	cfg.Plugins.Enabled = []string{"again"}
 	rt, err := New(Options{
 		Config:        &cfg,
