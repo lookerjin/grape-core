@@ -21,7 +21,7 @@ for evt := range run.Events() {
 
 `RunHandle.Events` closes after one terminal event: `completed`, `failed`, or `cancelled`. `Sequence` is monotonic for that process-local run. It is not a durable cursor.
 
-The stream keeps a soft buffer of 256 events. Only `text_delta` events are dropped when a consumer falls behind, and a later event then carries `dropped N events`. Tool calls, permission decisions, errors, hook failures, and the terminal event are not dropped; the buffer grows to hold them.
+The stream keeps a soft buffer of 256 events. Only `text_delta` events are dropped when a consumer falls behind. One `dropped N events` marker is emitted per catch-up, not once per dropped delta. Tool calls, permission decisions, errors, hook failures, and the terminal event are not dropped; the buffer grows to hold them.
 
 `RunHandle.Cancel` cancels the caller context and the tRPC managed run. The session lock stays held until in-flight tool calls return. `context.tool_drain_timeout` (default 30s) bounds that wait. After it, the session is poisoned and `Start` returns that error until `ForceReleaseSession`. Releasing the lock does not stop a tool that ignores cancellation. `Enqueue` uses `SteerableRunner` when the runner supports it.
 

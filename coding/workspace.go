@@ -167,11 +167,26 @@ func readLineWindow(r io.Reader, rel string, lim ReadLimit) (string, error) {
 	var b strings.Builder
 	line := 0
 	for {
-		text, eof, err := readCappedLine(br, lineCap)
-		if err != nil {
-			return "", fmt.Errorf("file %s line %d: %w", rel, line+1, err)
+		keep := false
+		next := line + 1
+		if next >= start && (end == 0 || next <= end) {
+			keep = true
 		}
-		if text == "" && eof {
+		var text string
+		var eof bool
+		var err error
+		if keep {
+			text, eof, err = readCappedLine(br, lineCap)
+		} else {
+			eof, err = discardLine(br)
+		}
+		if err != nil {
+			return "", fmt.Errorf("file %s line %d: %w", rel, next, err)
+		}
+		if !keep && eof && next == 1 && line == 0 {
+			break
+		}
+		if keep && text == "" && eof && line == 0 {
 			break
 		}
 		line++
@@ -225,6 +240,22 @@ func readCappedLine(r *bufio.Reader, max int) (string, bool, error) {
 	}
 }
 
+func discardLine(r *bufio.Reader) (bool, error) {
+	for {
+		_, err := r.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err == io.EOF {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+}
+
 // List returns names of entries in a workspace directory.
 func List(root, rel string) ([]string, error) {
 	rel, err := cleanRel(rel)
@@ -265,30 +296,30 @@ type SearchLimit struct {
 // Search walks the workspace for a literal substring. It skips directories
 // named .git and does not follow symlinks that leave the workspace.
 func Search(root, substr string) ([]Hit, error) {
-	return SearchLimited(root, ".", substr, SearchLimit{})
+	hits, _, err := SearchLimited(root, ".", substr, SearchLimit{})
+	return hits, err
 }
 
 // SearchLimited searches under rel. rel may be a file or a directory.
-func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, error) {
+// skipped is how many files were left out because they exceed MaxBytes.
+func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, int, error) {
 	if substr == "" {
-		return nil, fmt.Errorf("empty search")
+		return nil, 0, fmt.Errorf("empty search")
 	}
 	rel, err := cleanRel(rel)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	_, r, err := openWorkspace(root)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer r.Close()
 	var hits []Hit
+	var skipped int
 	err = fs.WalkDir(r.FS(), rel, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
-		}
-		if lim.MaxHits > 0 && len(hits) >= lim.MaxHits {
-			return fs.SkipAll
 		}
 		if d.IsDir() {
 			if d.Name() == ".git" {
@@ -304,6 +335,7 @@ func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, error) {
 			return nil
 		}
 		if lim.MaxBytes > 0 && info.Size() > int64(lim.MaxBytes) {
+			skipped++
 			return nil
 		}
 		b, err := r.ReadFile(path)
@@ -311,6 +343,7 @@ func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, error) {
 			return nil
 		}
 		if lim.MaxBytes > 0 && len(b) > lim.MaxBytes {
+			skipped++
 			return nil
 		}
 		text := string(b)
@@ -332,7 +365,7 @@ func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, error) {
 	if err == fs.SkipAll {
 		err = nil
 	}
-	return hits, err
+	return hits, skipped, err
 }
 
 // Replace replaces old with new in a workspace file and keeps the file mode.

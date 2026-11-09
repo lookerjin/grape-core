@@ -206,14 +206,14 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 			if path == "" {
 				path = "."
 			}
-			hits, err := coding.SearchLimited(ws(ctx), path, in.ContentPattern, coding.SearchLimit{
+			hits, skipped, err := coding.SearchLimited(ws(ctx), path, in.ContentPattern, coding.SearchLimit{
 				MaxBytes: rt.cfg.Workspace.MaxReadBytes,
 				MaxHits:  rt.cfg.Workspace.MaxSearchHits,
 			})
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"matches": hits}, nil
+			return map[string]any{"matches": hits, "skipped": skipped}, nil
 		}, function.WithName("search_content"), function.WithDescription("Search UTF-8 files under path. Escaping symlinks are not followed. Large files and excess matches are skipped.")),
 		function.NewFunctionTool(func(ctx context.Context, in multiIn) (map[string]any, error) {
 			var files []map[string]string

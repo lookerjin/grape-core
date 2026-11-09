@@ -1,6 +1,7 @@
 package trpcruntime
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -32,7 +33,7 @@ func TestReadAndSearchStayInsideLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	big := strings.Repeat("x", 80)
-	if err := os.WriteFile(filepath.Join(ws, "keep", "big.txt"), []byte(big), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(ws, "keep", "0big.txt"), []byte(big), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
@@ -44,7 +45,7 @@ func TestReadAndSearchStayInsideLimits(t *testing.T) {
 	cfg.Model.Generation.Stream = boolPtr(false)
 	script := [][2]string{
 		{"read_file", `{"file_name":"keep/note.txt","offset":2,"limit":1}`},
-		{"read_file", `{"file_name":"keep/big.txt"}`},
+		{"read_file", `{"file_name":"keep/0big.txt"}`},
 		{"search_content", `{"path":"keep","content_pattern":"NEEDLE"}`},
 	}
 	var step int
@@ -91,6 +92,9 @@ func TestReadAndSearchStayInsideLimits(t *testing.T) {
 	if !strings.Contains(blob, "NEEDLE-keep") {
 		t.Fatalf("search missed the path: %s", blob)
 	}
+	if strings.Contains(blob, `"skipped":0`) {
+		t.Fatalf("search did not count the oversized file: %s", blob)
+	}
 }
 
 func TestRangedReadAllowsLongLinesAndLargeFiles(t *testing.T) {
@@ -114,6 +118,27 @@ func TestRangedReadAllowsLongLinesAndLargeFiles(t *testing.T) {
 	}
 	if !strings.Contains(longBlob, long[:32]) {
 		t.Fatal("long line missing from read_file")
+	}
+	huge := filepath.Join(ws, "huge.txt")
+	f, err := os.Create(huge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(bytes.Repeat([]byte{'H'}, 2<<20)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("\nTAIL-AFTER-HUGE\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	skipBlob := runRead(t, ws, 1<<20, `{"file_name":"huge.txt","offset":2,"limit":1}`)
+	if strings.Contains(skipBlob, "exceeds") {
+		t.Fatalf("offset could not skip a long line: %s", skipBlob)
+	}
+	if !strings.Contains(skipBlob, "TAIL-AFTER-HUGE") {
+		t.Fatalf("line after a long line missing: %s", skipBlob)
 	}
 	tailBlob := runRead(t, ws, 4096, `{"file_name":"wide.txt","offset":201,"limit":1}`)
 	if strings.Contains(tailBlob, "exceeds") {

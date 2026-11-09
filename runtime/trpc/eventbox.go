@@ -52,7 +52,6 @@ func (b *eventBox) push(evt agent.Event) {
 			return
 		}
 	}
-	b.flushDroppedLocked()
 	b.items = append(b.items, evt)
 	b.signal()
 }
@@ -68,12 +67,13 @@ func (b *eventBox) dropOldestDelta() bool {
 	return false
 }
 
-func (b *eventBox) flushDroppedLocked() {
+func (b *eventBox) takeDroppedLocked() (agent.Event, bool) {
 	if b.dropped == 0 {
-		return
+		return agent.Event{}, false
 	}
-	b.items = append(b.items, droppedMarker(b.dropped))
+	n := b.dropped
 	b.dropped = 0
+	return droppedMarker(n), true
 }
 
 func droppedMarker(n int) agent.Event {
@@ -89,8 +89,18 @@ func droppedMarker(n int) agent.Event {
 
 func (b *eventBox) close() {
 	b.mu.Lock()
-	b.flushDroppedLocked()
 	b.closed = true
+	b.mu.Unlock()
+	b.signal()
+}
+
+// abandon drops buffered events and refuses further pushes. Close uses
+// this so a finished handle does not keep filling the queue.
+func (b *eventBox) abandon() {
+	b.mu.Lock()
+	b.closed = true
+	b.items = nil
+	b.dropped = 0
 	b.mu.Unlock()
 	b.signal()
 }
@@ -116,6 +126,10 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}) {
 func (b *eventBox) pop(stop <-chan struct{}) (agent.Event, bool) {
 	for {
 		b.mu.Lock()
+		if marker, ok := b.takeDroppedLocked(); ok && (len(b.items) > 0 || b.closed) {
+			b.mu.Unlock()
+			return marker, true
+		}
 		if len(b.items) > 0 {
 			evt := b.items[0]
 			b.items = b.items[1:]

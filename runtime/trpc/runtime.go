@@ -454,6 +454,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	h := &runHandle{
 		id:     runID,
 		events: ch,
+		box:    box,
 		stop:   make(chan struct{}),
 		cancel: func() error {
 			cancel()
@@ -812,6 +813,7 @@ type runHandle struct {
 	events   <-chan agent.Event
 	cancel   func() error
 	enqueue  func(string) error
+	box      *eventBox
 	stop     chan struct{}
 	stopOnce sync.Once
 }
@@ -824,7 +826,12 @@ func (h *runHandle) Close() error {
 	if h == nil || h.stop == nil {
 		return nil
 	}
-	h.stopOnce.Do(func() { close(h.stop) })
+	h.stopOnce.Do(func() {
+		if h.box != nil {
+			h.box.abandon()
+		}
+		close(h.stop)
+	})
 	return nil
 }
 
