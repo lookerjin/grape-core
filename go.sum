@@ -139,3 +139,5 @@ trpc.group/trpc-go/trpc-agent-go/session/sqlite v1.12.0 h1:DcJxqmksPDfKZ/9RrTMCk
 trpc.group/trpc-go/trpc-agent-go/session/sqlite v1.12.0/go.mod h1:oq+fVu68Zt0YoyvVHeLKNR0WRIi2C1jVvfdLF2KkJ10=
 trpc.group/trpc-go/trpc-mcp-go v0.0.10 h1:kKPfevmikMojfOgtUBf5SJQ/v6aDugckodgyH1uDu2Q=
 trpc.group/trpc-go/trpc-mcp-go v0.0.10/go.mod h1:OT6rLglkdaQ17D2T1Y87Y/ckItzdsEldDbw7dHAbGEA=
+trpc.group/trpc-go/trpc-mcp-go v0.0.20 h1:279fmBFoZCRfR9AcKhBq7XfRX7DgoycTayiIbTU86v0=
+trpc.group/trpc-go/trpc-mcp-go v0.0.20/go.mod h1:OT6rLglkdaQ17D2T1Y87Y/ckItzdsEldDbw7dHAbGEA=
