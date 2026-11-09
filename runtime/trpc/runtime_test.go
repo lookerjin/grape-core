@@ -324,6 +324,79 @@ func TestCancelDoesNotOverlapToolExecution(t *testing.T) {
 	}
 }
 
+func TestPoisonedSessionForceRelease(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Context.ToolDrainTimeout = "200ms"
+	release := make(chan struct{})
+	defer close(release)
+	blocker := function.NewFunctionTool(func(ctx context.Context, in echoIn) (echoOut, error) {
+		<-release
+		return echoOut{Text: in.Text}, nil
+	}, function.WithName("block"), function.WithDescription("blocks"))
+	var phase atomic.Int32
+	mdl := mockmodel.New("poison", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if phase.Load() > 0 || hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return &model.Response{Choices: []model.Choice{{
+			Message: model.Message{
+				Role: model.RoleAssistant,
+				ToolCalls: []model.ToolCall{{
+					ID:   "call-block",
+					Type: "function",
+					Function: model.FunctionDefinitionParam{
+						Name:      "block",
+						Arguments: []byte(`{"text":"x"}`),
+					},
+				}},
+			},
+		}}}, nil
+	})
+	rt, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir(), Tools: []tool.Tool{blocker}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "poison", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := h.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var nextErr error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		_, nextErr = rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "poison", Message: "next"})
+		cancel()
+		if nextErr != nil && strings.Contains(nextErr.Error(), "poisoned") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if nextErr == nil || !strings.Contains(nextErr.Error(), "poisoned") {
+		t.Fatalf("error %v", nextErr)
+	}
+	if err := rt.ForceReleaseSession("poison"); err != nil {
+		t.Fatal(err)
+	}
+	phase.Store(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	h2, err := rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "poison", Message: "next"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collect(t, h2)
+	if len(events) == 0 || !events[len(events)-1].Terminal() {
+		t.Fatalf("recovered run %#v", kinds(events))
+	}
+}
+
 func TestAbandonedHandlesReleasePumps(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false

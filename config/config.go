@@ -184,6 +184,10 @@ type PlanConfig struct {
 type ContextConfig struct {
 	MaxLLMCalls       int `yaml:"max_llm_calls"`
 	MaxToolIterations int `yaml:"max_tool_iterations"`
+	// ToolDrainTimeout is how long a cancelled run waits for tool calls
+	// to return before the session is marked poisoned. Zero uses 30s.
+	// ForceReleaseSession is the explicit recovery.
+	ToolDrainTimeout string `yaml:"tool_drain_timeout"`
 }
 
 // ApprovalConfig requires an approval for mutating tools when true.
@@ -261,6 +265,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Context.MaxToolIterations == 0 {
 		c.Context.MaxToolIterations = 24
+	}
+	if c.Context.ToolDrainTimeout == "" {
+		c.Context.ToolDrainTimeout = "30s"
 	}
 }
 

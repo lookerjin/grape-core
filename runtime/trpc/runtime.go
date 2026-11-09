@@ -100,6 +100,8 @@ type Runtime struct {
 	mu       sync.Mutex
 	locks    map[string]*sync.Mutex
 	draining map[string]error
+	poisoned map[string]error
+	held     map[string]func()
 
 	closeOnce sync.Once
 	closeErr  error
@@ -176,6 +178,8 @@ func New(opts Options) (*Runtime, error) {
 		instruction: instruction,
 		locks:       map[string]*sync.Mutex{},
 		draining:    map[string]error{},
+		poisoned:    map[string]error{},
+		held:        map[string]func(){},
 		fixed:       opts.FixedAgent,
 		subs:        append([]trpcagent.Agent(nil), opts.SubAgents...),
 	}
@@ -594,6 +598,14 @@ drained:
 	}
 }
 
+func (rt *Runtime) toolDrainTimeout() time.Duration {
+	d, err := config.Duration(rt.cfg.Context.ToolDrainTimeout)
+	if err != nil || d <= 0 {
+		return 30 * time.Second
+	}
+	return d
+}
+
 func (rt *Runtime) finishSession(id string, st *runState, unlock func()) {
 	if st == nil || !st.captureBusy() {
 		unlock()
@@ -601,14 +613,58 @@ func (rt *Runtime) finishSession(id string, st *runState, unlock func()) {
 	}
 	rt.mu.Lock()
 	rt.draining[id] = fmt.Errorf("session %s is still finishing tool execution", id)
+	rt.held[id] = unlock
 	rt.mu.Unlock()
+	timeout := rt.toolDrainTimeout()
 	go func() {
-		st.waitTools()
-		rt.mu.Lock()
-		delete(rt.draining, id)
-		rt.mu.Unlock()
-		unlock()
+		done := make(chan struct{})
+		go func() {
+			st.waitTools()
+			close(done)
+		}()
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+			rt.releaseHeld(id, true)
+		case <-timer.C:
+			rt.mu.Lock()
+			if _, ok := rt.held[id]; ok {
+				err := fmt.Errorf("session %s is poisoned: a tool did not finish within %s", id, timeout)
+				rt.draining[id] = err
+				rt.poisoned[id] = err
+			}
+			rt.mu.Unlock()
+		}
 	}()
+}
+
+// ForceReleaseSession drops a poisoned or still-draining session lock.
+// The stuck tool may still be running. The next Start is allowed.
+func (rt *Runtime) ForceReleaseSession(id string) error {
+	if rt == nil {
+		return fmt.Errorf("runtime is nil")
+	}
+	if !rt.releaseHeld(id, true) {
+		return fmt.Errorf("session %s is not held", id)
+	}
+	return nil
+}
+
+func (rt *Runtime) releaseHeld(id string, clearPoison bool) bool {
+	rt.mu.Lock()
+	unlock := rt.held[id]
+	delete(rt.held, id)
+	delete(rt.draining, id)
+	if clearPoison {
+		delete(rt.poisoned, id)
+	}
+	rt.mu.Unlock()
+	if unlock == nil {
+		return false
+	}
+	unlock()
+	return true
 }
 
 func (rt *Runtime) lockSession(ctx context.Context, id string) (func(), error) {

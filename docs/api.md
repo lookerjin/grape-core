@@ -23,7 +23,7 @@ for evt := range run.Events() {
 
 The stream keeps a soft buffer of 256 events. Only `text_delta` events are dropped when a consumer falls behind, and a later event then carries `dropped N events`. Tool calls, permission decisions, errors, hook failures, and the terminal event are not dropped; the buffer grows to hold them.
 
-`RunHandle.Cancel` cancels the caller context and the tRPC managed run. `Enqueue` uses `SteerableRunner` when the runner supports it.
+`RunHandle.Cancel` cancels the caller context and the tRPC managed run. The session lock stays held until in-flight tool calls return. `context.tool_drain_timeout` (default 30s) bounds that wait. After it, the session is poisoned and `Start` returns that error until `ForceReleaseSession`. Releasing the lock does not stop a tool that ignores cancellation. `Enqueue` uses `SteerableRunner` when the runner supports it.
 
 Approvals are `agent.ApprovalRequest` values delivered to an `agent.Decider`. The SDK does not read stdin. Plan mode asks before mutating tools. A denial does not call the tool.
 
