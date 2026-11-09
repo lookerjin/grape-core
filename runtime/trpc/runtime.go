@@ -95,11 +95,11 @@ type Runtime struct {
 	maxField    int
 	instruction string
 
-	mu       sync.Mutex
-	locks    map[string]*sync.Mutex
-	draining map[string]error
-	poisoned map[string]error
-	held     map[string]func()
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+	// holds is the in-flight drain for a session, keyed so an older run
+	// cannot release or poison the run that replaced it.
+	holds map[string]*sessionHold
 
 	closeOnce sync.Once
 	closeErr  error
@@ -175,9 +175,7 @@ func New(opts Options) (*Runtime, error) {
 		maxField:    cfg.Journal.MaxFieldBytes,
 		instruction: instruction,
 		locks:       map[string]*sync.Mutex{},
-		draining:    map[string]error{},
-		poisoned:    map[string]error{},
-		held:        map[string]func(){},
+		holds:       map[string]*sessionHold{},
 		fixed:       opts.FixedAgent,
 		subs:        append([]trpcagent.Agent(nil), opts.SubAgents...),
 	}
@@ -481,7 +479,7 @@ func classifyRunError(err error) error {
 }
 
 func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID string, st *runState, in <-chan *event.Event, out *eventBox, unlock func()) {
-	defer rt.finishSession(req.SessionID, st, unlock)
+	defer rt.finishSession(req.SessionID, runID, st, unlock)
 	defer out.close()
 	conv := newConverter(runID, req.SessionID, rt.maxField, rt.secrets)
 	terminal := false
@@ -604,14 +602,24 @@ func (rt *Runtime) toolDrainTimeout() time.Duration {
 	return d
 }
 
-func (rt *Runtime) finishSession(id string, st *runState, unlock func()) {
+// sessionHold is one run's claim on a session lock while its tools drain.
+type sessionHold struct {
+	runID  string
+	unlock func()
+	err    error
+}
+
+func (rt *Runtime) finishSession(id, runID string, st *runState, unlock func()) {
 	if st == nil || !st.captureBusy() {
 		unlock()
 		return
 	}
 	rt.mu.Lock()
-	rt.draining[id] = fmt.Errorf("session %s is still finishing tool execution", id)
-	rt.held[id] = unlock
+	rt.holds[id] = &sessionHold{
+		runID:  runID,
+		unlock: unlock,
+		err:    fmt.Errorf("session %s is still finishing tool execution", id),
+	}
 	rt.mu.Unlock()
 	timeout := rt.toolDrainTimeout()
 	go func() {
@@ -624,50 +632,57 @@ func (rt *Runtime) finishSession(id string, st *runState, unlock func()) {
 		defer timer.Stop()
 		select {
 		case <-done:
-			rt.releaseHeld(id, true)
+			rt.releaseHold(id, runID)
 		case <-timer.C:
 			rt.mu.Lock()
-			if _, ok := rt.held[id]; ok {
-				err := fmt.Errorf("session %s is poisoned: a tool did not finish within %s", id, timeout)
-				rt.draining[id] = err
-				rt.poisoned[id] = err
+			if hold := rt.holds[id]; hold != nil && hold.runID == runID {
+				hold.err = fmt.Errorf("session %s is poisoned: a tool did not finish within %s", id, timeout)
 			}
 			rt.mu.Unlock()
 		}
 	}()
 }
 
-// ForceReleaseSession drops a poisoned or still-draining session lock.
+// ForceReleaseSession drops the current poisoned or draining lock.
 // The stuck tool may still be running. The next Start is allowed.
+// An older run cannot release a later run's lock.
 func (rt *Runtime) ForceReleaseSession(id string) error {
 	if rt == nil {
 		return fmt.Errorf("runtime is nil")
 	}
-	if !rt.releaseHeld(id, true) {
+	rt.mu.Lock()
+	hold := rt.holds[id]
+	runID := ""
+	if hold != nil {
+		runID = hold.runID
+	}
+	rt.mu.Unlock()
+	if runID == "" || !rt.releaseHold(id, runID) {
 		return fmt.Errorf("session %s is not held", id)
 	}
 	return nil
 }
 
-func (rt *Runtime) releaseHeld(id string, clearPoison bool) bool {
+func (rt *Runtime) releaseHold(id, runID string) bool {
 	rt.mu.Lock()
-	unlock := rt.held[id]
-	delete(rt.held, id)
-	delete(rt.draining, id)
-	if clearPoison {
-		delete(rt.poisoned, id)
-	}
-	rt.mu.Unlock()
-	if unlock == nil {
+	hold := rt.holds[id]
+	if hold == nil || hold.runID != runID {
+		rt.mu.Unlock()
 		return false
 	}
-	unlock()
+	delete(rt.holds, id)
+	unlock := hold.unlock
+	rt.mu.Unlock()
+	if unlock != nil {
+		unlock()
+	}
 	return true
 }
 
 func (rt *Runtime) lockSession(ctx context.Context, id string) (func(), error) {
 	rt.mu.Lock()
-	if err := rt.draining[id]; err != nil {
+	if hold := rt.holds[id]; hold != nil && hold.err != nil {
+		err := hold.err
 		rt.mu.Unlock()
 		return nil, agent.Wrap(agent.ErrSession, "session", err)
 	}
@@ -702,7 +717,10 @@ func (rt *Runtime) lockSession(ctx context.Context, id string) (func(), error) {
 			return nil, agent.Wrap(agent.ErrRunCancelled, "session", ctx.Err())
 		case <-ticker.C:
 			rt.mu.Lock()
-			err := rt.draining[id]
+			var err error
+			if hold := rt.holds[id]; hold != nil {
+				err = hold.err
+			}
 			rt.mu.Unlock()
 			if err != nil {
 				go func() {
