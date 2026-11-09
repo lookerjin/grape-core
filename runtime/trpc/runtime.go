@@ -301,9 +301,8 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		}
 		opts = append(opts, llmagent.WithExtensions(goal.New(goal.WithMaxRetries(retries))))
 	}
-	if len(rt.subs) > 0 {
-		opts = append(opts, llmagent.WithSubAgents(rt.subs))
-	}
+	// Subagents are exposed only as gated agent tools. WithSubAgents would
+	// also register transfer_to_agent, which bypasses that gate.
 	return llmagent.New("grape", opts...), nil
 }
 
