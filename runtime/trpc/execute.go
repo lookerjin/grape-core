@@ -207,6 +207,7 @@ func (e *commandExecutor) managed(ctx context.Context, req sandbox.Request) (san
 	rt := trpcsandbox.NewRuntime(
 		trpcsandbox.WithWorkspaceRoot(e.sandboxRoot),
 		trpcsandbox.WithPermissionProfile(e.profile(req.Workspace)),
+		trpcsandbox.WithShellEnvironmentPolicy(e.envPolicy()),
 	)
 	defer rt.Close()
 	ws, err := rt.CreateWorkspace(ctx, "run", codeexecutor.WorkspacePolicy{})
@@ -236,11 +237,12 @@ func (e *commandExecutor) managed(ctx context.Context, req sandbox.Request) (san
 		timeout = 60 * time.Second
 	}
 	spec := codeexecutor.RunProgramSpec{
-		Cmd:     "sh",
-		Args:    append([]string{"-c", `cd "$1" && shift && exec "$@"`, "sh", req.Workspace}, req.Argv...),
-		Env:     env,
-		Timeout: timeout,
-		Cwd:     "work",
+		Cmd:      "sh",
+		Args:     append([]string{"-c", `cd "$1" && shift && exec "$@"`, "sh", req.Workspace}, req.Argv...),
+		Env:      env,
+		Timeout:  timeout,
+		Cwd:      "work",
+		CleanEnv: true,
 	}
 	res, err := rt.RunProgram(ctx, ws, spec)
 	out := sandbox.Result{
@@ -263,6 +265,23 @@ func (e *commandExecutor) managed(ctx context.Context, req sandbox.Request) (san
 		return out, agent.Wrap(agent.ErrTool, "command", err)
 	}
 	return out, nil
+}
+
+func (e *commandExecutor) envPolicy() trpcsandbox.ShellEnvironmentPolicy {
+	policy := trpcsandbox.ShellEnvironmentPolicy{
+		Inherit:              trpcsandbox.ShellEnvironmentPolicyInheritCore,
+		ApplyDefaultExcludes: true,
+	}
+	if len(e.cfg.Sandbox.EnvAllow) == 0 {
+		return policy
+	}
+	allow := append([]string{}, e.cfg.Sandbox.EnvAllow...)
+	allow = append(allow, "GOCACHE", "GOTMPDIR", "GOTELEMETRY", "GOTOOLCHAIN", "GIT_CONFIG_NOSYSTEM", "GRAPE_HOOK_INPUT", "HOME", "TMPDIR", "TMP", "TEMP")
+	return trpcsandbox.ShellEnvironmentPolicy{
+		Inherit:              trpcsandbox.ShellEnvironmentPolicyInheritNone,
+		ApplyDefaultExcludes: true,
+		IncludeOnly:          allow,
+	}
 }
 
 func (e *commandExecutor) profile(workspace string) trpcsandbox.PermissionProfile {

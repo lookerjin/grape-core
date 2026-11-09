@@ -12,6 +12,8 @@
 
 Managed mode on Linux uses tRPC bubblewrap. The preflight runs `/bin/true` inside the sandbox. If bubblewrap is missing or the preflight fails, `Execute` returns `agent.ErrSandboxUnavailable` and does not run the command on the host.
 
+A managed command inherits the core shell environment (`PATH`, `HOME`, `LANG`, `TERM`, and the other startup variables), not the full host environment. Names that look like secrets are removed. `sandbox.env_allow` replaces that list. `HOME` inside the sandbox is the workspace home, not the host home.
+
 `FilesystemIsolation` is false for this profile. trpc-agent-go v1.12.0 `WorkspaceWriteProfile` starts bubblewrap with `--ro-bind / /` and then adds a writable bind for the workspace grant. A managed command can still `cat` an ordinary file outside the workspace. Writes outside that grant are denied.
 
 Existing sensitive paths are passed to `PermissionProfile.WithNoAccessPaths`, which the Linux backend enforces with deny-read masks (`tmpfs` mode `000` for directories, a mask file for regular files). `WithNoAccessGlobs` is used only for workspace-relative patterns in `sandbox.deny_read`; v1.12.0 rejects absolute globs. `Capabilities.SensitivePathsMasked` lists the paths that existed and were masked. `FilesystemIsolation` stays false because the rest of the host remains readable.

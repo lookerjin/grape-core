@@ -15,7 +15,9 @@ import (
 
 	"github.com/lookerjin/grape-core/agent"
 	"github.com/lookerjin/grape-core/config"
+	"github.com/lookerjin/grape-core/internal/mockmodel"
 	"github.com/lookerjin/grape-core/sandbox"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
 func TestWindowsPlatformDoesNotExecuteManagedCommand(t *testing.T) {
@@ -265,6 +267,44 @@ func TestDangerCancelKillsProcess(t *testing.T) {
 		if strings.Contains(line, "sleep 30") {
 			t.Fatalf("sleep survived cancel: %s", out)
 		}
+	}
+}
+
+func TestManagedCommandDoesNotInheritHostSecrets(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("bwrap verification is Linux")
+	}
+	t.Setenv("FAKE_API_KEY", "host-secret-value")
+	ws := t.TempDir()
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Workspace.Root = ws
+	cfg.Sandbox.Mode = sandbox.ModeManaged
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	mdl := mockmodel.New("env", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return toolCall("run_command", `{"argv":["printenv","FAKE_API_KEY"]}`), nil
+	})
+	rt, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{
+		UserID: "u", SessionID: "env", Workspace: ws, Message: "print",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if strings.Contains(blob, "host-secret-value") {
+		t.Fatalf("managed command inherited FAKE_API_KEY: %s", blob)
+	}
+	if !strings.Contains(blob, "managed") {
+		t.Fatalf("command did not run in the managed sandbox: %s", blob)
 	}
 }
 

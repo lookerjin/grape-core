@@ -83,6 +83,10 @@ type SandboxConfig struct {
 	Backend      string   `yaml:"backend"`
 	DenyRead     []string `yaml:"deny_read"`
 	DenyReadMode string   `yaml:"deny_read_mode"`
+	// EnvAllow replaces the managed-sandbox environment allowlist.
+	// Empty keeps the core list: PATH, HOME, LANG, TERM, and the other
+	// shell startup variables.
+	EnvAllow []string `yaml:"env_allow"`
 }
 
 // SkillsConfig lists skill roots. KnowledgeOnly defaults to true.
