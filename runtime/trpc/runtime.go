@@ -82,6 +82,7 @@ type Runtime struct {
 	fixed       trpcagent.Agent
 	subs        []trpcagent.Agent
 	evolution   evolution.Service
+	mcpSets     []tool.ToolSet
 	decider     agent.Decider
 	reject      bool
 	journal     *journal.Writer
@@ -212,6 +213,11 @@ func New(opts Options) (*Runtime, error) {
 		}
 	}
 	rt.journal = jw
+	if err := rt.openMCP(context.Background()); err != nil {
+		_ = r.Close()
+		_ = sessions.Close()
+		return nil, err
+	}
 	return rt, nil
 }
 
@@ -253,6 +259,9 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		llmagent.WithMaxLLMCalls(positiveLimit(rt.cfg.Context.MaxLLMCalls)),
 		llmagent.WithMaxToolIterations(positiveLimit(rt.cfg.Context.MaxToolIterations)),
 		llmagent.WithTools(tools),
+	}
+	if len(rt.mcpSets) > 0 {
+		opts = append(opts, llmagent.WithToolSets(rt.mcpSets))
 	}
 	if repo, err := rt.skillRepository(); err != nil {
 		return nil, err
@@ -581,6 +590,11 @@ func (rt *Runtime) Close() error {
 		}
 		if rt.sessions != nil {
 			if err := rt.sessions.Close(); err != nil && rt.closeErr == nil {
+				rt.closeErr = err
+			}
+		}
+		for _, set := range rt.mcpSets {
+			if err := set.Close(); err != nil && rt.closeErr == nil {
 				rt.closeErr = err
 			}
 		}

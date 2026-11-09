@@ -14,6 +14,11 @@ import (
 )
 
 func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error {
+	configured, err := serversFromConfig(rt.cfg)
+	if err != nil {
+		return err
+	}
+	rt.mcpServers = append(rt.mcpServers, configured...)
 	rt.globalRules = filepath.Join(dataDir, "rules")
 	for _, path := range rt.cfg.Skills.Paths {
 		if strings.TrimSpace(path) == "" {

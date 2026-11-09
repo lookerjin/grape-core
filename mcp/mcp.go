@@ -143,7 +143,7 @@ func ParseClaudeConfig(raw []byte, source string) ([]Server, error) {
 			Args:    item.Args,
 			URL:     item.URL,
 			Headers: item.Headers,
-			Enabled: true,
+			Enabled: false,
 			Source:  source,
 		}
 		if server.URL != "" {
