@@ -3,6 +3,8 @@ package hooks
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,7 +32,7 @@ func TestUnsupportedEvent(t *testing.T) {
 	if _, err := Parse([]byte(`{"hooks":[{"event":"OnError","command":"echo"}]}`)); err == nil {
 		t.Fatal("expected unsupported")
 	}
-	r := NewRunner(&fakeExec{}, nil, 1)
+	r := NewRunner(&fakeExec{}, nil, 1, 0)
 	if _, err := r.Run(context.Background(), OnError, t.TempDir(), "{}"); err == nil {
 		t.Fatal("expected unsupported run")
 	}
@@ -58,7 +60,7 @@ func TestHookTimeoutExitAndMalformedJSON(t *testing.T) {
 	dir := t.TempDir()
 	slow := NewRunner(&scriptExec{block: true}, []Spec{{
 		Event: BeforeTool, Command: "sleep", Blocking: true, Timeout: 150 * time.Millisecond,
-	}}, 1)
+	}}, 1, 0)
 	start := time.Now()
 	if _, err := slow.Run(context.Background(), BeforeTool, dir, `{}`); err == nil {
 		t.Fatal("expected timeout")
@@ -68,21 +70,21 @@ func TestHookTimeoutExitAndMalformedJSON(t *testing.T) {
 	}
 	blocking := NewRunner(&scriptExec{code: 2, out: "nope"}, []Spec{{
 		Event: BeforeTool, Command: "false", Blocking: true,
-	}}, 1)
+	}}, 1, 0)
 	results, err := blocking.Run(context.Background(), BeforeTool, dir, `{}`)
 	if err == nil || len(results) != 1 || !results[0].Blocked || results[0].ExitCode != 2 {
 		t.Fatalf("err=%v results=%#v", err, results)
 	}
 	open := NewRunner(&scriptExec{code: 2, out: "nope"}, []Spec{{
 		Event: BeforeTool, Command: "false", Blocking: false,
-	}}, 1)
+	}}, 1, 0)
 	results, err = open.Run(context.Background(), BeforeTool, dir, `{}`)
 	if err != nil || len(results) != 1 || results[0].Blocked || results[0].ExitCode != 2 {
 		t.Fatalf("non-blocking err=%v results=%#v", err, results)
 	}
 	bad := NewRunner(&scriptExec{out: "{not-json"}, []Spec{{
 		Event: BeforeTool, Command: "emit", Blocking: true, ExpectJSON: true,
-	}}, 1)
+	}}, 1, 0)
 	if _, err := bad.Run(context.Background(), BeforeTool, dir, `{}`); err == nil {
 		t.Fatal("expected malformed JSON error")
 	}
@@ -98,7 +100,7 @@ func TestDenialDoesNotCountAsSuccess(t *testing.T) {
 		Command:  "echo",
 		Blocking: true,
 		Timeout:  time.Second,
-	}}, 1)
+	}}, 1, 0)
 	_, err := r.Run(context.Background(), BeforeTool, t.TempDir(), `{"name":"run_command"}`)
 	if err == nil {
 		t.Fatal("expected denial")
@@ -106,10 +108,56 @@ func TestDenialDoesNotCountAsSuccess(t *testing.T) {
 	if exec.calls != 1 {
 		t.Fatalf("calls %d", exec.calls)
 	}
-	if _, err := r.Run(context.Background(), BeforeTool, t.TempDir(), `{"name":"run_command"}`); err != nil {
-		t.Fatal(err)
+	if _, err := r.Run(context.Background(), BeforeTool, t.TempDir(), `{"name":"run_command"}`); err == nil {
+		t.Fatal("expected the blocking hook to run again")
 	}
-	if exec.calls != 1 {
-		t.Fatal("duplicate hook executed")
+	if exec.calls != 2 {
+		t.Fatalf("calls %d", exec.calls)
 	}
+}
+
+func TestDefaultTimeoutIsHonoured(t *testing.T) {
+	r := NewRunner(&scriptExec{block: true}, []Spec{{
+		Event: BeforeTool, Command: "sleep", Blocking: true,
+	}}, 1, 150*time.Millisecond)
+	start := time.Now()
+	if _, err := r.Run(context.Background(), BeforeTool, t.TempDir(), `{}`); err == nil {
+		t.Fatal("expected default timeout")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("default timeout did not fire")
+	}
+}
+
+func TestConcurrentRunsDoNotRace(t *testing.T) {
+	var calls atomic.Int32
+	exec := &countingExec{calls: &calls}
+	r := NewRunner(exec, []Spec{{
+		Event: BeforeTool, Command: "echo", Blocking: true,
+	}}, 4, time.Second)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := r.Run(context.Background(), BeforeTool, t.TempDir(), `{"name":"echo"}`); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if calls.Load() != 8 {
+		t.Fatalf("calls %d", calls.Load())
+	}
+}
+
+type countingExec struct{ calls *atomic.Int32 }
+
+func (c *countingExec) Capabilities(context.Context) (sandbox.Capabilities, error) {
+	return sandbox.Capabilities{}, nil
+}
+
+func (c *countingExec) Execute(context.Context, sandbox.Request) (sandbox.Result, error) {
+	c.calls.Add(1)
+	return sandbox.Result{ExitCode: 0}, nil
 }

@@ -502,6 +502,12 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 	if !terminal {
 		flush()
 	}
+	for _, evt := range st.drain() {
+		if evt.Terminal() {
+			continue
+		}
+		emit(conv.stamp(evt))
+	}
 	if !terminal {
 		status := agent.EventFailed
 		msg := "run ended without a terminal event"

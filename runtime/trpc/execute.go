@@ -107,6 +107,9 @@ func (e *commandExecutor) Execute(ctx context.Context, req sandbox.Request) (san
 		return sandbox.Result{}, agent.Wrap(agent.ErrPermissionDenied, "workspace", err)
 	}
 	req.Workspace = root
+	if req.Hook {
+		return e.executeHook(ctx, req)
+	}
 	switch e.cfg.Workspace.Permission {
 	case agent.PermissionReadOnly:
 		return sandbox.Result{}, agent.Wrap(agent.ErrPermissionDenied, "command", fmt.Errorf("read_only workspace"))
@@ -116,6 +119,31 @@ func (e *commandExecutor) Execute(ctx context.Context, req sandbox.Request) (san
 		return e.executeWrite(ctx, req)
 	default:
 		return sandbox.Result{}, agent.Invalid("permission", fmt.Errorf("unsupported permission %q", e.cfg.Workspace.Permission))
+	}
+}
+
+func (e *commandExecutor) executeHook(ctx context.Context, req sandbox.Request) (sandbox.Result, error) {
+	switch e.cfg.Sandbox.Mode {
+	case sandbox.ModeDangerFullAccess:
+		return e.host(ctx, req)
+	case sandbox.ModeExternal:
+		return e.externalRun(ctx, req)
+	default:
+		if _, err := e.denyList(req.Workspace); err != nil {
+			return sandbox.Result{}, agent.Invalid("sandbox.deny_read", err)
+		}
+		caps, err := e.probe(ctx)
+		if err != nil {
+			return sandbox.Result{}, err
+		}
+		if !caps.ManagedIsolation {
+			reason := caps.Reason
+			if reason == "" {
+				reason = "managed sandbox is unavailable"
+			}
+			return sandbox.Result{}, agent.Wrap(agent.ErrSandboxUnavailable, "hook", fmt.Errorf("%s", reason))
+		}
+		return e.managed(ctx, req)
 	}
 }
 

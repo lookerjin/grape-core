@@ -37,6 +37,9 @@ type Request struct {
 	Argv      []string
 	Timeout   time.Duration
 	Env       map[string]string
+	// Hook marks a product shell hook. Hooks still use the sandbox, and a
+	// read_only workspace does not turn the hook itself into a denial.
+	Hook bool
 }
 
 // Result is the outcome of a command that was actually started.

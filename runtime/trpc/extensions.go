@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/hooks"
 	"github.com/lookerjin/grape-core/mcp"
 	"github.com/lookerjin/grape-core/plugin"
@@ -71,7 +72,11 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 			}
 		}
 		if len(hookSpecs) > 0 {
-			rt.hookRunner = hooks.NewRunner(rt.exec, hookSpecs, rt.cfg.Hooks.MaxConcurrent)
+			timeout, err := config.Duration(rt.cfg.Hooks.Timeout)
+			if err != nil {
+				return err
+			}
+			rt.hookRunner = hooks.NewRunner(rt.exec, hookSpecs, rt.cfg.Hooks.MaxConcurrent, timeout)
 		}
 	}
 	if _, err := skill.Discover(rt.cfg.Plugins.Conflict, rt.skillRoots...); err != nil {

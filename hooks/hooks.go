@@ -2,8 +2,6 @@ package hooks
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -43,6 +41,7 @@ type Result struct {
 	Stdout   string
 	Stderr   string
 	Blocked  bool
+	Err      string
 }
 
 // File is the on-disk hooks.json document.
@@ -69,9 +68,6 @@ func Parse(raw []byte) ([]Spec, error) {
 		return nil, err
 	}
 	for i := range doc.Hooks {
-		if doc.Hooks[i].Timeout == 0 {
-			doc.Hooks[i].Timeout = 30 * time.Second
-		}
 		if !Supported(doc.Hooks[i].Event) {
 			return nil, fmt.Errorf("hook event %q is unsupported", doc.Hooks[i].Event)
 		}
@@ -94,28 +90,33 @@ func Supported(event string) bool {
 
 // Runner executes shell hooks through Executor.
 type Runner struct {
-	exec  sandbox.Executor
-	hooks []Spec
-	limit chan struct{}
-	seen  map[string]struct{}
+	exec           sandbox.Executor
+	hooks          []Spec
+	limit          chan struct{}
+	defaultTimeout time.Duration
 }
 
-// NewRunner bounds concurrent hook execution.
-func NewRunner(exec sandbox.Executor, hooks []Spec, maxConcurrent int) *Runner {
+// NewRunner bounds concurrent hook execution. defaultTimeout applies when a
+// hook omits its own timeout. Zero uses 30s.
+func NewRunner(exec sandbox.Executor, hooks []Spec, maxConcurrent int, defaultTimeout time.Duration) *Runner {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1
 	}
+	if defaultTimeout <= 0 {
+		defaultTimeout = 30 * time.Second
+	}
 	return &Runner{
-		exec:  exec,
-		hooks: append([]Spec(nil), hooks...),
-		limit: make(chan struct{}, maxConcurrent),
-		seen:  map[string]struct{}{},
+		exec:           exec,
+		hooks:          append([]Spec(nil), hooks...),
+		limit:          make(chan struct{}, maxConcurrent),
+		defaultTimeout: defaultTimeout,
 	}
 }
 
 // Run executes hooks for event. input is the JSON payload.
 // A blocking hook with a non-zero exit, timeout, or executor error stops
-// the step. Duplicate event+command+input pairs in one runner are skipped.
+// the step. Each call runs matching hooks again; there is no process-wide
+// dedupe, because tool-call ids can repeat across runs.
 func (r *Runner) Run(ctx context.Context, event, workspace, input string) ([]Result, error) {
 	if !Supported(event) {
 		return nil, fmt.Errorf("hook event %q is unsupported", event)
@@ -128,11 +129,6 @@ func (r *Runner) Run(ctx context.Context, event, workspace, input string) ([]Res
 		if hook.Event != event {
 			continue
 		}
-		key := dedupeKey(hook, input)
-		if _, ok := r.seen[key]; ok {
-			continue
-		}
-		r.seen[key] = struct{}{}
 		select {
 		case r.limit <- struct{}{}:
 		case <-ctx.Done():
@@ -140,14 +136,15 @@ func (r *Runner) Run(ctx context.Context, event, workspace, input string) ([]Res
 		}
 		result, err := r.one(ctx, hook, workspace, input)
 		<-r.limit
-		out = append(out, result)
-		if err != nil && hook.Blocking {
-			result.Blocked = true
-			if len(out) > 0 {
-				out[len(out)-1].Blocked = true
+		if err != nil {
+			result.Err = err.Error()
+			if hook.Blocking {
+				result.Blocked = true
+				out = append(out, result)
+				return out, err
 			}
-			return out, err
 		}
+		out = append(out, result)
 	}
 	return out, nil
 }
@@ -155,7 +152,7 @@ func (r *Runner) Run(ctx context.Context, event, workspace, input string) ([]Res
 func (r *Runner) one(ctx context.Context, hook Spec, workspace, input string) (Result, error) {
 	timeout := hook.Timeout
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = r.defaultTimeout
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -165,6 +162,7 @@ func (r *Runner) one(ctx context.Context, hook Spec, workspace, input string) (R
 		Argv:      argv,
 		Timeout:   timeout,
 		Env:       map[string]string{"GRAPE_HOOK_INPUT": input},
+		Hook:      true,
 	})
 	result := Result{Event: hook.Event, ExitCode: res.ExitCode, Stdout: res.Stdout, Stderr: res.Stderr}
 	if err != nil {
@@ -180,12 +178,6 @@ func (r *Runner) one(ctx context.Context, hook Spec, workspace, input string) (R
 	}
 	if err != nil && hook.Blocking {
 		result.Blocked = true
-		return result, err
 	}
-	return result, nil
-}
-
-func dedupeKey(hook Spec, input string) string {
-	sum := sha256.Sum256([]byte(hook.Event + "\x00" + hook.Command + "\x00" + strings.Join(hook.Args, "\x00") + "\x00" + input))
-	return hex.EncodeToString(sum[:])
+	return result, err
 }
