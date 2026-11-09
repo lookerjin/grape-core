@@ -49,6 +49,48 @@ func TestPathBoundaryAndReplaceKeepsMode(t *testing.T) {
 	}
 }
 
+func TestReplacePreservesEncodingAndRefusesNonUTF8(t *testing.T) {
+	root := t.TempDir()
+	raw := []byte("\xef\xbb\xbfalpha\r\nbeta\r\n")
+	path := filepath.Join(root, "notes.txt")
+	if err := os.WriteFile(path, raw, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := Replace(root, "notes.txt", "alpha", "ALPHA", 1); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("\xef\xbb\xbfALPHA\r\nbeta\r\n")
+	if string(got) != string(want) {
+		t.Fatalf("bytes %q", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Fatalf("mode %o", info.Mode().Perm())
+	}
+	binary := filepath.Join(root, "blob.bin")
+	original := []byte{0xff, 0xfe, 'a', 'b'}
+	if err := os.WriteFile(binary, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Replace(root, "blob.bin", "ab", "cd", 1); err == nil {
+		t.Fatal("expected non-UTF-8 refusal")
+	}
+	after, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(original) {
+		t.Fatalf("binary changed %v", after)
+	}
+}
+
 func TestGitStatusDoesNotStage(t *testing.T) {
 	root := t.TempDir()
 	gitCmd(t, root, "init")

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // Resolve returns a cleaned absolute workspace directory.
@@ -219,6 +220,9 @@ func Replace(root, rel, old, new string, n int) error {
 	b, err := os.ReadFile(full)
 	if err != nil {
 		return err
+	}
+	if !utf8.Valid(b) {
+		return fmt.Errorf("refusing to edit non-UTF-8 file %s", rel)
 	}
 	if n <= 0 {
 		n = 1
