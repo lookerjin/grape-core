@@ -42,9 +42,7 @@ func (p *hookPlugin) beforeAgent(ctx context.Context, args *trpcagent.BeforeAgen
 }
 
 func (p *hookPlugin) afterAgent(ctx context.Context, args *trpcagent.AfterAgentArgs) (*trpcagent.AfterAgentResult, error) {
-	if err := p.dispatch(ctx, hooks.AfterRun, `{"event":"AfterRun","where":"agent"}`); err != nil {
-		return nil, err
-	}
+	// AfterRun is emitted from the runner hook so a run does not fire it twice.
 	return nil, nil
 }
 
@@ -56,6 +54,9 @@ func (p *hookPlugin) beforeModel(ctx context.Context, args *model.BeforeModelArg
 }
 
 func (p *hookPlugin) afterModel(ctx context.Context, args *model.AfterModelArgs) (*model.AfterModelResult, error) {
+	if args != nil && args.Response != nil && args.Response.IsPartial {
+		return nil, nil
+	}
 	if err := p.dispatch(ctx, hooks.AfterModel, `{"event":"AfterModel"}`); err != nil {
 		return nil, err
 	}
@@ -93,6 +94,9 @@ func (p *hookPlugin) afterTool(ctx context.Context, args *tool.AfterToolArgs) (*
 }
 
 func (p *hookPlugin) onEvent(ctx context.Context, inv *trpcagent.Invocation, evt *event.Event) (*event.Event, error) {
+	if evt != nil && evt.Response != nil && evt.IsPartial {
+		return evt, nil
+	}
 	kind := ""
 	if evt != nil {
 		kind = string(evt.Object)

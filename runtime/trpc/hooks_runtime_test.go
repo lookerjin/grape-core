@@ -151,6 +151,60 @@ func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestHooksFireOncePerLogicalEvent(t *testing.T) {
+	root := t.TempDir()
+	ws := filepath.Join(root, "ws")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := installHooks(t, root, "once", `[
+		{"event":"BeforeModel","command":"sh","args":["-c","echo BeforeModel >> hook.log"],"blocking":false},
+		{"event":"AfterModel","command":"sh","args":["-c","echo AfterModel >> hook.log"],"blocking":false},
+		{"event":"AfterRun","command":"sh","args":["-c","echo AfterRun >> hook.log"],"blocking":false},
+		{"event":"OnEvent","command":"sh","args":["-c","echo OnEvent >> hook.log"],"blocking":false}
+	]`)
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Workspace.Root = ws
+	cfg.Sandbox.Mode = "managed"
+	cfg.Model.Generation.Stream = boolPtr(true)
+	cfg.Journal.Enabled = false
+	cfg.Plugins.Enabled = []string{"once"}
+	mdl := mockmodel.New("once", mockmodel.Echo).WithStream()
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(), PluginManager: mgr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{
+		UserID: "u", SessionID: "once", Workspace: ws, Message: "hello streaming world",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collect(t, h)
+	raw, err := os.ReadFile(filepath.Join(ws, "hook.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	before := strings.Count(text, "BeforeModel")
+	after := strings.Count(text, "AfterModel")
+	runs := strings.Count(text, "AfterRun")
+	events := strings.Count(text, "OnEvent")
+	if before == 0 || before != after {
+		t.Fatalf("model hooks before=%d after=%d\n%s", before, after, text)
+	}
+	if runs != 1 {
+		t.Fatalf("AfterRun count %d\n%s", runs, text)
+	}
+	if events != 9 {
+		t.Fatalf("OnEvent count %d, want the non-partial events only\n%s", events, text)
+	}
+}
+
 func TestHooksRunAgainAcrossSessions(t *testing.T) {
 	root := t.TempDir()
 	ws := filepath.Join(root, "ws")
