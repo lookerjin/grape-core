@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,6 +104,80 @@ func TestInstallEnableResolveAndGitRevision(t *testing.T) {
 	}
 	if _, err := mgr.Inspect("demo"); err == nil {
 		t.Fatal("expected uninstall")
+	}
+}
+
+func TestInstallRollbackAndFailedUpdate(t *testing.T) {
+	root := t.TempDir()
+	mgr, err := NewManager(filepath.Join(root, "installed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(root, "src")
+	writePlugin(t, src, "demo")
+	if err := os.WriteFile(filepath.Join(src, "VERSION"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	copied := 0
+	failCopy = func(string) error {
+		copied++
+		if copied > 1 {
+			return errors.New("injected copy failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { failCopy = nil })
+	if _, err := mgr.InstallLocal(src); err == nil {
+		t.Fatal("expected mid-copy failure")
+	}
+	if _, err := os.Stat(filepath.Join(mgr.Root(), "demo")); !os.IsNotExist(err) {
+		t.Fatal("partial install directory remains")
+	}
+	entries, err := os.ReadDir(mgr.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".staging-") || entry.Name() == "demo" {
+			t.Fatalf("leftover %s", entry.Name())
+		}
+	}
+	if raw, err := os.ReadFile(filepath.Join(mgr.Root(), "installed.json")); err == nil && strings.Contains(string(raw), "demo") {
+		t.Fatalf("install record written: %s", raw)
+	}
+	failCopy = nil
+	if _, err := mgr.InstallLocal(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Enable("demo"); err != nil {
+		t.Fatal(err)
+	}
+	next := filepath.Join(root, "next")
+	writePlugin(t, next, "demo")
+	if err := os.WriteFile(filepath.Join(next, ".claude-plugin", "plugin.json"), []byte(`{"name":"demo","version":"9.9.9"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	copied = 0
+	failCopy = func(string) error {
+		copied++
+		if copied > 1 {
+			return errors.New("injected copy failure")
+		}
+		return nil
+	}
+	if _, err := mgr.UpdateLocal(next); err == nil {
+		t.Fatal("expected failed update")
+	}
+	got, err := mgr.Inspect("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != "0.1.0" || !got.Enabled {
+		t.Fatalf("previous install not preserved: %+v", got)
+	}
+	body, err := os.ReadFile(filepath.Join(mgr.Root(), "demo", "VERSION"))
+	if err != nil || string(body) != "1\n" {
+		t.Fatalf("version file %q err %v", body, err)
 	}
 }
 

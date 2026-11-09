@@ -87,6 +87,16 @@ func (m *Manager) Root() string { return m.root }
 
 // InstallLocal copies a directory bundle into the manager root.
 func (m *Manager) InstallLocal(src string) (*Record, error) {
+	return m.installSource(src, "")
+}
+
+// UpdateLocal replaces an installed bundle from a directory.
+// A failure while copying or validating leaves the previous install in place.
+func (m *Manager) UpdateLocal(src string) (*Record, error) {
+	return m.installSource(src, "")
+}
+
+func (m *Manager) installSource(src, revision string) (*Record, error) {
 	abs, err := filepath.Abs(src)
 	if err != nil {
 		return nil, err
@@ -98,7 +108,7 @@ func (m *Manager) InstallLocal(src string) (*Record, error) {
 	if !info.IsDir() {
 		return nil, fmt.Errorf("plugin source is not a directory")
 	}
-	return m.installTree(abs, abs, "")
+	return m.installTree(abs, abs, revision)
 }
 
 // List returns installed records sorted by name.
@@ -280,6 +290,9 @@ func (m *Manager) installTree(src, sourceLabel, revision string) (*Record, error
 	if err != nil {
 		_ = os.RemoveAll(final)
 		return nil, err
+	}
+	if prev, ok := state[rec.Name]; ok {
+		rec.Enabled = prev.Enabled
 	}
 	state[rec.Name] = rec
 	if err := m.store(state); err != nil {
@@ -472,7 +485,15 @@ func inside(root, path string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
+// failCopy is a test seam. Production leaves it nil.
+var failCopy func(dst string) error
+
 func copyFile(src, dst string, mode os.FileMode) error {
+	if failCopy != nil {
+		if err := failCopy(dst); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
