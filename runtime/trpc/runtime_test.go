@@ -3,6 +3,7 @@ package trpcruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -323,6 +324,37 @@ func TestCancelDoesNotOverlapToolExecution(t *testing.T) {
 	}
 }
 
+func TestAbandonedHandlesReleasePumps(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	mdl := mockmodel.New("abandon", mockmodel.Echo)
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	before := goruntime.NumGoroutine()
+	var handles []agent.RunHandle
+	for i := 0; i < 5; i++ {
+		h, err := rt.Start(context.Background(), agent.RunRequest{
+			UserID: "u", SessionID: fmt.Sprintf("ab%d", i), Message: "hi",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handles = append(handles, h)
+	}
+	time.Sleep(100 * time.Millisecond)
+	handles = nil
+	goruntime.GC()
+	goruntime.GC()
+	deadline := time.Now().Add(2 * time.Second)
+	for goruntime.NumGoroutine() > before+4 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		goruntime.GC()
+	}
+	if goruntime.NumGoroutine() > before+4 {
+		t.Fatalf("goroutines %d baseline %d", goruntime.NumGoroutine(), before)
+	}
+}
+
 func TestCancelDuringToolStartNoRace(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false
@@ -415,7 +447,7 @@ func TestEventBoxDropsOnlyTextDeltas(t *testing.T) {
 	box.push(agent.Event{Kind: agent.EventCompleted, Payload: agent.MustPayload(map[string]string{"status": "completed"})})
 	box.close()
 	out := make(chan agent.Event)
-	go box.pump(out)
+	go box.pump(out, nil)
 	var kinds []agent.EventKind
 	var dropped int
 	for evt := range out {

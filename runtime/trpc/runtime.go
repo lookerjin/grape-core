@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	stdruntime "runtime"
 	"sync"
 	"time"
 
@@ -448,10 +449,10 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	}
 	box := newEventBox(256)
 	ch := make(chan agent.Event)
-	go box.pump(ch)
 	h := &runHandle{
 		id:     runID,
 		events: ch,
+		stop:   make(chan struct{}),
 		cancel: func() error {
 			cancel()
 			if managed, ok := rt.runner.(runner.ManagedRunner); ok {
@@ -463,6 +464,8 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 			return runner.EnqueueUserMessage(rt.runner, runID, model.NewUserMessage(message))
 		},
 	}
+	go box.pump(ch, h.stop)
+	stdruntime.SetFinalizer(h, func(h *runHandle) { h.Close() })
 	go rt.forward(runCtx, req, runID, st, events, box, unlock)
 	return h, nil
 }
@@ -732,10 +735,22 @@ func (rt *Runtime) Close() error {
 }
 
 type runHandle struct {
-	id      string
-	events  <-chan agent.Event
-	cancel  func() error
-	enqueue func(string) error
+	id       string
+	events   <-chan agent.Event
+	cancel   func() error
+	enqueue  func(string) error
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+// Close unblocks the event pump and drops events still buffered.
+// The handle is also finalized this way if the caller abandons it.
+func (h *runHandle) Close() error {
+	if h == nil || h.stop == nil {
+		return nil
+	}
+	h.stopOnce.Do(func() { close(h.stop) })
+	return nil
 }
 
 func (h *runHandle) ID() string                 { return h.id }

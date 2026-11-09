@@ -17,7 +17,7 @@ import (
 // one "dropped N events" marker.
 type eventBox struct {
 	mu      sync.Mutex
-	cond    *sync.Cond
+	wake    chan struct{}
 	items   []agent.Event
 	closed  bool
 	max     int
@@ -28,9 +28,14 @@ func newEventBox(max int) *eventBox {
 	if max < 2 {
 		max = 2
 	}
-	b := &eventBox{max: max}
-	b.cond = sync.NewCond(&b.mu)
-	return b
+	return &eventBox{max: max, wake: make(chan struct{}, 1)}
+}
+
+func (b *eventBox) signal() {
+	select {
+	case b.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (b *eventBox) push(evt agent.Event) {
@@ -49,7 +54,7 @@ func (b *eventBox) push(evt agent.Event) {
 	}
 	b.flushDroppedLocked()
 	b.items = append(b.items, evt)
-	b.cond.Signal()
+	b.signal()
 }
 
 func (b *eventBox) dropOldestDelta() bool {
@@ -86,24 +91,46 @@ func (b *eventBox) close() {
 	b.mu.Lock()
 	b.flushDroppedLocked()
 	b.closed = true
-	b.cond.Broadcast()
 	b.mu.Unlock()
+	b.signal()
 }
 
-func (b *eventBox) pump(out chan<- agent.Event) {
+// pump sends queued events until the box is drained or stop is closed.
+// Closing stop drops whatever is still buffered so an abandoned handle
+// does not leave this goroutine running.
+func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}) {
 	defer close(out)
 	for {
-		b.mu.Lock()
-		for len(b.items) == 0 && !b.closed {
-			b.cond.Wait()
-		}
-		if len(b.items) == 0 {
-			b.mu.Unlock()
+		evt, ok := b.pop(stop)
+		if !ok {
 			return
 		}
-		evt := b.items[0]
-		b.items = b.items[1:]
+		select {
+		case out <- evt:
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (b *eventBox) pop(stop <-chan struct{}) (agent.Event, bool) {
+	for {
+		b.mu.Lock()
+		if len(b.items) > 0 {
+			evt := b.items[0]
+			b.items = b.items[1:]
+			b.mu.Unlock()
+			return evt, true
+		}
+		if b.closed {
+			b.mu.Unlock()
+			return agent.Event{}, false
+		}
 		b.mu.Unlock()
-		out <- evt
+		select {
+		case <-b.wake:
+		case <-stop:
+			return agent.Event{}, false
+		}
 	}
 }
