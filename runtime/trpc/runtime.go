@@ -14,6 +14,7 @@ import (
 	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/internal/journal"
 	"github.com/lookerjin/grape-core/internal/paths"
+	"github.com/lookerjin/grape-core/sandbox"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -39,6 +40,10 @@ type Options struct {
 	Decider                 agent.Decider
 	RejectConcurrentSession bool
 	Instruction             string
+	// Platform overrides GOOS for sandbox preflight. Leave it empty in
+	// production. Tests set "windows" to exercise the fail-closed path.
+	Platform string
+	External sandbox.Backend
 }
 
 // Runtime is a tRPC-backed agent.Runtime.
@@ -51,6 +56,8 @@ type Runtime struct {
 	runner      runner.Runner
 	sessions    *sqlitesession.Service
 	counter     *countingModel
+	model       model.Model
+	exec        *commandExecutor
 	tools       []tool.Tool
 	decider     agent.Decider
 	reject      bool
@@ -115,26 +122,30 @@ func New(opts Options) (*Runtime, error) {
 	}
 	instruction := opts.Instruction
 	if instruction == "" {
-		instruction = "You are grape-core, a local assistant. Use tools only when they are provided. Never claim that a command ran unless a tool result says so."
+		instruction = "You are grape-core, a local assistant. Use tools only when they are provided. Never claim that a command ran unless a tool result says so. Do not stage, commit, push, reset, or clean git state."
 	}
-	agentOpts := []llmagent.Option{
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction(instruction),
-		llmagent.WithGenerationConfig(generationConfig(cfg)),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithMaxLLMCalls(positiveLimit(cfg.Context.MaxLLMCalls)),
-		llmagent.WithMaxToolIterations(positiveLimit(cfg.Context.MaxToolIterations)),
-	}
-	if len(opts.Tools) > 0 {
-		agentOpts = append(agentOpts, llmagent.WithTools(opts.Tools))
-	}
-	ag := llmagent.New("grape", agentOpts...)
 	appName := opts.AppName
 	if appName == "" {
 		appName = defaultAppName
 	}
-	r := runner.NewRunner(appName, ag, runner.WithSessionService(sessions))
-	secrets := secretValues(cfg)
+	rt := &Runtime{
+		cfg:         cfg,
+		appName:     appName,
+		sessions:    sessions,
+		counter:     counter,
+		model:       mdl,
+		exec:        newCommandExecutor(cfg, filepath.Join(dataDir, "sandbox"), opts.Platform, opts.External),
+		tools:       append([]tool.Tool(nil), opts.Tools...),
+		decider:     opts.Decider,
+		reject:      opts.RejectConcurrentSession,
+		secrets:     secretValues(cfg),
+		maxField:    cfg.Journal.MaxFieldBytes,
+		instruction: instruction,
+		locks:       map[string]*sync.Mutex{},
+	}
+	r := runner.NewRunnerWithAgentFactory(appName, "grape", rt.agentFactory, runner.WithSessionService(sessions))
+	rt.runner = r
+	secrets := rt.secrets
 	var jw *journal.Writer
 	if cfg.Journal.Enabled {
 		jw, err = journal.Open(cfg.Journal.Path, cfg.Journal.MaxFieldBytes, secrets)
@@ -144,21 +155,34 @@ func New(opts Options) (*Runtime, error) {
 			return nil, agent.Wrap(agent.ErrInvalidConfig, "journal", err)
 		}
 	}
-	return &Runtime{
-		cfg:         cfg,
-		appName:     appName,
-		runner:      r,
-		sessions:    sessions,
-		counter:     counter,
-		tools:       append([]tool.Tool(nil), opts.Tools...),
-		decider:     opts.Decider,
-		reject:      opts.RejectConcurrentSession,
-		journal:     jw,
-		secrets:     secrets,
-		maxField:    cfg.Journal.MaxFieldBytes,
-		instruction: instruction,
-		locks:       map[string]*sync.Mutex{},
-	}, nil
+	rt.journal = jw
+	return rt, nil
+}
+
+func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (trpcagent.Agent, error) {
+	ws := rt.cfg.Workspace.Root
+	if ro.RuntimeState != nil {
+		if v, ok := ro.RuntimeState["workspace"].(string); ok && v != "" {
+			ws = v
+		}
+	}
+	allowWrite := rt.cfg.Workspace.Permission != agent.PermissionReadOnly
+	tools, err := rt.workspaceTools(ws, allowWrite)
+	if err != nil {
+		return nil, err
+	}
+	tools = append(tools, rt.tools...)
+	opts := []llmagent.Option{
+		llmagent.WithModel(rt.model),
+		llmagent.WithInstruction(rt.instruction),
+		llmagent.WithGenerationConfig(generationConfig(rt.cfg)),
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
+		llmagent.WithWorkspaceExecSurfaceEnabled(false),
+		llmagent.WithMaxLLMCalls(positiveLimit(rt.cfg.Context.MaxLLMCalls)),
+		llmagent.WithMaxToolIterations(positiveLimit(rt.cfg.Context.MaxToolIterations)),
+		llmagent.WithTools(tools),
+	}
+	return llmagent.New("grape", opts...), nil
 }
 
 func resolvePaths(cfg config.Config, dataDir string) (config.Config, error) {
@@ -250,14 +274,30 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	if err != nil {
 		return nil, err
 	}
+	workspace := req.Workspace
+	if workspace == "" {
+		workspace = rt.cfg.Workspace.Root
+	}
+	workspace, err = filepath.Abs(workspace)
+	if err != nil {
+		unlock()
+		return nil, agent.Invalid("workspace", err)
+	}
 	runID := uuid.NewString()
 	runCtx, cancel := context.WithCancel(ctx)
+	st := &runState{runID: runID, session: req.SessionID, mode: req.Mode}
+	runCtx = withState(runCtx, st)
+	runCtx = context.WithValue(runCtx, workspaceKey{}, workspace)
 	events, err := rt.runner.Run(
 		runCtx,
 		req.UserID,
 		req.SessionID,
 		model.NewUserMessage(req.Message),
 		trpcagent.WithRequestID(runID),
+		trpcagent.WithRuntimeState(map[string]any{
+			"workspace": workspace,
+			"mode":      string(req.Mode),
+		}),
 	)
 	if err != nil {
 		cancel()
@@ -279,7 +319,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 			return runner.EnqueueUserMessage(rt.runner, runID, model.NewUserMessage(message))
 		},
 	}
-	go rt.forward(runCtx, req, runID, events, ch, unlock)
+	go rt.forward(runCtx, req, runID, st, events, ch, unlock)
 	return h, nil
 }
 
@@ -290,7 +330,7 @@ func classifyRunError(err error) error {
 	return agent.Wrap(agent.ErrModel, "run", err)
 }
 
-func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID string, in <-chan *event.Event, out chan<- agent.Event, unlock func()) {
+func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID string, st *runState, in <-chan *event.Event, out chan<- agent.Event, unlock func()) {
 	defer unlock()
 	defer close(out)
 	conv := newConverter(runID, req.SessionID, rt.maxField, rt.secrets)
@@ -310,7 +350,19 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 			terminal = true
 		}
 	}
+	flush := func() {
+		for _, evt := range st.drain() {
+			emit(conv.stamp(evt))
+			if terminal {
+				return
+			}
+		}
+	}
 	for evt := range in {
+		if terminal {
+			continue
+		}
+		flush()
 		if terminal {
 			continue
 		}
@@ -327,6 +379,9 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 				break
 			}
 		}
+	}
+	if !terminal {
+		flush()
 	}
 	if !terminal {
 		status := agent.EventFailed
