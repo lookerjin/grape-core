@@ -12,7 +12,26 @@
 
 Managed mode on Linux uses tRPC bubblewrap. The preflight runs `/bin/true` inside the sandbox. If bubblewrap is missing or the preflight fails, `Execute` returns `agent.ErrSandboxUnavailable` and does not run the command on the host.
 
-`FilesystemIsolation` is false for this profile. trpc-agent-go v1.12.0 `WorkspaceWriteProfile` starts bubblewrap with `--ro-bind / /` and then adds a writable bind for the workspace grant. A managed command can `cat` a file outside the workspace. Writes outside that grant are denied. grape-core reports that split in `Capabilities.Reason` instead of claiming host reads are blocked.
+`FilesystemIsolation` is false for this profile. trpc-agent-go v1.12.0 `WorkspaceWriteProfile` starts bubblewrap with `--ro-bind / /` and then adds a writable bind for the workspace grant. A managed command can still `cat` an ordinary file outside the workspace. Writes outside that grant are denied.
+
+Existing sensitive paths are passed to `PermissionProfile.WithNoAccessPaths`, which the Linux backend enforces with deny-read masks (`tmpfs` mode `000` for directories, a mask file for regular files). `WithNoAccessGlobs` is used only for workspace-relative patterns in `sandbox.deny_read`; v1.12.0 rejects absolute globs. `Capabilities.SensitivePathsMasked` lists the paths that existed and were masked. `FilesystemIsolation` stays false because the rest of the host remains readable.
+
+The default list, used when `sandbox.deny_read_mode` is `add`, is the following paths under the user home when they exist:
+
+- `~/.ssh`
+- `~/.gnupg`
+- `~/.aws`
+- `~/.azure`
+- `~/.config/gcloud`
+- `~/.kube`
+- `~/.docker/config.json`
+- `~/.netrc`
+- `~/.git-credentials`
+- `~/.config/gh`
+
+It also includes the grape-core data directory (`~/.grape-core`, or `%AppData%\grape-core` on Windows) when that directory exists, the SQLite session file when it lives outside that directory and exists, and any `file:` credential path named by MCP `credential_ref` or headers. Missing paths are omitted. `sandbox.deny_read_mode: override` uses only `sandbox.deny_read`. Paths that contain the command workspace are omitted so the workspace grant is not covered by a mask. Bubblewrap scratch directories live in the system temp directory, outside the data directory, so the data directory itself can be masked.
+
+`read_only` never starts a command. The managed profile builder still attaches the same no-access list to `ReadOnlyProfile` for that permission, and to `WorkspaceWriteProfile` for `workspace_write`.
 
 `NetworkIsolation` is true when `sandbox.network` is `restricted` and the preflight succeeded. The Linux backend uses a fresh network namespace, so a connect to a listener on the host loopback is refused. `sandbox.network: enabled` sets `NetworkIsolation` false.
 
