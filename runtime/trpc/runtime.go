@@ -99,7 +99,8 @@ type Runtime struct {
 	locks map[string]*sync.Mutex
 	// holds is the in-flight drain for a session, keyed so an older run
 	// cannot release or poison the run that replaced it.
-	holds map[string]*sessionHold
+	holds  map[string]*sessionHold
+	active map[*runHandle]struct{}
 
 	closeOnce sync.Once
 	closeErr  error
@@ -449,7 +450,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		return nil, classifyRunError(err)
 	}
 	box := newEventBox(256)
-	ch := make(chan agent.Event)
+	ch := make(chan agent.Event, 3)
 	h := &runHandle{
 		id:     runID,
 		events: ch,
@@ -466,7 +467,11 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 			return runner.EnqueueUserMessage(rt.runner, runID, model.NewUserMessage(message))
 		},
 	}
-	go box.pump(ch, h.stop)
+	rt.track(h)
+	go func() {
+		box.pump(ch, h.stop, rt.eventHoldTimeout())
+		rt.untrack(h)
+	}()
 	go rt.forward(runCtx, req, runID, st, events, box, unlock)
 	return h, nil
 }
@@ -591,6 +596,47 @@ drained:
 				Error:  msg,
 			}),
 		}))
+	}
+}
+
+func (rt *Runtime) eventHoldTimeout() time.Duration {
+	d, err := config.Duration(rt.cfg.Context.EventHoldTimeout)
+	if err != nil || d <= 0 {
+		return 30 * time.Second
+	}
+	return d
+}
+
+func (rt *Runtime) track(h *runHandle) {
+	if rt == nil || h == nil {
+		return
+	}
+	rt.mu.Lock()
+	if rt.active == nil {
+		rt.active = map[*runHandle]struct{}{}
+	}
+	rt.active[h] = struct{}{}
+	rt.mu.Unlock()
+}
+
+func (rt *Runtime) untrack(h *runHandle) {
+	if rt == nil || h == nil {
+		return
+	}
+	rt.mu.Lock()
+	delete(rt.active, h)
+	rt.mu.Unlock()
+}
+
+func (rt *Runtime) stopPumps() {
+	rt.mu.Lock()
+	handles := make([]*runHandle, 0, len(rt.active))
+	for h := range rt.active {
+		handles = append(handles, h)
+	}
+	rt.mu.Unlock()
+	for _, h := range handles {
+		_ = h.Close()
 	}
 }
 
@@ -785,6 +831,7 @@ func (rt *Runtime) Close() error {
 		return nil
 	}
 	rt.closeOnce.Do(func() {
+		rt.stopPumps()
 		if rt.runner != nil {
 			rt.closeErr = rt.runner.Close()
 		}

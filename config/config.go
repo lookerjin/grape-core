@@ -188,6 +188,9 @@ type ContextConfig struct {
 	// to return before the session is marked poisoned. Zero uses 30s.
 	// ForceReleaseSession is the explicit recovery.
 	ToolDrainTimeout string `yaml:"tool_drain_timeout"`
+	// EventHoldTimeout is how long a finished run keeps unread events
+	// before the pump keeps only the terminal event and exits. Zero uses 30s.
+	EventHoldTimeout string `yaml:"event_hold_timeout"`
 }
 
 // ApprovalConfig requires an approval for mutating tools when true.
@@ -268,6 +271,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Context.ToolDrainTimeout == "" {
 		c.Context.ToolDrainTimeout = "30s"
+	}
+	if c.Context.EventHoldTimeout == "" {
+		c.Context.EventHoldTimeout = "30s"
 	}
 }
 

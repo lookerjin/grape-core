@@ -32,16 +32,22 @@ type RunRequest struct {
 	AgentID   string `json:"agent_id,omitempty"`
 }
 
-// RunHandle is the read-only handle for an in-flight run.
+// RunHandle is the handle for an in-flight run.
 //
 // Events is closed after exactly one terminal event. Cancel aborts the run.
-// The context passed to Runtime.Start bounds the run; Cancel is an additional
-// explicit abort. Implementations must not detach the run onto
-// context.Background.
+// Close drops any events still buffered and releases the pump. Call it when
+// the consumer will not read Events. A finished run that is left unread
+// keeps its backlog only until context.event_hold_timeout (default 30s);
+// the pump then discards non-terminal events, leaves the terminal event,
+// and exits. Runtime.Close releases every pump immediately. The context
+// passed to Runtime.Start bounds the run; Cancel is an additional explicit
+// abort. Implementations must not detach the run onto context.Background.
 type RunHandle interface {
 	ID() string
 	Events() <-chan Event
 	Cancel() error
+	// Close releases the event pump. It is safe to call more than once.
+	Close() error
 	// Enqueue inserts a user message at the next tool boundary when the
 	// underlying runner supports steering.
 	Enqueue(message string) error

@@ -516,6 +516,120 @@ func TestAbandonedHandlesReleasePumps(t *testing.T) {
 	}
 }
 
+func TestRuntimeCloseReleasesPumps(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Context.EventHoldTimeout = "30s"
+	rt := newTestRuntime(t, mockmodel.New("rt-close", mockmodel.Echo), cfg)
+	before := goruntime.NumGoroutine()
+	for i := 0; i < 8; i++ {
+		if _, err := rt.Start(context.Background(), agent.RunRequest{
+			UserID: "u", SessionID: fmt.Sprintf("rtc%d", i), Message: "hi",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+	if err := rt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for goruntime.NumGoroutine() > before+6 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if goruntime.NumGoroutine() > before+6 {
+		t.Fatalf("goroutines %d baseline %d", goruntime.NumGoroutine(), before)
+	}
+}
+
+func TestAbandonedRunsReleaseWithoutClose(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Context.EventHoldTimeout = "150ms"
+	cfg.Context.MaxLLMCalls = 30
+	cfg.Context.MaxToolIterations = 30
+	payload := strings.Repeat("x", 4096)
+	var n atomic.Int32
+	mdl := mockmodel.New("leak", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if ctx.Err() != nil || (hasToolMessage(req) && n.Load() >= 20) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		n.Add(1)
+		return &model.Response{Choices: []model.Choice{{
+			Message: model.Message{
+				Role: model.RoleAssistant,
+				ToolCalls: []model.ToolCall{{
+					ID:   "call-leak",
+					Type: "function",
+					Function: model.FunctionDefinitionParam{
+						Name:      "echo",
+						Arguments: []byte(`{"text":"` + payload + `"}`),
+					},
+				}},
+			},
+		}}}, nil
+	})
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	goruntime.GC()
+	beforeG := goruntime.NumGoroutine()
+	before := runtimeMem()
+	for i := 0; i < 25; i++ {
+		h, err := rt.Start(context.Background(), agent.RunRequest{
+			UserID: "u", SessionID: fmt.Sprintf("leak%d", i), Message: "go",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = h
+	}
+	time.Sleep(700 * time.Millisecond)
+	goruntime.GC()
+	goruntime.GC()
+	deadline := time.Now().Add(2 * time.Second)
+	for goruntime.NumGoroutine() > beforeG+8 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		goruntime.GC()
+	}
+	if goruntime.NumGoroutine() > beforeG+8 {
+		t.Fatalf("goroutines %d baseline %d", goruntime.NumGoroutine(), beforeG)
+	}
+	after := runtimeMem()
+	if after > before+8<<20 {
+		t.Fatalf("heap grew %d bytes", after-before)
+	}
+}
+
+func runtimeMem() uint64 {
+	goruntime.GC()
+	var m goruntime.MemStats
+	goruntime.ReadMemStats(&m)
+	return m.HeapAlloc
+}
+
+func TestLateReaderAfterHoldSeesTerminal(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Context.EventHoldTimeout = "200ms"
+	rt := newTestRuntime(t, mockmodel.New("late-hold", mockmodel.Echo), cfg)
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "late-hold", Message: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	var last agent.Event
+	n := 0
+	for evt := range h.Events() {
+		n++
+		last = evt
+	}
+	if n == 0 || !last.Terminal() {
+		t.Fatalf("events=%d last=%s", n, last.Kind)
+	}
+}
+
 func TestRangeEventsSurvivesGC(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false
@@ -651,7 +765,7 @@ func TestEventBoxDropsOnlyTextDeltas(t *testing.T) {
 	box.push(agent.Event{Kind: agent.EventCompleted, Payload: agent.MustPayload(map[string]string{"status": "completed"})})
 	box.close()
 	out := make(chan agent.Event)
-	go box.pump(out, nil)
+	go box.pump(out, nil, time.Hour)
 	var kinds []agent.EventKind
 	var dropped int
 	for evt := range out {

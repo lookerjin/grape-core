@@ -105,22 +105,114 @@ func (b *eventBox) abandon() {
 	b.signal()
 }
 
-// pump sends queued events until the box is drained or stop is closed.
-// Closing stop drops whatever is still buffered so an abandoned handle
-// does not leave this goroutine running.
-func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}) {
+// pump sends queued events until the box is drained, stop is closed, or
+// idle elapses after the run is finished without a consumer taking the
+// next event. On that timeout the backlog is discarded and only a drop
+// marker plus the terminal event are sent.
+func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.Duration) {
 	defer close(out)
+	if idle <= 0 {
+		idle = 30 * time.Second
+	}
+	var timer *time.Timer
+	var timed <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	arm := func() {
+		if timer == nil {
+			timer = time.NewTimer(idle)
+			timed = timer.C
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timed:
+			default:
+			}
+		}
+		timer.Reset(idle)
+	}
 	for {
 		evt, ok := b.pop(stop)
 		if !ok {
 			return
 		}
+		for len(out) > 0 {
+			if b.isClosed() && timer == nil {
+				arm()
+			}
+			select {
+			case <-timed:
+				b.deliverFinal(out, &evt)
+				return
+			case <-stop:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
 		select {
 		case out <- evt:
+			if b.isClosed() {
+				arm()
+			}
+		case <-timed:
+			b.deliverFinal(out, &evt)
+			return
 		case <-stop:
 			return
 		}
 	}
+}
+
+func (b *eventBox) isClosed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closed
+}
+
+func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event) {
+	n, term := b.compact()
+	if held != nil && held.Terminal() {
+		term = held
+	} else if held != nil {
+		n++
+	}
+	if n > 0 {
+		select {
+		case out <- droppedMarker(n):
+		default:
+		}
+	}
+	if term != nil {
+		select {
+		case out <- *term:
+		default:
+		}
+	}
+}
+
+func (b *eventBox) compact() (int, *agent.Event) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var term *agent.Event
+	extra := 0
+	for i := range b.items {
+		if b.items[i].Terminal() {
+			evt := b.items[i]
+			term = &evt
+			continue
+		}
+		extra++
+	}
+	b.items = nil
+	b.dropped += extra
+	n := b.dropped
+	b.dropped = 0
+	b.closed = true
+	return n, term
 }
 
 func (b *eventBox) pop(stop <-chan struct{}) (agent.Event, bool) {

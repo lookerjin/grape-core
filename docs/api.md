@@ -19,7 +19,7 @@ for evt := range run.Events() {
 }
 ```
 
-`RunHandle.Events` closes after one terminal event: `completed`, `failed`, or `cancelled`. `Sequence` is monotonic for that process-local run. It is not a durable cursor.
+`RunHandle.Events` closes after one terminal event: `completed`, `failed`, or `cancelled`. `Sequence` is monotonic for that process-local run. It is not a durable cursor. `RunHandle.Close` drops unread events and releases the pump. Call it when the consumer will not read. If a finished run is not drained within `context.event_hold_timeout` (default 30s), the pump discards the backlog, leaves the terminal event, and exits. `Runtime.Close` releases every pump.
 
 The stream keeps a soft buffer of 256 events. Only `text_delta` events are dropped when a consumer falls behind. One `dropped N events` marker is emitted per catch-up, not once per dropped delta. Tool calls, permission decisions, errors, hook failures, and the terminal event are not dropped; the buffer grows to hold them.
 
