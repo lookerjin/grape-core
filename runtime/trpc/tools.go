@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,12 +17,19 @@ import (
 
 type runState struct {
 	mu       sync.Mutex
+	cond     *sync.Cond
 	events   []agent.Event
 	runID    string
 	session  string
 	mode     agent.Mode
-	inflight atomic.Int32
-	tools    sync.WaitGroup
+	tools    int
+	stopping bool
+}
+
+func newRunState(runID, session string, mode agent.Mode) *runState {
+	st := &runState{runID: runID, session: session, mode: mode}
+	st.cond = sync.NewCond(&st.mu)
+	return st
 }
 
 type stateKey struct{}
@@ -51,16 +57,51 @@ func (st *runState) enterTool() {
 	if st == nil {
 		return
 	}
-	st.inflight.Add(1)
-	st.tools.Add(1)
+	st.mu.Lock()
+	st.tools++
+	st.mu.Unlock()
 }
 
 func (st *runState) leaveTool() {
 	if st == nil {
 		return
 	}
-	st.inflight.Add(-1)
-	st.tools.Done()
+	st.mu.Lock()
+	if st.tools > 0 {
+		st.tools--
+	}
+	if st.tools == 0 {
+		st.cond.Broadcast()
+	}
+	st.mu.Unlock()
+}
+
+// waitTools blocks until every tool that has entered has left.
+// The count and the wait share one mutex, so a tool cannot publish
+// itself after a waiter has already decided the run is idle.
+func (st *runState) waitTools() {
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.stopping = true
+	for st.tools > 0 {
+		st.cond.Wait()
+	}
+}
+
+// captureBusy marks the run as finishing and reports whether a tool is
+// still inside Call. The flag and the counter move together, so a tool
+// that enters before this returns is included.
+func (st *runState) captureBusy() bool {
+	if st == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.stopping = true
+	return st.tools > 0
 }
 
 func (st *runState) drain() []agent.Event {

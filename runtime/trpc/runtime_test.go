@@ -323,6 +323,87 @@ func TestCancelDoesNotOverlapToolExecution(t *testing.T) {
 	}
 }
 
+func TestCancelDuringToolStartNoRace(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Approvals.Required = false
+	var current atomic.Int32
+	var overlapped atomic.Bool
+	release := make(chan struct{})
+	defer close(release)
+	blocker := function.NewFunctionTool(func(ctx context.Context, in echoIn) (echoOut, error) {
+		if current.Add(1) > 1 {
+			overlapped.Store(true)
+		}
+		defer current.Add(-1)
+		timer := time.NewTimer(30 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-release:
+		case <-timer.C:
+		case <-ctx.Done():
+		}
+		return echoOut{Text: in.Text}, nil
+	}, function.WithName("block"), function.WithDescription("blocks briefly"))
+	mdl := mockmodel.New("start-race", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if hasToolMessage(req) || ctx.Err() != nil {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return &model.Response{Choices: []model.Choice{{
+			Message: model.Message{
+				Role: model.RoleAssistant,
+				ToolCalls: []model.ToolCall{{
+					ID:   "call-block",
+					Type: "function",
+					Function: model.FunctionDefinitionParam{
+						Name:      "block",
+						Arguments: []byte(`{"text":"x"}`),
+					},
+				}},
+			},
+		}}}, nil
+	})
+	rt, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir(), Tools: []tool.Tool{blocker}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	for i := 0; i < 50; i++ {
+		h, err := rt.Start(context.Background(), agent.RunRequest{
+			UserID: "u", SessionID: "race", Message: "go",
+		})
+		if err != nil {
+			t.Fatalf("iter %d start: %v", i, err)
+		}
+		go func() { _ = h.Cancel() }()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		deadline := time.Now().Add(2 * time.Second)
+		var nextErr error
+		for time.Now().Before(deadline) {
+			_, nextErr = rt.Start(ctx, agent.RunRequest{
+				UserID: "u", SessionID: "race", Message: "next",
+			})
+			if nextErr == nil || !strings.Contains(nextErr.Error(), "finishing tool execution") {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+		if nextErr != nil && !strings.Contains(nextErr.Error(), "finishing tool execution") && ctx.Err() == nil {
+			t.Fatalf("iter %d: %v", i, nextErr)
+		}
+		// Drain the first handle so its goroutines can exit.
+		go func(h agent.RunHandle) {
+			for range h.Events() {
+			}
+		}(h)
+		if overlapped.Load() {
+			t.Fatalf("iter %d overlapped", i)
+		}
+	}
+}
+
 func TestLateConsumerReceivesTerminalEvent(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false

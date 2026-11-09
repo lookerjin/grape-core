@@ -427,7 +427,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	}
 	runID := uuid.NewString()
 	runCtx, cancel := context.WithCancel(ctx)
-	st := &runState{runID: runID, session: req.SessionID, mode: req.Mode}
+	st := newRunState(runID, req.SessionID, req.Mode)
 	runCtx = withState(runCtx, st)
 	runCtx = context.WithValue(runCtx, workspaceKey{}, workspace)
 	events, err := rt.runner.Run(
@@ -591,7 +591,7 @@ drained:
 }
 
 func (rt *Runtime) finishSession(id string, st *runState, unlock func()) {
-	if st == nil || st.inflight.Load() == 0 {
+	if st == nil || !st.captureBusy() {
 		unlock()
 		return
 	}
@@ -599,7 +599,7 @@ func (rt *Runtime) finishSession(id string, st *runState, unlock func()) {
 	rt.draining[id] = fmt.Errorf("session %s is still finishing tool execution", id)
 	rt.mu.Unlock()
 	go func() {
-		st.tools.Wait()
+		st.waitTools()
 		rt.mu.Lock()
 		delete(rt.draining, id)
 		rt.mu.Unlock()
