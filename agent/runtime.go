@@ -37,12 +37,11 @@ type RunRequest struct {
 // Events is closed after exactly one terminal event. Cancel aborts the run.
 // Close drops any events still buffered and releases the pump. Call it when
 // the consumer will not read Events. After a run finishes,
-// context.event_hold_timeout (default 30s) bounds the wait for a consumer
-// who has not taken an event. The first take cancels that wait, so a reader
-// slower than the timeout still receives tool, permission, and error events.
-// When the wait elapses with no take, the pump discards non-terminal events,
-// leaves the terminal event, and exits. Runtime.Close releases every pump
-// immediately. The context
+// context.event_hold_timeout (default 30s) bounds the wait for the first
+// take, and context.event_idle_timeout (default 5m) bounds the gap after
+// the last take. Either deadline discards non-terminal events, leaves the
+// terminal event, and exits. Cancelling the Start context does the same.
+// Runtime.Close releases every pump immediately. The context
 // passed to Runtime.Start bounds the run; Cancel is an additional explicit
 // abort. Implementations must not detach the run onto context.Background.
 type RunHandle interface {

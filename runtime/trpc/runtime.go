@@ -98,6 +98,8 @@ type Runtime struct {
 	maxField    int
 	instruction string
 	nested      map[string]map[string]struct{}
+	readMu      sync.Mutex
+	readID      map[uintptr]struct{}
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -316,11 +318,13 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	}
 	// Subagents are exposed only as gated agent tools. WithSubAgents would
 	// also register transfer_to_agent, which bypasses that gate.
-	return llmagent.New("grape", opts...), nil
+	ag := llmagent.New("grape", opts...)
+	rt.noteAgentReads(ag)
+	return ag, nil
 }
 
 func (rt *Runtime) memoryTool() tool.Tool {
-	return asRead(function.NewFunctionTool(
+	return rt.asRead(function.NewFunctionTool(
 		func(ctx context.Context, in struct {
 			Query string `json:"query"`
 		}) ([]memory.Entry, error) {
@@ -477,7 +481,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	}
 	rt.track(h)
 	go func() {
-		box.pump(ch, h.stop, rt.eventHoldTimeout())
+		box.pump(ch, h.stop, runCtx, rt.eventHoldTimeout(), rt.eventIdleTimeout())
 		rt.untrack(h)
 	}()
 	go rt.forward(runCtx, req, runID, st, events, box, unlock)
@@ -506,6 +510,7 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 		if ctx.Err() != nil && !evt.Terminal() {
 			return
 		}
+		evt = failIfBudget(st, evt)
 		if rt.journal != nil {
 			_ = rt.journal.Append(evt)
 		}
@@ -613,6 +618,30 @@ func (rt *Runtime) eventHoldTimeout() time.Duration {
 		return 30 * time.Second
 	}
 	return d
+}
+
+func (rt *Runtime) eventIdleTimeout() time.Duration {
+	d, err := config.Duration(rt.cfg.Context.EventIdleTimeout)
+	if err != nil || d <= 0 {
+		return 5 * time.Minute
+	}
+	return d
+}
+
+func failIfBudget(st *runState, evt agent.Event) agent.Event {
+	if st == nil || evt.Kind != agent.EventCompleted {
+		return evt
+	}
+	reason := st.failure()
+	if reason == "" {
+		return evt
+	}
+	evt.Kind = agent.EventFailed
+	evt.Payload = agent.MustPayload(agent.TerminalPayload{
+		Status: string(agent.EventFailed),
+		Error:  reason,
+	})
+	return evt
 }
 
 func (rt *Runtime) track(h *runHandle) {

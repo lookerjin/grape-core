@@ -3,10 +3,12 @@ package trpcruntime
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/lookerjin/grape-core/agent"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
 	skilltool "trpc.group/trpc-go/trpc-agent-go/tool/skill"
@@ -47,12 +49,14 @@ func (t builtinReadTool) Call(ctx context.Context, args []byte) (any, error) {
 	return t.inner.Call(ctx, args)
 }
 
-func asRead(item tool.Tool) tool.Tool {
+func (rt *Runtime) asRead(item tool.Tool) tool.Tool {
 	callable, ok := item.(tool.CallableTool)
 	if !ok {
 		return item
 	}
-	return builtinReadTool{inner: callable}
+	wrapped := &builtinReadTool{inner: callable}
+	rt.noteRead(wrapped)
+	return wrapped
 }
 
 func (t hostMCPTool) grapeReadLevel() bool {
@@ -124,7 +128,7 @@ func (rt *Runtime) nestedToolKind(ctx context.Context, name string) string {
 		return "side_effect"
 	}
 	for _, item := range matched {
-		if !isPrivilegedRead(unwrapTool(item)) {
+		if !rt.registeredRead(item) {
 			return "side_effect"
 		}
 	}
@@ -147,33 +151,10 @@ func toolsNamed(inv *trpcagent.Invocation, name string) []tool.Tool {
 	return out
 }
 
-func isPrivilegedRead(item tool.Tool) bool {
-	if item == nil {
-		return false
-	}
-	if marker, ok := item.(grapeReadLevel); ok && marker.grapeReadLevel() {
-		return true
-	}
-	switch item.(type) {
-	case *skilltool.LoadTool, *skilltool.ListDocsTool, *skilltool.SelectDocsTool:
-		return true
-	default:
-		return false
-	}
-}
-
-type toolOriginal interface {
-	Original() tool.Tool
-}
-
-func unwrapTool(item tool.Tool) tool.Tool {
+// unwrapGrape removes only wrappers this package constructs. It does not
+// follow Original or any other exported unwrap method.
+func unwrapGrape(item tool.Tool) tool.Tool {
 	for i := 0; item != nil && i < 8; i++ {
-		if original, ok := item.(toolOriginal); ok {
-			if next := original.Original(); next != nil && next != item {
-				item = next
-				continue
-			}
-		}
 		switch inner := item.(type) {
 		case trackingTool:
 			if inner.inner == nil {
@@ -185,8 +166,6 @@ func unwrapTool(item tool.Tool) tool.Tool {
 				return item
 			}
 			item = inner.inner
-		case builtinReadTool:
-			return item
 		default:
 			return item
 		}
@@ -194,13 +173,65 @@ func unwrapTool(item tool.Tool) tool.Tool {
 	return item
 }
 
+func toolPointer(item tool.Tool) (uintptr, bool) {
+	v := reflect.ValueOf(item)
+	if !v.IsValid() || v.Kind() != reflect.Pointer || v.IsNil() {
+		return 0, false
+	}
+	return v.Pointer(), true
+}
+
+func (rt *Runtime) noteRead(item tool.Tool) {
+	if rt == nil {
+		return
+	}
+	ptr, ok := toolPointer(item)
+	if !ok {
+		return
+	}
+	rt.readMu.Lock()
+	defer rt.readMu.Unlock()
+	if rt.readID == nil {
+		rt.readID = map[uintptr]struct{}{}
+	}
+	rt.readID[ptr] = struct{}{}
+}
+
+func (rt *Runtime) registeredRead(item tool.Tool) bool {
+	if rt == nil {
+		return false
+	}
+	ptr, ok := toolPointer(unwrapGrape(item))
+	if !ok {
+		return false
+	}
+	rt.readMu.Lock()
+	defer rt.readMu.Unlock()
+	_, ok = rt.readID[ptr]
+	return ok
+}
+
+func (rt *Runtime) noteAgentReads(a trpcagent.Agent) {
+	if rt == nil || a == nil {
+		return
+	}
+	for _, item := range a.Tools() {
+		item = unwrapGrape(item)
+		switch item.(type) {
+		case *skilltool.LoadTool, *skilltool.ListDocsTool, *skilltool.SelectDocsTool, *builtinReadTool:
+			rt.noteRead(item)
+		case *hostMCPTool:
+			if mcp, ok := item.(*hostMCPTool); ok && mcp.kind == "read" {
+				rt.noteRead(item)
+			}
+		}
+	}
+}
+
 func (rt *Runtime) consumeLLMCall(ctx context.Context) error {
 	st := stateFrom(ctx)
 	if rt == nil || st == nil {
 		return nil
-	}
-	if err := rt.toolBudgetError(st.toolIterations()); err != nil {
-		return rt.noteBudget(ctx, err)
 	}
 	limit := rt.cfg.Context.MaxLLMCalls
 	n := st.addLLMCall()
@@ -210,32 +241,53 @@ func (rt *Runtime) consumeLLMCall(ctx context.Context) error {
 	return nil
 }
 
-func (rt *Runtime) consumeToolIteration(ctx context.Context) error {
+func (rt *Runtime) consumeToolCall(ctx context.Context) error {
 	st := stateFrom(ctx)
 	if rt == nil || st == nil {
 		return nil
 	}
+	limit := rt.cfg.Context.MaxToolCalls
+	if limit <= 0 {
+		return nil
+	}
+	n := st.addToolCall()
+	if n > limit {
+		return rt.noteBudget(ctx, fmt.Errorf("max tool calls (%d) exceeded", limit))
+	}
+	return nil
+}
+
+func (rt *Runtime) noteToolRound(ctx context.Context, resp *model.Response) error {
+	if rt == nil || !responseRequestsTools(resp) {
+		return nil
+	}
+	st := stateFrom(ctx)
+	if st == nil {
+		return nil
+	}
 	limit := rt.cfg.Context.MaxToolIterations
-	n := st.addToolIteration()
+	n := st.addToolRound()
 	if limit > 0 && n > limit {
 		return rt.noteBudget(ctx, fmt.Errorf("max tool iterations (%d) exceeded", limit))
 	}
 	return nil
 }
 
-func (rt *Runtime) toolBudgetError(n int) error {
-	if rt == nil {
-		return nil
+func responseRequestsTools(resp *model.Response) bool {
+	if resp == nil || resp.IsPartial {
+		return false
 	}
-	limit := rt.cfg.Context.MaxToolIterations
-	if limit > 0 && n > limit {
-		return fmt.Errorf("max tool iterations (%d) exceeded", limit)
+	for _, choice := range resp.Choices {
+		if len(choice.Message.ToolCalls) > 0 || len(choice.Delta.ToolCalls) > 0 {
+			return true
+		}
 	}
-	return nil
+	return false
 }
 
 func (rt *Runtime) noteBudget(ctx context.Context, err error) error {
 	if st := stateFrom(ctx); st != nil && err != nil {
+		st.markFailure(err.Error())
 		st.add(agent.Event{
 			Kind: agent.EventError,
 			Time: time.Now().UTC(),

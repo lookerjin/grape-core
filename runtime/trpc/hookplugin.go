@@ -67,6 +67,15 @@ func (p *hookPlugin) afterModel(ctx context.Context, args *model.AfterModelArgs)
 	if args != nil && args.Response != nil && args.Response.IsPartial {
 		return nil, nil
 	}
+	if p.rt != nil {
+		resp := (*model.Response)(nil)
+		if args != nil {
+			resp = args.Response
+		}
+		if err := p.rt.noteToolRound(ctx, resp); err != nil {
+			return nil, err
+		}
+	}
 	if err := p.dispatch(ctx, hooks.AfterModel, `{"event":"AfterModel"}`); err != nil {
 		return nil, err
 	}
@@ -89,7 +98,7 @@ func (p *hookPlugin) beforeTool(ctx context.Context, args *tool.BeforeToolArgs) 
 		}}, nil
 	}
 	if p.rt != nil {
-		if err := p.rt.consumeToolIteration(ctx); err != nil {
+		if err := p.rt.consumeToolCall(ctx); err != nil {
 			return nil, err
 		}
 		if p.rt.nestedCaller(ctx) {

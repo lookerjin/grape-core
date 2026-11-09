@@ -181,18 +181,30 @@ type PlanConfig struct {
 }
 
 // ContextConfig bounds one run. Negative values mean unlimited.
+// Zero on the numeric limits selects the default, except MaxToolCalls,
+// where zero means unlimited.
 type ContextConfig struct {
-	MaxLLMCalls       int `yaml:"max_llm_calls"`
+	// MaxLLMCalls bounds model calls for the whole run, including nested
+	// agents. Zero uses 128.
+	MaxLLMCalls int `yaml:"max_llm_calls"`
+	// MaxToolIterations bounds model turns that request tools (one round,
+	// however many calls it contains) for the whole run, including nested
+	// agents. Zero uses 64.
 	MaxToolIterations int `yaml:"max_tool_iterations"`
+	// MaxToolCalls bounds individual tool executions. Zero means unlimited.
+	MaxToolCalls int `yaml:"max_tool_calls"`
 	// ToolDrainTimeout is how long a cancelled run waits for tool calls
 	// to return before the session is marked poisoned. Zero uses 30s.
 	// ForceReleaseSession is the explicit recovery.
 	ToolDrainTimeout string `yaml:"tool_drain_timeout"`
 	// EventHoldTimeout is how long a finished run waits for a consumer
-	// who has not taken an event. The first take cancels that wait, so a
-	// reader slower than the timeout keeps tool, permission, and error
-	// events. Zero uses 30s.
+	// who has not taken an event. The first take cancels that wait.
+	// Zero uses 30s.
 	EventHoldTimeout string `yaml:"event_hold_timeout"`
+	// EventIdleTimeout is how long a finished run waits after the
+	// consumer's last take before the pump keeps only the terminal event.
+	// Zero uses 5m. A reader who keeps taking events is left alone.
+	EventIdleTimeout string `yaml:"event_idle_timeout"`
 }
 
 // ApprovalConfig requires an approval for mutating tools when true.
@@ -266,16 +278,19 @@ func (c *Config) applyDefaults() {
 		c.Plan.RequireApproval = &v
 	}
 	if c.Context.MaxLLMCalls == 0 {
-		c.Context.MaxLLMCalls = 32
+		c.Context.MaxLLMCalls = 128
 	}
 	if c.Context.MaxToolIterations == 0 {
-		c.Context.MaxToolIterations = 24
+		c.Context.MaxToolIterations = 64
 	}
 	if c.Context.ToolDrainTimeout == "" {
 		c.Context.ToolDrainTimeout = "30s"
 	}
 	if c.Context.EventHoldTimeout == "" {
 		c.Context.EventHoldTimeout = "30s"
+	}
+	if c.Context.EventIdleTimeout == "" {
+		c.Context.EventIdleTimeout = "5m"
 	}
 }
 

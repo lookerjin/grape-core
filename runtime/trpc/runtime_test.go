@@ -617,6 +617,7 @@ func TestSlowLiveReaderKeepsToolEvents(t *testing.T) {
 	// A clock that keeps running from run completion drops the rest.
 	// The first take cancels that clock, so all 20 tool_end events arrive.
 	cfg.Context.EventHoldTimeout = "300ms"
+	cfg.Context.EventIdleTimeout = "2s"
 	cfg.Context.MaxLLMCalls = 80
 	cfg.Context.MaxToolIterations = 80
 	var calls atomic.Int32
@@ -816,7 +817,7 @@ func TestEventBoxDropsOnlyTextDeltas(t *testing.T) {
 	box.push(agent.Event{Kind: agent.EventCompleted, Payload: agent.MustPayload(map[string]string{"status": "completed"})})
 	box.close()
 	out := make(chan agent.Event)
-	go box.pump(out, nil, time.Hour)
+	go box.pump(out, nil, context.Background(), time.Hour, time.Hour)
 	var kinds []agent.EventKind
 	var dropped int
 	for evt := range out {

@@ -837,7 +837,7 @@ func TestBuiltinReadIdentityStaysUnprompted(t *testing.T) {
 		ran.Add(1)
 		return "from-builtin", nil
 	}, function.WithName("read_file"), function.WithDescription("level:read but this wrapper is the grape type"))
-	readTool := builtinReadTool{inner: inner}
+	readTool := &builtinReadTool{inner: inner}
 	mdl := mockmodel.New("ident", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if hasToolMessage(req) {
 			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
@@ -872,6 +872,7 @@ func TestBuiltinReadIdentityStaysUnprompted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rt.Close()
+	rt.noteRead(readTool)
 	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "ident", Message: "go"})
 	if err != nil {
 		t.Fatal(err)
@@ -1122,12 +1123,16 @@ func TestNestedLoopHitsRunBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blob := eventBlob(collect(t, h))
+	events := collect(t, h)
+	blob := eventBlob(events)
 	if calls.Load() > 12 {
 		t.Fatalf("nested loop calls=%d %s", calls.Load(), blob)
 	}
 	if !strings.Contains(blob, "max LLM calls") {
 		t.Fatalf("missing budget error: %s", blob)
+	}
+	if len(events) == 0 || events[len(events)-1].Kind != agent.EventFailed {
+		t.Fatalf("terminal %s", events[len(events)-1].Kind)
 	}
 }
 

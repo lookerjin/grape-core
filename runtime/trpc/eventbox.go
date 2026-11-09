@@ -1,6 +1,7 @@
 package trpcruntime
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -105,21 +106,22 @@ func (b *eventBox) abandon() {
 	b.signal()
 }
 
-// pump sends queued events until the box is drained or stop is closed.
-// After the run is finished, idle is how long the pump waits for a
-// consumer who has not taken an event. The first take cancels that
-// clock. A consumer who has started reading keeps every tool, permission,
-// and error event, even when the gap between takes is longer than idle.
-// Close and Runtime.Close still release the pump.
-func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.Duration) {
+// pump sends queued events until the box is drained, stop is closed, or
+// the caller context ends. hold is how long a finished run waits for a
+// consumer who has not taken an event. idle is how long it waits after
+// the last take. Either expiry keeps the terminal event and exits.
+// Cancel drops the non-terminal backlog the same way.
+func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx context.Context, hold, idle time.Duration) {
 	defer close(out)
-	if idle <= 0 {
-		idle = 30 * time.Second
+	if hold <= 0 {
+		hold = 30 * time.Second
 	}
+	if idle <= 0 {
+		idle = 5 * time.Minute
+	}
+	done := ctxDone(ctx)
 	var timer *time.Timer
 	var timed <-chan time.Time
-	sent := false
-	taken := false
 	stopTimer := func() {
 		if timer == nil {
 			return
@@ -133,21 +135,45 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.
 		timed = nil
 	}
 	defer stopTimer()
+	sent := false
+	var lastTake time.Time
 	pulse := time.NewTicker(10 * time.Millisecond)
 	defer pulse.Stop()
+	finish := func(held *agent.Event) {
+		if !b.deliverFinal(out, held) {
+			select {
+			case out <- cancelledTerminal(ctx):
+			default:
+			}
+		}
+	}
 	for {
-		evt, ok := b.pop(stop)
+		evt, ok := b.pop(stop, done)
 		if !ok {
+			if ctx != nil && ctx.Err() != nil {
+				finish(nil)
+			}
 			return
 		}
 		for len(out) > 0 {
-			if b.isClosed() && !taken && timed == nil {
-				timer = time.NewTimer(idle)
+			if b.isClosed() && timed == nil {
+				wait := hold
+				if !lastTake.IsZero() {
+					wait = idle - time.Since(lastTake)
+				}
+				if wait <= 0 {
+					finish(&evt)
+					return
+				}
+				timer = time.NewTimer(wait)
 				timed = timer.C
 			}
 			select {
 			case <-timed:
-				b.deliverFinal(out, &evt)
+				finish(&evt)
+				return
+			case <-done:
+				finish(&evt)
 				return
 			case <-stop:
 				return
@@ -155,15 +181,40 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.
 			}
 		}
 		if sent {
-			taken = true
+			lastTake = time.Now()
 			stopTimer()
 		}
 		select {
 		case out <- evt:
 			sent = true
+		case <-done:
+			finish(&evt)
+			return
 		case <-stop:
 			return
 		}
+	}
+}
+
+func ctxDone(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
+}
+
+func cancelledTerminal(ctx context.Context) agent.Event {
+	msg := "context canceled"
+	if ctx != nil && ctx.Err() != nil {
+		msg = ctx.Err().Error()
+	}
+	return agent.Event{
+		Kind: agent.EventCancelled,
+		Time: time.Now().UTC(),
+		Payload: agent.MustPayload(agent.TerminalPayload{
+			Status: string(agent.EventCancelled),
+			Error:  msg,
+		}),
 	}
 }
 
@@ -173,7 +224,7 @@ func (b *eventBox) isClosed() bool {
 	return b.closed
 }
 
-func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event) {
+func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event) bool {
 	n, term := b.compact()
 	if held != nil && held.Terminal() {
 		term = held
@@ -186,11 +237,14 @@ func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event) {
 		default:
 		}
 	}
-	if term != nil {
-		select {
-		case out <- *term:
-		default:
-		}
+	if term == nil {
+		return false
+	}
+	select {
+	case out <- *term:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -215,7 +269,7 @@ func (b *eventBox) compact() (int, *agent.Event) {
 	return n, term
 }
 
-func (b *eventBox) pop(stop <-chan struct{}) (agent.Event, bool) {
+func (b *eventBox) pop(stop <-chan struct{}, done <-chan struct{}) (agent.Event, bool) {
 	for {
 		b.mu.Lock()
 		if marker, ok := b.takeDroppedLocked(); ok && (len(b.items) > 0 || b.closed) {
@@ -236,6 +290,8 @@ func (b *eventBox) pop(stop <-chan struct{}) (agent.Event, bool) {
 		select {
 		case <-b.wake:
 		case <-stop:
+			return agent.Event{}, false
+		case <-done:
 			return agent.Event{}, false
 		}
 	}

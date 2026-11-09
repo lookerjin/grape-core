@@ -2,6 +2,7 @@ package trpcruntime
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ type converter struct {
 	runID     string
 	sessionID string
 	seenTool  map[string]struct{}
+	openTool  map[string]string
 	maxField  int
 	secrets   []string
 	seq       uint64
@@ -30,6 +32,7 @@ func newConverter(runID, sessionID string, maxField int, secrets []string) *conv
 		runID:     runID,
 		sessionID: sessionID,
 		seenTool:  map[string]struct{}{},
+		openTool:  map[string]string{},
 		maxField:  maxField,
 		secrets:   secrets,
 	}
@@ -40,12 +43,16 @@ func (c *converter) convert(evt *event.Event) []agent.Event {
 		return nil
 	}
 	if evt.IsRunnerCompletion() {
-		return []agent.Event{c.terminal(evt)}
+		out := c.closeOpenTools(evt)
+		out = append(out, c.terminal(evt))
+		return out
 	}
 	var out []agent.Event
 	if evt.Object == model.ObjectTypeToolResponse {
-		out = append(out, c.toolEnd(evt))
-		return c.nonEmpty(out)
+		if evt.IsPartial {
+			return nil
+		}
+		return c.nonEmpty(c.toolEnds(evt))
 	}
 	if evt.IsError() {
 		out = append(out, c.errorEvent(evt))
@@ -136,6 +143,10 @@ func (c *converter) toolStarts(evt *event.Event) []agent.Event {
 			continue
 		}
 		c.seenTool[key] = struct{}{}
+		if c.openTool == nil {
+			c.openTool = map[string]string{}
+		}
+		c.openTool[key] = call.Function.Name
 		args := c.clipRaw(call.Function.Arguments)
 		ev := c.base(evt, agent.EventToolStart, agent.MustPayload(agent.ToolPayload{
 			Name:      call.Function.Name,
@@ -148,15 +159,47 @@ func (c *converter) toolStarts(evt *event.Event) []agent.Event {
 	return out
 }
 
-func (c *converter) toolEnd(evt *event.Event) agent.Event {
-	name := ""
-	id := ""
-	content := ""
-	if len(evt.Choices) > 0 {
-		msg := evt.Choices[0].Message
-		name = msg.ToolName
-		id = msg.ToolID
-		content = msg.Content
+func (c *converter) toolEnds(evt *event.Event) []agent.Event {
+	if len(evt.Choices) == 0 {
+		return []agent.Event{c.toolEndOne(evt, "", "", "")}
+	}
+	var out []agent.Event
+	seen := map[string]struct{}{}
+	for _, choice := range evt.Choices {
+		name := choice.Message.ToolName
+		id := choice.Message.ToolID
+		content := choice.Message.Content
+		if id == "" {
+			id = choice.Delta.ToolID
+		}
+		if name == "" {
+			name = choice.Delta.ToolName
+		}
+		if content == "" {
+			content = choice.Delta.Content
+		}
+		key := id
+		if key == "" {
+			key = name
+		}
+		if key != "" {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		out = append(out, c.toolEndOne(evt, name, id, content))
+	}
+	return out
+}
+
+func (c *converter) toolEndOne(evt *event.Event, name, id, content string) agent.Event {
+	key := id
+	if key == "" {
+		key = name
+	}
+	if key != "" {
+		delete(c.openTool, key)
 	}
 	cleaned, truncated := c.clip(content)
 	result := json.RawMessage(strconvQuote(cleaned))
@@ -168,6 +211,23 @@ func (c *converter) toolEnd(evt *event.Event) agent.Event {
 	}))
 	ev.ToolCallID = id
 	return ev
+}
+
+func (c *converter) closeOpenTools(evt *event.Event) []agent.Event {
+	if len(c.openTool) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(c.openTool))
+	for id := range c.openTool {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var out []agent.Event
+	for _, id := range ids {
+		name := c.openTool[id]
+		out = append(out, c.toolEndOne(evt, name, id, ""))
+	}
+	return out
 }
 
 func strconvQuote(s string) string {
