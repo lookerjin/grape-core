@@ -92,3 +92,64 @@ func TestReadAndSearchStayInsideLimits(t *testing.T) {
 		t.Fatalf("search missed the path: %s", blob)
 	}
 }
+
+func TestRangedReadAllowsLongLinesAndLargeFiles(t *testing.T) {
+	ws := t.TempDir()
+	long := strings.Repeat("L", 80<<10)
+	if err := os.WriteFile(filepath.Join(ws, "long.txt"), []byte(long+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var big strings.Builder
+	for i := 0; i < 200; i++ {
+		big.WriteString(strings.Repeat("a", 40))
+		big.WriteByte('\n')
+	}
+	big.WriteString("TAIL-LINE\n")
+	if err := os.WriteFile(filepath.Join(ws, "wide.txt"), []byte(big.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	longBlob := runRead(t, ws, 1<<20, `{"file_name":"long.txt","offset":1,"limit":1}`)
+	if strings.Contains(longBlob, "token too long") || strings.Contains(longBlob, "exceeds") {
+		t.Fatalf("long line refused: %s", longBlob)
+	}
+	if !strings.Contains(longBlob, long[:32]) {
+		t.Fatal("long line missing from read_file")
+	}
+	tailBlob := runRead(t, ws, 4096, `{"file_name":"wide.txt","offset":201,"limit":1}`)
+	if strings.Contains(tailBlob, "exceeds") {
+		t.Fatalf("late line refused because the file is larger than the cap: %s", tailBlob)
+	}
+	if !strings.Contains(tailBlob, "TAIL-LINE") {
+		t.Fatalf("late line missing: %s", tailBlob)
+	}
+}
+
+func runRead(t *testing.T, ws string, max int, args string) string {
+	t.Helper()
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Workspace.Root = ws
+	cfg.Workspace.MaxReadBytes = max
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	var step int
+	mdl := mockmodel.New("range", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if step > 0 || hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		step++
+		return toolCall("read_file", args), nil
+	})
+	rt, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{
+		UserID: "u", SessionID: "range", Workspace: ws, Message: "read",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return eventBlob(collect(t, h))
+}

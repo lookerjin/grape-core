@@ -90,12 +90,14 @@ func openWorkspace(root string) (string, *os.Root, error) {
 }
 
 // ReadLimit selects a line window and a byte cap. LineOffset is 1-based.
-// LineLimit zero means the rest of the capped bytes. MaxBytes zero means
-// no extra cap beyond what the caller already applied.
+// LineLimit zero means the rest of the file. MaxBytes caps the returned
+// text, not the bytes skipped to reach Offset. MaxLineBytes caps one
+// physical line. Zero MaxLineBytes uses 1 MiB.
 type ReadLimit struct {
-	MaxBytes   int
-	LineOffset int
-	LineLimit  int
+	MaxBytes     int
+	LineOffset   int
+	LineLimit    int
+	MaxLineBytes int
 }
 
 // Read returns the text of a workspace file. Symlinks that leave the
@@ -149,7 +151,11 @@ func ReadLimited(root, rel string, lim ReadLimit) (string, error) {
 }
 
 func readLineWindow(r io.Reader, rel string, lim ReadLimit) (string, error) {
-	sc := bufio.NewScanner(r)
+	br := bufio.NewReader(r)
+	lineCap := lim.MaxLineBytes
+	if lineCap <= 0 {
+		lineCap = 1 << 20
+	}
 	start := 1
 	if lim.LineOffset > 1 {
 		start = lim.LineOffset
@@ -159,33 +165,64 @@ func readLineWindow(r io.Reader, rel string, lim ReadLimit) (string, error) {
 		end = start + lim.LineLimit - 1
 	}
 	var b strings.Builder
-	var read int
 	line := 0
-	for sc.Scan() {
-		line++
-		text := sc.Text()
-		read += len(text) + 1
-		if lim.MaxBytes > 0 && read > lim.MaxBytes {
-			return "", fmt.Errorf("file %s exceeds %d bytes", rel, lim.MaxBytes)
+	for {
+		text, eof, err := readCappedLine(br, lineCap)
+		if err != nil {
+			return "", fmt.Errorf("file %s line %d: %w", rel, line+1, err)
 		}
-		if line < start {
-			continue
-		}
-		if end > 0 && line > end {
+		if text == "" && eof {
 			break
 		}
-		if b.Len() > 0 {
-			b.WriteByte('\n')
+		line++
+		if line >= start && (end == 0 || line <= end) {
+			if b.Len() > 0 {
+				if lim.MaxBytes > 0 && b.Len()+1 > lim.MaxBytes {
+					return "", fmt.Errorf("file %s output exceeds %d bytes", rel, lim.MaxBytes)
+				}
+				b.WriteByte('\n')
+			}
+			if lim.MaxBytes > 0 && b.Len()+len(text) > lim.MaxBytes {
+				return "", fmt.Errorf("file %s output exceeds %d bytes", rel, lim.MaxBytes)
+			}
+			b.WriteString(text)
 		}
-		b.WriteString(text)
-	}
-	if err := sc.Err(); err != nil {
-		return "", err
+		if end > 0 && line >= end {
+			break
+		}
+		if eof {
+			break
+		}
 	}
 	if !utf8.ValidString(b.String()) {
 		return "", fmt.Errorf("refusing to read non-UTF-8 file %s", rel)
 	}
 	return b.String(), nil
+}
+
+// readCappedLine reads one line without bufio.Scanner's 64KB token limit.
+func readCappedLine(r *bufio.Reader, max int) (string, bool, error) {
+	var b strings.Builder
+	for {
+		frag, err := r.ReadSlice('\n')
+		if len(frag) > 0 {
+			if b.Len()+len(frag) > max+1 {
+				return "", false, fmt.Errorf("exceeds %d bytes", max)
+			}
+			b.Write(frag)
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		text := strings.TrimRight(b.String(), "\r\n")
+		if err == io.EOF {
+			return text, true, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		return text, false, nil
+	}
 }
 
 // List returns names of entries in a workspace directory.
