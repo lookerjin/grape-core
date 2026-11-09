@@ -404,6 +404,102 @@ func TestCancelDuringToolStartNoRace(t *testing.T) {
 	}
 }
 
+func TestEventBoxDropsOnlyTextDeltas(t *testing.T) {
+	box := newEventBox(4)
+	for i := 0; i < 10; i++ {
+		box.push(agent.Event{Kind: agent.EventTextDelta, Payload: agent.MustPayload(map[string]int{"i": i})})
+	}
+	box.push(agent.Event{Kind: agent.EventToolEnd, Payload: agent.MustPayload(map[string]string{"name": "echo"})})
+	box.push(agent.Event{Kind: agent.EventPermissionRequest, Payload: agent.MustPayload(map[string]string{"kind": "write"})})
+	box.push(agent.Event{Kind: agent.EventError, Payload: agent.MustPayload(map[string]string{"hook": "BeforeTool"})})
+	box.push(agent.Event{Kind: agent.EventCompleted, Payload: agent.MustPayload(map[string]string{"status": "completed"})})
+	box.close()
+	out := make(chan agent.Event)
+	go box.pump(out)
+	var kinds []agent.EventKind
+	var dropped int
+	for evt := range out {
+		kinds = append(kinds, evt.Kind)
+		if strings.Contains(string(evt.Payload), "dropped") {
+			dropped++
+		}
+		if evt.Kind == agent.EventToolEnd || evt.Kind == agent.EventPermissionRequest || evt.Kind == agent.EventError {
+			if strings.Contains(string(evt.Payload), "dropped") && evt.Kind != agent.EventRaw {
+				t.Fatalf("important event replaced: %s", evt.Payload)
+			}
+		}
+	}
+	if dropped == 0 {
+		t.Fatalf("no drop marker in %#v", kinds)
+	}
+	for _, kind := range []agent.EventKind{agent.EventToolEnd, agent.EventPermissionRequest, agent.EventError, agent.EventCompleted} {
+		found := false
+		for _, got := range kinds {
+			if got == kind {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("missing %s in %#v", kind, kinds)
+		}
+	}
+}
+
+func TestSlowConsumerKeepsToolEvents(t *testing.T) {
+	const calls = 400
+	cfg := testConfig(t)
+	cfg.Journal.Enabled = false
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Context.MaxLLMCalls = calls + 5
+	cfg.Context.MaxToolIterations = calls + 5
+	var n atomic.Int32
+	mdl := mockmodel.New("keep", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if hasToolMessage(req) && n.Load() >= calls {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		n.Add(1)
+		return &model.Response{Choices: []model.Choice{{
+			Message: model.Message{
+				Role: model.RoleAssistant,
+				ToolCalls: []model.ToolCall{{
+					ID:   "call-keep",
+					Type: "function",
+					Function: model.FunctionDefinitionParam{
+						Name:      "echo",
+						Arguments: []byte(`{"text":"x"}`),
+					},
+				}},
+			},
+		}}}, nil
+	})
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "keep", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for n.Load() < calls && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	events := collect(t, h)
+	var tools int
+	for _, evt := range events {
+		if evt.Kind == agent.EventToolEnd || evt.Kind == agent.EventToolStart {
+			tools++
+		}
+	}
+	if tools < calls {
+		t.Fatalf("kept %d tool events, want at least %d (len %d)", tools, calls, len(events))
+	}
+	if !events[len(events)-1].Terminal() {
+		t.Fatalf("last %s", events[len(events)-1].Kind)
+	}
+}
+
 func TestLateConsumerReceivesTerminalEvent(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false

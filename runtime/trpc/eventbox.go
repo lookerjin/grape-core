@@ -1,20 +1,27 @@
 package trpcruntime
 
 import (
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/lookerjin/grape-core/agent"
 )
 
-// eventBox keeps a bounded queue and always retains a terminal event.
-// A slow consumer drops the oldest non-terminal events instead of
-// blocking the run or losing the terminal event.
+// eventBox queues run events for a consumer.
+//
+// Text deltas are the only events that are dropped, and only when the
+// consumer is behind the soft cap. Tool, permission, error, hook, and
+// other events are kept and the queue grows to hold them. A terminal
+// event is always kept. Each burst of dropped deltas is reported with
+// one "dropped N events" marker.
 type eventBox struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	items  []agent.Event
-	closed bool
-	max    int
+	mu      sync.Mutex
+	cond    *sync.Cond
+	items   []agent.Event
+	closed  bool
+	max     int
+	dropped int
 }
 
 func newEventBox(max int) *eventBox {
@@ -32,39 +39,52 @@ func (b *eventBox) push(evt agent.Event) {
 	if b.closed {
 		return
 	}
-	limit := b.max
-	if !evt.Terminal() {
-		limit = b.max - 1
-	}
-	for len(b.items) >= limit {
-		if b.dropOldestNonTerminal() {
-			continue
+	if evt.Kind == agent.EventTextDelta {
+		for len(b.items) >= b.max-1 && b.dropOldestDelta() {
 		}
-		if evt.Terminal() && len(b.items) >= b.max {
-			b.items = b.items[1:]
-			continue
+		if len(b.items) >= b.max-1 {
+			b.dropped++
+			return
 		}
-		break
 	}
-	if !evt.Terminal() && len(b.items) >= b.max-1 {
-		return
-	}
+	b.flushDroppedLocked()
 	b.items = append(b.items, evt)
 	b.cond.Signal()
 }
 
-func (b *eventBox) dropOldestNonTerminal() bool {
+func (b *eventBox) dropOldestDelta() bool {
 	for i, item := range b.items {
-		if !item.Terminal() {
+		if item.Kind == agent.EventTextDelta {
 			b.items = append(b.items[:i], b.items[i+1:]...)
+			b.dropped++
 			return true
 		}
 	}
 	return false
 }
 
+func (b *eventBox) flushDroppedLocked() {
+	if b.dropped == 0 {
+		return
+	}
+	b.items = append(b.items, droppedMarker(b.dropped))
+	b.dropped = 0
+}
+
+func droppedMarker(n int) agent.Event {
+	return agent.Event{
+		Kind: agent.EventRaw,
+		Time: time.Now().UTC(),
+		Payload: agent.MustPayload(map[string]any{
+			"dropped": n,
+			"message": fmt.Sprintf("dropped %d events", n),
+		}),
+	}
+}
+
 func (b *eventBox) close() {
 	b.mu.Lock()
+	b.flushDroppedLocked()
 	b.closed = true
 	b.cond.Broadcast()
 	b.mu.Unlock()

@@ -21,6 +21,8 @@ for evt := range run.Events() {
 
 `RunHandle.Events` closes after one terminal event: `completed`, `failed`, or `cancelled`. `Sequence` is monotonic for that process-local run. It is not a durable cursor.
 
+The stream keeps a soft buffer of 256 events. Only `text_delta` events are dropped when a consumer falls behind, and a later event then carries `dropped N events`. Tool calls, permission decisions, errors, hook failures, and the terminal event are not dropped; the buffer grows to hold them.
+
 `RunHandle.Cancel` cancels the caller context and the tRPC managed run. `Enqueue` uses `SteerableRunner` when the runner supports it.
 
 Approvals are `agent.ApprovalRequest` values delivered to an `agent.Decider`. The SDK does not read stdin. Plan mode asks before mutating tools. A denial does not call the tool.
