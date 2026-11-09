@@ -267,7 +267,6 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	}
 	if len(rt.subs) > 0 {
 		for _, sub := range rt.subs {
-			rt.wrapSubAgentTools(sub)
 			tools = append(tools, rt.gate(agenttool.NewTool(sub), "side_effect"))
 		}
 	}
