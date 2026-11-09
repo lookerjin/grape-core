@@ -6,6 +6,17 @@ import (
 	"testing"
 )
 
+func TestClaudeHeaderRefParses(t *testing.T) {
+	raw := []byte(`{"mcpServers":{"demo":{"url":"http://127.0.0.1/mcp","headers":{"Authorization":"${TOKEN}"}}}}`)
+	servers, err := ParseClaudeConfig(raw, "plugin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers[0].Headers["Authorization"] != "${TOKEN}" || servers[0].Enabled {
+		t.Fatalf("%#v", servers)
+	}
+}
+
 func TestMergeOrderAndRedaction(t *testing.T) {
 	user := []Server{{Name: "a", Transport: "stdio", Command: "echo", Enabled: true, Headers: map[string]string{"Authorization": "env:TOKEN"}}}
 	project := []Server{{Name: "a", Transport: "stdio", Command: "other", Enabled: false}, {Name: "b", Transport: "sse", URL: "http://127.0.0.1/mcp", Enabled: true}}

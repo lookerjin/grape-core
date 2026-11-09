@@ -68,7 +68,19 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 				if err != nil {
 					return err
 				}
-				rt.mcpServers = append(rt.mcpServers, servers...)
+				serverName := comp.Name
+				if i := strings.LastIndex(comp.Name, "/"); i >= 0 {
+					serverName = comp.Name[i+1:]
+				}
+				for _, server := range servers {
+					if server.Name != serverName {
+						continue
+					}
+					if mcp.PluginAllowed(rt.cfg.MCP.AllowPluginServers, comp.Name) {
+						server.Enabled = true
+					}
+					rt.mcpServers = append(rt.mcpServers, server)
+				}
 			}
 		}
 		if len(hookSpecs) > 0 {

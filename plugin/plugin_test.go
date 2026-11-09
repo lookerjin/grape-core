@@ -217,6 +217,63 @@ func writePlugin(t *testing.T, dir, name string) {
 	must(os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(`{"mcpServers":{"demo":{"command":"echo","args":["hi"]}}}`), 0o644))
 }
 
+func TestPluginComponentNamesDoNotCollide(t *testing.T) {
+	root := t.TempDir()
+	mgr, err := NewManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := filepath.Join(root, "a-src")
+	b := filepath.Join(root, "b-src")
+	writePlugin(t, a, "alpha")
+	writePlugin(t, b, "beta")
+	if err := os.RemoveAll(filepath.Join(b, "skills")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(b, "rules")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(b, "commands")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.InstallLocal(a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.InstallLocal(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Enable("alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Enable("beta"); err != nil {
+		t.Fatal(err)
+	}
+	records := []Record{}
+	for _, name := range []string{"alpha", "beta"} {
+		rec, err := mgr.Inspect(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, rec)
+	}
+	resolved, err := Resolve(records, "error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawAlpha, sawBeta bool
+	for _, comp := range resolved.Components {
+		if comp.Kind == KindHook && comp.Name == "alpha/hooks" {
+			sawAlpha = true
+		}
+		if comp.Kind == KindMCP && comp.Name == "beta/demo" {
+			sawBeta = true
+		}
+	}
+	if !sawAlpha || !sawBeta {
+		t.Fatalf("components %#v", resolved.Components)
+	}
+}
+
 func run(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
 	cmd := exec.Command(name, args...)

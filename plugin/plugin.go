@@ -382,11 +382,15 @@ func Discover(root string) ([]Component, error) {
 			out = append(out, Component{Kind: KindSkill, Name: entry.Name(), Path: filepath.Dir(skillFile)})
 		}
 	}
-	if _, err := os.Stat(filepath.Join(root, ".mcp.json")); err == nil {
-		out = append(out, Component{Kind: KindMCP, Name: "mcp", Path: filepath.Join(root, ".mcp.json")})
+	label := pluginLabel(root)
+	mcpFile := filepath.Join(root, ".mcp.json")
+	if _, err := os.Stat(mcpFile); err == nil {
+		for _, server := range mcpServerNames(mcpFile) {
+			out = append(out, Component{Kind: KindMCP, Name: label + "/" + server, Path: mcpFile})
+		}
 	}
 	if _, err := os.Stat(filepath.Join(root, "hooks", "hooks.json")); err == nil {
-		out = append(out, Component{Kind: KindHook, Name: "hooks", Path: filepath.Join(root, "hooks", "hooks.json")})
+		out = append(out, Component{Kind: KindHook, Name: label + "/hooks", Path: filepath.Join(root, "hooks", "hooks.json")})
 	}
 	rulesDir := filepath.Join(root, "rules")
 	if entries, err := os.ReadDir(rulesDir); err == nil {
@@ -406,6 +410,39 @@ func Discover(root string) ([]Component, error) {
 		return out[i].Kind < out[j].Kind
 	})
 	return out, nil
+}
+
+func pluginLabel(root string) string {
+	raw, err := os.ReadFile(filepath.Join(root, ".claude-plugin", "plugin.json"))
+	if err != nil {
+		return filepath.Base(root)
+	}
+	var doc struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(raw, &doc) != nil || strings.TrimSpace(doc.Name) == "" {
+		return filepath.Base(root)
+	}
+	return strings.TrimSpace(doc.Name)
+}
+
+func mcpServerNames(path string) []string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return []string{"mcp"}
+	}
+	var doc struct {
+		MCPServers map[string]json.RawMessage `json:"mcpServers"`
+	}
+	if json.Unmarshal(raw, &doc) != nil || len(doc.MCPServers) == 0 {
+		return []string{"mcp"}
+	}
+	names := make([]string, 0, len(doc.MCPServers))
+	for name := range doc.MCPServers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func markdownComponents(dir string, kind Kind) []Component {

@@ -123,6 +123,9 @@ type MCPConfig struct {
 	// Strict makes one failed MCP server fail Runtime construction.
 	// The default reports that server as failed and continues.
 	Strict bool `yaml:"strict"`
+	// AllowPluginServers lists plugin/server keys that may be enabled.
+	// Plugin MCP servers stay disabled until their key is listed.
+	AllowPluginServers []string `yaml:"allow_plugin_servers"`
 }
 
 // MemoryConfig enables the Markdown memory root. It is off by default.

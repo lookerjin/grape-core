@@ -211,15 +211,81 @@ func validate(server Server) error {
 
 func checkRef(value string) error {
 	value = strings.TrimSpace(value)
-	if value == "" || strings.HasPrefix(value, "env:") && len(value) > len("env:") {
-		if strings.HasPrefix(value, "env:") {
-			if _, ok := os.LookupEnv(strings.TrimPrefix(value, "env:")); !ok {
-				return nil
-			}
-		}
+	switch {
+	case value == "":
 		return nil
+	case strings.HasPrefix(value, "env:") && len(value) > len("env:"):
+		return nil
+	case strings.HasPrefix(value, "file:") && len(value) > len("file:"):
+		return nil
+	case strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") && len(value) > len("${}"):
+		return nil
+	default:
+		return fmt.Errorf("value must be an env:NAME, file:PATH, or ${NAME} reference")
 	}
-	return fmt.Errorf("value must be an env:NAME reference")
+}
+
+// ResolveRef expands env:, file:, and ${NAME} credential references.
+// A missing target is an error that names the reference and not a secret.
+func ResolveRef(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	switch {
+	case value == "":
+		return "", nil
+	case strings.HasPrefix(value, "env:"):
+		name := strings.TrimPrefix(value, "env:")
+		got, ok := os.LookupEnv(name)
+		if !ok || got == "" {
+			return "", fmt.Errorf("missing env:%s", name)
+		}
+		return got, nil
+	case strings.HasPrefix(value, "file:"):
+		path := strings.TrimPrefix(value, "file:")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("missing file:%s", path)
+		}
+		return strings.TrimSpace(string(raw)), nil
+	case strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}"):
+		name := strings.TrimSuffix(strings.TrimPrefix(value, "${"), "}")
+		got, ok := os.LookupEnv(name)
+		if !ok || got == "" {
+			return "", fmt.Errorf("missing ${%s}", name)
+		}
+		return got, nil
+	default:
+		return value, nil
+	}
+}
+
+// ResolveHeaders resolves every header reference.
+func ResolveHeaders(headers map[string]string) (map[string]string, []string, error) {
+	if len(headers) == 0 {
+		return nil, nil, nil
+	}
+	out := make(map[string]string, len(headers))
+	var secrets []string
+	for key, value := range headers {
+		resolved, err := ResolveRef(value)
+		if err != nil {
+			return nil, nil, fmt.Errorf("header %s: %w", key, err)
+		}
+		out[key] = resolved
+		if resolved != "" && resolved != value {
+			secrets = append(secrets, resolved)
+		}
+	}
+	return out, secrets, nil
+}
+
+// PluginAllowed reports whether plugin/server is in the allow list.
+func PluginAllowed(allow []string, key string) bool {
+	for _, item := range allow {
+		if item == key {
+			return true
+		}
+	}
+	return false
 }
 
 func redact(server Server) Server {

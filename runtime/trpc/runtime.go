@@ -203,21 +203,22 @@ func New(opts Options) (*Runtime, error) {
 		r = runner.NewRunnerWithAgentFactory(appName, "grape", rt.agentFactory, runnerOpts...)
 	}
 	rt.runner = r
-	secrets := rt.secrets
-	var jw *journal.Writer
-	if cfg.Journal.Enabled {
-		jw, err = journal.Open(cfg.Journal.Path, cfg.Journal.MaxFieldBytes, secrets)
-		if err != nil {
-			_ = r.Close()
-			_ = sessions.Close()
-			return nil, agent.Wrap(agent.ErrInvalidConfig, "journal", err)
-		}
-	}
-	rt.journal = jw
 	if err := rt.openMCP(context.Background()); err != nil {
 		_ = r.Close()
 		_ = sessions.Close()
 		return nil, err
+	}
+	if cfg.Journal.Enabled {
+		jw, err := journal.Open(cfg.Journal.Path, cfg.Journal.MaxFieldBytes, rt.secrets)
+		if err != nil {
+			_ = r.Close()
+			_ = sessions.Close()
+			for _, set := range rt.mcpSets {
+				_ = set.Close()
+			}
+			return nil, agent.Wrap(agent.ErrInvalidConfig, "journal", err)
+		}
+		rt.journal = jw
 	}
 	return rt, nil
 }

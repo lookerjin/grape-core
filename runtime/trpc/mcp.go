@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lookerjin/grape-core/config"
+	"github.com/lookerjin/grape-core/internal/redact"
 	"github.com/lookerjin/grape-core/mcp"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	trpcmcp "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
@@ -59,11 +60,11 @@ func (rt *Runtime) openMCP(ctx context.Context) error {
 			})
 			continue
 		}
-		set, err := dialMCP(ctx, server)
+		set, err := rt.dialMCP(ctx, server)
 		if err != nil {
 			rt.mcpStatus = append(rt.mcpStatus, mcp.Status{
 				Name: server.Name, Transport: transportOf(server), State: "failed",
-				Detail: err.Error(), Isolation: isolationOf(server),
+				Detail: redactDetail(err.Error(), rt.secrets), Isolation: isolationOf(server),
 			})
 			if rt.cfg.MCP.Strict {
 				for _, opened := range sets {
@@ -81,6 +82,10 @@ func (rt *Runtime) openMCP(ctx context.Context) error {
 	}
 	rt.mcpSets = sets
 	return nil
+}
+
+func redactDetail(detail string, secrets []string) string {
+	return redact.Text(detail, secrets)
 }
 
 func isStdio(server mcp.Server) bool {
@@ -121,13 +126,33 @@ func isolationOf(server mcp.Server) string {
 	return ""
 }
 
-func dialMCP(ctx context.Context, server mcp.Server) (tool.ToolSet, error) {
+func (rt *Runtime) dialMCP(ctx context.Context, server mcp.Server) (tool.ToolSet, error) {
+	headers, secrets, err := mcp.ResolveHeaders(server.Headers)
+	if err != nil {
+		return nil, fmt.Errorf("mcp %s: %w", server.Name, err)
+	}
+	if ref := strings.TrimSpace(server.CredentialRef); ref != "" {
+		value, err := mcp.ResolveRef(ref)
+		if err != nil {
+			return nil, fmt.Errorf("mcp %s: %w", server.Name, err)
+		}
+		if headers == nil {
+			headers = map[string]string{}
+		}
+		if _, ok := headers["Authorization"]; !ok && value != "" {
+			headers["Authorization"] = value
+		}
+		if value != "" {
+			secrets = append(secrets, value)
+		}
+	}
+	rt.secrets = append(rt.secrets, secrets...)
 	cfg := trpcmcp.ConnectionConfig{
 		Transport: transportOf(server),
 		Command:   server.Command,
 		Args:      server.Args,
 		ServerURL: server.URL,
-		Headers:   server.Headers,
+		Headers:   headers,
 		Timeout:   server.Timeout,
 	}
 	if cfg.Transport == "stdio" {
