@@ -158,7 +158,7 @@ func New(opts Options) (*Runtime, error) {
 		sessions:    sessions,
 		counter:     counter,
 		model:       mdl,
-		exec:        newCommandExecutor(cfg, filepath.Join(dataDir, "sandbox"), opts.Platform, opts.External),
+		exec:        newCommandExecutor(cfg, filepath.Join(os.TempDir(), "grape-core-sandbox"), dataDir, opts.Platform, opts.External),
 		tools:       append([]tool.Tool(nil), opts.Tools...),
 		decider:     opts.Decider,
 		reject:      opts.RejectConcurrentSession,

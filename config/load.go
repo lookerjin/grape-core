@@ -158,6 +158,11 @@ func (c Config) Validate() error {
 	default:
 		return agent.Invalid("sandbox.network", fmt.Errorf("unsupported network %q", c.Sandbox.Network))
 	}
+	switch c.Sandbox.DenyReadMode {
+	case "", "add", "override":
+	default:
+		return agent.Invalid("sandbox.deny_read_mode", fmt.Errorf("unsupported mode %q", c.Sandbox.DenyReadMode))
+	}
 	switch c.Plugins.Conflict {
 	case "", "error", "earliest", "latest":
 	default:
@@ -195,15 +200,18 @@ func checkCredentialRef(ref string) error {
 	if strings.HasPrefix(ref, "env:") && len(ref) > len("env:") {
 		return nil
 	}
-	return agent.Invalid("mcp.credential_ref", fmt.Errorf("credential_ref must be env:NAME"))
+	if strings.HasPrefix(ref, "file:") && len(ref) > len("file:") {
+		return nil
+	}
+	return agent.Invalid("mcp.credential_ref", fmt.Errorf("credential_ref must be env:NAME or file:PATH"))
 }
 
 func checkHeaderValue(key, value string) error {
 	value = strings.TrimSpace(value)
-	if value == "" || strings.HasPrefix(value, "env:") {
+	if value == "" || strings.HasPrefix(value, "env:") || strings.HasPrefix(value, "file:") {
 		return nil
 	}
-	return agent.Invalid("mcp.headers."+key, fmt.Errorf("header values must be env:NAME references"))
+	return agent.Invalid("mcp.headers."+key, fmt.Errorf("header values must be env:NAME or file:PATH references"))
 }
 
 // RedactedYAML returns YAML with secrets removed.

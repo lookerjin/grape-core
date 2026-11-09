@@ -72,10 +72,17 @@ type WorkspaceConfig struct {
 }
 
 // SandboxConfig selects isolation. Mode "managed" asks for the OS sandbox.
+//
+// DenyRead adds or replaces the default sensitive-path list. DenyReadMode is
+// "add" (default) or "override". Entries with a glob metacharacter are
+// workspace-relative and are passed to WithNoAccessGlobs. Other entries are
+// host paths passed to WithNoAccessPaths when they exist. See docs/sandbox.md.
 type SandboxConfig struct {
-	Mode    string `yaml:"mode"`
-	Network string `yaml:"network"`
-	Backend string `yaml:"backend"`
+	Mode         string   `yaml:"mode"`
+	Network      string   `yaml:"network"`
+	Backend      string   `yaml:"backend"`
+	DenyRead     []string `yaml:"deny_read"`
+	DenyReadMode string   `yaml:"deny_read_mode"`
 }
 
 // SkillsConfig lists skill roots. KnowledgeOnly defaults to true.
@@ -184,6 +191,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Sandbox.Network == "" {
 		c.Sandbox.Network = "restricted"
+	}
+	if c.Sandbox.DenyReadMode == "" {
+		c.Sandbox.DenyReadMode = "add"
 	}
 	if c.Plugins.Conflict == "" {
 		c.Plugins.Conflict = "error"

@@ -24,7 +24,7 @@ func TestWindowsPlatformDoesNotExecuteManagedCommand(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Sandbox.Mode = sandbox.ModeManaged
-	execer := newCommandExecutor(cfg, t.TempDir(), "windows", nil)
+	execer := newCommandExecutor(cfg, t.TempDir(), "", "windows", nil)
 	_, err := execer.Execute(context.Background(), sandbox.Request{
 		Workspace: dir,
 		Argv:      []string{"sh", "-c", "echo ran > " + marker},
@@ -49,7 +49,7 @@ func TestReadOnlyRejectsCommand(t *testing.T) {
 	marker := filepath.Join(dir, "ran")
 	cfg := config.Default()
 	cfg.Workspace.Permission = agent.PermissionReadOnly
-	execer := newCommandExecutor(cfg, t.TempDir(), "linux", nil)
+	execer := newCommandExecutor(cfg, t.TempDir(), "", "linux", nil)
 	_, err := execer.Execute(context.Background(), sandbox.Request{
 		Workspace: dir,
 		Argv:      []string{"sh", "-c", "echo ran > ran"},
@@ -76,7 +76,7 @@ func TestManagedSandboxDoesNotHideHostReads(t *testing.T) {
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Sandbox.Mode = sandbox.ModeManaged
 	cfg.Sandbox.Network = "restricted"
-	execer := newCommandExecutor(cfg, filepath.Join(t.TempDir(), "sb"), "linux", nil)
+	execer := newCommandExecutor(cfg, filepath.Join(t.TempDir(), "sb"), "", "linux", nil)
 	res, err := execer.Execute(context.Background(), sandbox.Request{
 		Workspace: dir,
 		Argv:      []string{"cat", secret},
@@ -126,7 +126,7 @@ func TestManagedSandboxDeniesHostListener(t *testing.T) {
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Sandbox.Mode = sandbox.ModeManaged
 	cfg.Sandbox.Network = "restricted"
-	execer := newCommandExecutor(cfg, filepath.Join(t.TempDir(), "sb"), "linux", nil)
+	execer := newCommandExecutor(cfg, filepath.Join(t.TempDir(), "sb"), "", "linux", nil)
 	script := fmt.Sprintf("python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", %d), 2)'", port)
 	res, err := execer.Execute(context.Background(), sandbox.Request{
 		Workspace: dir,
@@ -159,7 +159,7 @@ func TestManagedSandboxDeniesOutsideWrite(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Sandbox.Mode = sandbox.ModeManaged
-	execer := newCommandExecutor(cfg, filepath.Join(t.TempDir(), "sb"), "linux", nil)
+	execer := newCommandExecutor(cfg, filepath.Join(t.TempDir(), "sb"), "", "linux", nil)
 	res, err := execer.Execute(context.Background(), sandbox.Request{
 		Workspace: dir,
 		Argv:      []string{"sh", "-c", "echo ok > inside.txt; echo bad > " + shellSingle(outside)},
@@ -180,6 +180,61 @@ func TestManagedSandboxDeniesOutsideWrite(t *testing.T) {
 	}
 }
 
+func TestManagedSandboxMasksSensitivePathOnly(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Fatal("bubblewrap is required to verify sensitive path masks")
+	}
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sshDir, "id_rsa"), []byte("PRIVATE-KEY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "note.txt")
+	if err := os.WriteFile(outside, []byte("public-note"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Sandbox.Mode = sandbox.ModeManaged
+	cfg.Sandbox.Network = "restricted"
+	cfg.Sandbox.DenyReadMode = "override"
+	cfg.Sandbox.DenyRead = []string{sshDir}
+	execer := newCommandExecutor(cfg, filepath.Join(t.TempDir(), "sb"), "", "linux", nil)
+	denied, err := execer.Execute(context.Background(), sandbox.Request{
+		Workspace: work,
+		Argv:      []string{"cat", filepath.Join(sshDir, "id_rsa")},
+		Timeout:   20 * time.Second,
+	})
+	if strings.Contains(denied.Stdout, "PRIVATE-KEY") {
+		t.Fatalf("sensitive file was readable: stdout %q stderr %s err %v", denied.Stdout, denied.Stderr, err)
+	}
+	if err == nil && denied.ExitCode == 0 {
+		t.Fatalf("cat of masked path succeeded: %+v", denied)
+	}
+	open, err := execer.Execute(context.Background(), sandbox.Request{
+		Workspace: work,
+		Argv:      []string{"cat", outside},
+		Timeout:   20 * time.Second,
+	})
+	if err != nil || !strings.Contains(open.Stdout, "public-note") {
+		t.Fatalf("ordinary outside file was not readable: %+v err %v", open, err)
+	}
+	caps, err := execer.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caps.FilesystemIsolation {
+		t.Fatal("FilesystemIsolation must stay false")
+	}
+	if len(caps.SensitivePathsMasked) != 1 || caps.SensitivePathsMasked[0] != sshDir {
+		t.Fatalf("masked %#v", caps.SensitivePathsMasked)
+	}
+}
+
 func TestDangerCancelKillsProcess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("process-group cancellation is unverified on Windows")
@@ -187,7 +242,7 @@ func TestDangerCancelKillsProcess(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.Default()
 	cfg.Workspace.Permission = agent.PermissionDangerFullAccess
-	execer := newCommandExecutor(cfg, t.TempDir(), "linux", nil)
+	execer := newCommandExecutor(cfg, t.TempDir(), "", "linux", nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

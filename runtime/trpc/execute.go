@@ -27,6 +27,7 @@ type commandExecutor struct {
 	cfg         config.Config
 	platform    string
 	sandboxRoot string
+	dataDir     string
 	external    sandbox.Backend
 
 	mu     sync.Mutex
@@ -34,7 +35,7 @@ type commandExecutor struct {
 	caps   sandbox.Capabilities
 }
 
-func newCommandExecutor(cfg config.Config, sandboxRoot, platform string, external sandbox.Backend) *commandExecutor {
+func newCommandExecutor(cfg config.Config, sandboxRoot, dataDir, platform string, external sandbox.Backend) *commandExecutor {
 	if platform == "" {
 		platform = runtime.GOOS
 	}
@@ -42,6 +43,7 @@ func newCommandExecutor(cfg config.Config, sandboxRoot, platform string, externa
 		cfg:         cfg,
 		platform:    platform,
 		sandboxRoot: sandboxRoot,
+		dataDir:     dataDir,
 		external:    external,
 	}
 }
@@ -82,11 +84,16 @@ func (e *commandExecutor) probe(ctx context.Context) (sandbox.Capabilities, erro
 	}); err != nil {
 		preflight = err
 	}
+	masked, err := e.denyList("")
+	if err != nil && preflight == nil {
+		preflight = err
+	}
 	e.caps = sandbox.Assess(sandbox.Probe{
 		Platform:           e.platform,
 		ManagedImplemented: true,
 		PreflightErr:       preflight,
 		NetworkRestricted:  e.cfg.Sandbox.Network != "enabled",
+		SensitivePaths:     masked.Paths,
 	})
 	return e.caps, nil
 }
@@ -113,6 +120,9 @@ func (e *commandExecutor) Execute(ctx context.Context, req sandbox.Request) (san
 }
 
 func (e *commandExecutor) executeWrite(ctx context.Context, req sandbox.Request) (sandbox.Result, error) {
+	if _, err := e.denyList(req.Workspace); err != nil {
+		return sandbox.Result{}, agent.Invalid("sandbox.deny_read", err)
+	}
 	switch e.cfg.Sandbox.Mode {
 	case sandbox.ModeDangerFullAccess:
 		return e.host(ctx, req)
@@ -229,13 +239,60 @@ func (e *commandExecutor) managed(ctx context.Context, req sandbox.Request) (san
 
 func (e *commandExecutor) profile(workspace string) trpcsandbox.PermissionProfile {
 	profile := trpcsandbox.WorkspaceWriteProfile()
+	if e.cfg.Workspace.Permission == agent.PermissionReadOnly {
+		profile = trpcsandbox.ReadOnlyProfile()
+	}
 	if e.cfg.Sandbox.Network == "enabled" {
 		profile = profile.WithNetworkPolicy(trpcsandbox.NetworkPolicy{Mode: trpcsandbox.NetworkEnabled})
 	}
-	if workspace != "" {
+	if workspace != "" && e.cfg.Workspace.Permission != agent.PermissionReadOnly {
 		profile = profile.WithWritePaths(workspace)
 	}
+	denied, err := e.denyList(workspace)
+	if err != nil {
+		return profile
+	}
+	if len(denied.Paths) > 0 {
+		profile = profile.WithNoAccessPaths(denied.Paths...)
+	}
+	if len(denied.Globs) > 0 {
+		profile = profile.WithNoAccessGlobs(denied.Globs...)
+	}
 	return profile
+}
+
+func (e *commandExecutor) denyList(workspace string) (sandbox.DenyList, error) {
+	home, _ := os.UserHomeDir()
+	return sandbox.SensitivePaths(sandbox.DenyRequest{
+		Home:            home,
+		DataDir:         e.dataDir,
+		SessionPath:     e.cfg.Session.Path,
+		Extra:           e.cfg.Sandbox.DenyRead,
+		Mode:            e.cfg.Sandbox.DenyReadMode,
+		CredentialFiles: credentialFiles(e.cfg),
+		Workspace:       workspace,
+	})
+}
+
+func credentialFiles(cfg config.Config) []string {
+	var out []string
+	out = append(out, fileRef(cfg.MCP.Servers)...)
+	return out
+}
+
+func fileRef(servers []config.MCPServerConfig) []string {
+	var out []string
+	for _, server := range servers {
+		if strings.HasPrefix(server.CredentialRef, "file:") {
+			out = append(out, server.CredentialRef)
+		}
+		for _, value := range server.Headers {
+			if strings.HasPrefix(value, "file:") {
+				out = append(out, value)
+			}
+		}
+	}
+	return out
 }
 
 func envList(env map[string]string) []string {
