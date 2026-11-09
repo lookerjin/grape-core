@@ -105,12 +105,12 @@ func (b *eventBox) abandon() {
 	b.signal()
 }
 
-// pump sends queued events until the box is drained, stop is closed, or
-// the consumer leaves an event unread for idle after the run has finished.
-// The idle clock starts when an event is sitting in out and restarts when
-// the consumer takes it. A reader that keeps taking events keeps every
-// tool, permission, and error event. On timeout the backlog is discarded
-// and only a drop marker plus the terminal event are sent.
+// pump sends queued events until the box is drained or stop is closed.
+// After the run is finished, idle is how long the pump waits for a
+// consumer who has not taken an event. The first take cancels that
+// clock. A consumer who has started reading keeps every tool, permission,
+// and error event, even when the gap between takes is longer than idle.
+// Close and Runtime.Close still release the pump.
 func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.Duration) {
 	defer close(out)
 	if idle <= 0 {
@@ -118,6 +118,8 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.
 	}
 	var timer *time.Timer
 	var timed <-chan time.Time
+	sent := false
+	taken := false
 	stopTimer := func() {
 		if timer == nil {
 			return
@@ -131,21 +133,6 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.
 		timed = nil
 	}
 	defer stopTimer()
-	arm := func() {
-		if timer == nil {
-			timer = time.NewTimer(idle)
-			timed = timer.C
-			return
-		}
-		if !timer.Stop() {
-			select {
-			case <-timed:
-			default:
-			}
-		}
-		timer.Reset(idle)
-		timed = timer.C
-	}
 	pulse := time.NewTicker(10 * time.Millisecond)
 	defer pulse.Stop()
 	for {
@@ -154,8 +141,9 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.
 			return
 		}
 		for len(out) > 0 {
-			if b.isClosed() && timed == nil {
-				arm()
+			if b.isClosed() && !taken && timed == nil {
+				timer = time.NewTimer(idle)
+				timed = timer.C
 			}
 			select {
 			case <-timed:
@@ -166,14 +154,13 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, idle time.
 			case <-pulse.C:
 			}
 		}
-		// The consumer took the previous event. Restart the idle clock
-		// only after the next event is unread.
-		stopTimer()
+		if sent {
+			taken = true
+			stopTimer()
+		}
 		select {
 		case out <- evt:
-			if b.isClosed() {
-				arm()
-			}
+			sent = true
 		case <-stop:
 			return
 		}

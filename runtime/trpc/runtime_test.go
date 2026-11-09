@@ -613,10 +613,10 @@ func TestSlowLiveReaderKeepsToolEvents(t *testing.T) {
 	cfg.Journal.Enabled = false
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Approvals.Required = false
-	// 400ms between takes, hold 2s. The drain lasts about 8s, so a clock
-	// that starts when the run finishes drops tool events. The idle clock
-	// restarts on each take, and every tool_end arrives.
-	cfg.Context.EventHoldTimeout = "2s"
+	// Hold is 300ms and the reader pauses 400ms after every tool_end.
+	// A clock that keeps running from run completion drops the rest.
+	// The first take cancels that clock, so all 20 tool_end events arrive.
+	cfg.Context.EventHoldTimeout = "300ms"
 	cfg.Context.MaxLLMCalls = 80
 	cfg.Context.MaxToolIterations = 80
 	var calls atomic.Int32
