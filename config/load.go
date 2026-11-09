@@ -208,10 +208,10 @@ func checkCredentialRef(ref string) error {
 
 func checkHeaderValue(key, value string) error {
 	value = strings.TrimSpace(value)
-	if value == "" || strings.HasPrefix(value, "env:") || strings.HasPrefix(value, "file:") {
+	if value == "" || strings.HasPrefix(value, "env:") || strings.HasPrefix(value, "file:") || strings.Contains(value, "${") {
 		return nil
 	}
-	return agent.Invalid("mcp.headers."+key, fmt.Errorf("header values must be env:NAME or file:PATH references"))
+	return agent.Invalid("mcp.headers."+key, fmt.Errorf("header values must be env:NAME, file:PATH, or ${NAME} references"))
 }
 
 // RedactedYAML returns YAML with secrets removed.

@@ -78,8 +78,12 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 					if server.Name != serverName {
 						continue
 					}
-					if mcp.PluginAllowed(rt.cfg.MCP.AllowPluginServers, comp.Name) {
+					server.PluginKey = comp.Name
+					if grant, ok := rt.cfg.MCP.AllowPluginServers.Get(comp.Name); ok {
 						server.Enabled = true
+						if grant.Trust == "host" {
+							server.Trust = "host"
+						}
 					}
 					rt.mcpServers = append(rt.mcpServers, server)
 				}

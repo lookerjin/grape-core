@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -24,9 +25,13 @@ type Server struct {
 	Timeout       time.Duration     `json:"timeout,omitempty"`
 	Source        string            `json:"source,omitempty"`
 	// Trust is "host" when the operator accepts an unconfined stdio process.
+	// Plugin files cannot set this. Only user config can.
 	Trust string `json:"trust,omitempty"`
 	// Level is "write" or "read". Empty means write.
 	Level string `json:"level,omitempty"`
+	// PluginKey is "plugin/server" for a server that came from a plugin.
+	// Empty means the server came from user config.
+	PluginKey string `json:"plugin_key,omitempty"`
 }
 
 // Status is a connection snapshot. It does not include header values.
@@ -211,6 +216,8 @@ func validate(server Server) error {
 	return nil
 }
 
+var interpolation = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
 func checkRef(value string) error {
 	value = strings.TrimSpace(value)
 	switch {
@@ -220,74 +227,108 @@ func checkRef(value string) error {
 		return nil
 	case strings.HasPrefix(value, "file:") && len(value) > len("file:"):
 		return nil
-	case strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") && len(value) > len("${}"):
+	case interpolation.MatchString(value):
 		return nil
 	default:
 		return fmt.Errorf("value must be an env:NAME, file:PATH, or ${NAME} reference")
 	}
 }
 
-// ResolveRef expands env:, file:, and ${NAME} credential references.
+// HeaderPolicy controls how a server may read credentials.
+// Plugin servers cannot read file: refs. Their env: and ${NAME} names
+// must be listed in AllowEnv.
+type HeaderPolicy struct {
+	Plugin   bool
+	AllowEnv map[string]struct{}
+}
+
+func (p HeaderPolicy) allowEnv(name string) error {
+	if !p.Plugin {
+		return nil
+	}
+	if _, ok := p.AllowEnv[name]; ok {
+		return nil
+	}
+	return fmt.Errorf("env %s is not allowed for this plugin server", name)
+}
+
+// ResolveRef expands one credential reference under policy.
 // A missing target is an error that names the reference and not a secret.
-func ResolveRef(value string) (string, error) {
+// Plugin policy refuses file: without reading the file.
+func ResolveRef(value string, policy HeaderPolicy) (string, error) {
+	resolved, _, err := resolveValue(value, policy)
+	return resolved, err
+}
+
+func resolveValue(value string, policy HeaderPolicy) (string, []string, error) {
 	value = strings.TrimSpace(value)
 	switch {
 	case value == "":
-		return "", nil
-	case strings.HasPrefix(value, "env:"):
-		name := strings.TrimPrefix(value, "env:")
-		got, ok := os.LookupEnv(name)
-		if !ok || got == "" {
-			return "", fmt.Errorf("missing env:%s", name)
-		}
-		return got, nil
+		return "", nil, nil
 	case strings.HasPrefix(value, "file:"):
+		if policy.Plugin {
+			return "", nil, fmt.Errorf("plugin MCP servers cannot use file: references")
+		}
 		path := strings.TrimPrefix(value, "file:")
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			return "", fmt.Errorf("missing file:%s", path)
+			return "", nil, fmt.Errorf("missing file:%s", path)
 		}
-		return strings.TrimSpace(string(raw)), nil
-	case strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}"):
-		name := strings.TrimSuffix(strings.TrimPrefix(value, "${"), "}")
+		got := strings.TrimSpace(string(raw))
+		return got, []string{got}, nil
+	case strings.HasPrefix(value, "env:"):
+		name := strings.TrimPrefix(value, "env:")
+		if err := policy.allowEnv(name); err != nil {
+			return "", nil, err
+		}
 		got, ok := os.LookupEnv(name)
 		if !ok || got == "" {
-			return "", fmt.Errorf("missing ${%s}", name)
+			return "", nil, fmt.Errorf("missing env:%s", name)
 		}
-		return got, nil
+		return got, []string{got}, nil
 	default:
-		return value, nil
+		var secrets []string
+		var failure error
+		out := interpolation.ReplaceAllStringFunc(value, func(match string) string {
+			if failure != nil {
+				return ""
+			}
+			name := interpolation.FindStringSubmatch(match)[1]
+			if err := policy.allowEnv(name); err != nil {
+				failure = err
+				return ""
+			}
+			got, ok := os.LookupEnv(name)
+			if !ok || got == "" {
+				failure = fmt.Errorf("missing ${%s}", name)
+				return ""
+			}
+			secrets = append(secrets, got)
+			return got
+		})
+		if failure != nil {
+			return "", nil, failure
+		}
+		return out, secrets, nil
 	}
 }
 
 // ResolveHeaders resolves every header reference.
-func ResolveHeaders(headers map[string]string) (map[string]string, []string, error) {
+func ResolveHeaders(headers map[string]string, policy HeaderPolicy) (map[string]string, []string, error) {
 	if len(headers) == 0 {
 		return nil, nil, nil
 	}
 	out := make(map[string]string, len(headers))
 	var secrets []string
 	for key, value := range headers {
-		resolved, err := ResolveRef(value)
+		resolved, extra, err := resolveValue(value, policy)
 		if err != nil {
 			return nil, nil, fmt.Errorf("header %s: %w", key, err)
 		}
 		out[key] = resolved
-		if resolved != "" && resolved != value {
-			secrets = append(secrets, resolved)
-		}
+		secrets = append(secrets, extra...)
 	}
 	return out, secrets, nil
-}
-
-// PluginAllowed reports whether plugin/server is in the allow list.
-func PluginAllowed(allow []string, key string) bool {
-	for _, item := range allow {
-		if item == key {
-			return true
-		}
-	}
-	return false
 }
 
 func redact(server Server) Server {

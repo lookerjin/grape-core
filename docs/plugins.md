@@ -17,7 +17,7 @@ my-plugin/
 
 `plugin.Manager` installs from a local directory or `InstallGit`. Git installs record `git rev-parse HEAD` and do not fetch on the next process start. Copies reject `..` paths and symlinks. A failed install removes its staging directory. Enable and disable change the install record used by the next runtime. A runtime keeps the snapshot it resolved at construction.
 
-`.mcp.json` understands `mcpServers.<name>.command`, `args`, `url`, and `headers`. Header values may be `env:NAME`, `file:PATH`, or `${NAME}`. A plugin server stays disabled until `mcp.allow_plugin_servers` lists `plugin/server`. Stdio servers also need `trust: host` and then run on the host with isolation `none`.
+`.mcp.json` understands `mcpServers.<name>.command`, `args`, `url`, and `headers`. Header values may be `env:NAME`, `file:PATH`, or text containing `${NAME}` such as `Bearer ${TOKEN}`. A plugin server stays disabled until `mcp.allow_plugin_servers` lists `plugin/server`. A plugin cannot declare `trust: host`; the user grant does, as `{name: plugin/server, trust: host}`. Plugin headers never resolve `file:` refs. `env:` and `${NAME}` resolve only for names listed in `mcp.plugin_env_allow` under that `plugin/server` key. Stdio then runs on the host with isolation `none`.
 
 `commands/*.md` and `agents/*.md` are discovery-only. The runtime lists them on the plugin snapshot (`discovery_only`) and does not turn them into tools or subagents.
 

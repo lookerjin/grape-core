@@ -63,15 +63,16 @@ func (rt *Runtime) openMCP(ctx context.Context) error {
 		}
 		set, err := rt.dialMCP(ctx, server)
 		if err != nil {
+			redacted := redactDetail(err.Error(), rt.secrets)
 			rt.mcpStatus = append(rt.mcpStatus, mcp.Status{
 				Name: server.Name, Transport: transportOf(server), State: "failed",
-				Detail: redactDetail(err.Error(), rt.secrets), Isolation: isolationOf(server),
+				Detail: redacted, Isolation: isolationOf(server),
 			})
 			if rt.cfg.MCP.Strict {
 				for _, opened := range sets {
 					_ = opened.Close()
 				}
-				return err
+				return fmt.Errorf("%s", redacted)
 			}
 			continue
 		}
@@ -127,23 +128,38 @@ func isolationOf(server mcp.Server) string {
 	return ""
 }
 
+func (rt *Runtime) headerPolicy(server mcp.Server) mcp.HeaderPolicy {
+	policy := mcp.HeaderPolicy{}
+	if server.PluginKey == "" {
+		return policy
+	}
+	policy.Plugin = true
+	policy.AllowEnv = map[string]struct{}{}
+	for _, name := range rt.cfg.MCP.PluginEnvAllow[server.PluginKey] {
+		policy.AllowEnv[name] = struct{}{}
+	}
+	return policy
+}
+
 func (rt *Runtime) dialMCP(ctx context.Context, server mcp.Server) (tool.ToolSet, error) {
-	headers, secrets, err := mcp.ResolveHeaders(server.Headers)
+	policy := rt.headerPolicy(server)
+	headers, secrets, err := mcp.ResolveHeaders(server.Headers, policy)
 	if err != nil {
 		return nil, fmt.Errorf("mcp %s: %w", server.Name, err)
 	}
 	if ref := strings.TrimSpace(server.CredentialRef); ref != "" {
-		value, err := mcp.ResolveRef(ref)
+		if _, exists := headers["Authorization"]; exists {
+			return nil, fmt.Errorf("mcp %s: credential_ref is set but Authorization is already set", server.Name)
+		}
+		value, err := mcp.ResolveRef(ref, policy)
 		if err != nil {
 			return nil, fmt.Errorf("mcp %s: %w", server.Name, err)
 		}
 		if headers == nil {
 			headers = map[string]string{}
 		}
-		if _, ok := headers["Authorization"]; !ok && value != "" {
-			headers["Authorization"] = value
-		}
 		if value != "" {
+			headers["Authorization"] = value
 			secrets = append(secrets, value)
 		}
 	}

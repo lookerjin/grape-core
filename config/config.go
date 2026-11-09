@@ -131,8 +131,12 @@ type MCPConfig struct {
 	// The default reports that server as failed and continues.
 	Strict bool `yaml:"strict"`
 	// AllowPluginServers lists plugin/server keys that may be enabled.
-	// Plugin MCP servers stay disabled until their key is listed.
-	AllowPluginServers []string `yaml:"allow_plugin_servers"`
+	// An entry may be a name or {name, trust}. trust: host is the only
+	// way to launch a plugin stdio server. Plugin files cannot grant it.
+	AllowPluginServers PluginGrants `yaml:"allow_plugin_servers"`
+	// PluginEnvAllow maps "plugin/server" to env var names that plugin
+	// headers may read. file: refs from plugins are never resolved.
+	PluginEnvAllow map[string][]string `yaml:"plugin_env_allow"`
 }
 
 // MemoryConfig enables the Markdown memory root. It is off by default.
