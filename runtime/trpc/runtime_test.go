@@ -287,6 +287,14 @@ func TestDomainPackagesDoNotImportTRPC(t *testing.T) {
 	for _, pkg := range []string{
 		"github.com/lookerjin/grape-core/agent",
 		"github.com/lookerjin/grape-core/config",
+		"github.com/lookerjin/grape-core/coding",
+		"github.com/lookerjin/grape-core/sandbox",
+		"github.com/lookerjin/grape-core/plugin",
+		"github.com/lookerjin/grape-core/mcp",
+		"github.com/lookerjin/grape-core/skill",
+		"github.com/lookerjin/grape-core/hooks",
+		"github.com/lookerjin/grape-core/rules",
+		"github.com/lookerjin/grape-core/memory",
 	} {
 		cmd := exec.Command("go", "list", "-deps", "-f", "{{.ImportPath}}", pkg)
 		cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local")

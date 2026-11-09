@@ -12,17 +12,26 @@ import (
 	"github.com/google/uuid"
 	"github.com/lookerjin/grape-core/agent"
 	"github.com/lookerjin/grape-core/config"
+	"github.com/lookerjin/grape-core/hooks"
 	"github.com/lookerjin/grape-core/internal/journal"
 	"github.com/lookerjin/grape-core/internal/paths"
+	"github.com/lookerjin/grape-core/mcp"
+	"github.com/lookerjin/grape-core/memory"
+	"github.com/lookerjin/grape-core/plugin"
+	"github.com/lookerjin/grape-core/rules"
 	"github.com/lookerjin/grape-core/sandbox"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/agent/extension/goal"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/evolution"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sqlitesession "trpc.group/trpc-go/trpc-agent-go/session/sqlite"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
+	agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
+	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -42,8 +51,12 @@ type Options struct {
 	Instruction             string
 	// Platform overrides GOOS for sandbox preflight. Leave it empty in
 	// production. Tests set "windows" to exercise the fail-closed path.
-	Platform string
-	External sandbox.Backend
+	Platform          string
+	External          sandbox.Backend
+	PluginManager     *plugin.Manager
+	FixedAgent        trpcagent.Agent
+	SubAgents         []trpcagent.Agent
+	EvolutionReviewer evolution.Reviewer
 }
 
 // Runtime is a tRPC-backed agent.Runtime.
@@ -59,6 +72,16 @@ type Runtime struct {
 	model       model.Model
 	exec        *commandExecutor
 	tools       []tool.Tool
+	skillRoots  []string
+	ruleText    string
+	ruleSources []rules.Source
+	globalRules string
+	hookRunner  *hooks.Runner
+	mcpServers  []mcp.Server
+	resolved    plugin.Resolved
+	fixed       trpcagent.Agent
+	subs        []trpcagent.Agent
+	evolution   evolution.Service
 	decider     agent.Decider
 	reject      bool
 	journal     *journal.Writer
@@ -142,8 +165,41 @@ func New(opts Options) (*Runtime, error) {
 		maxField:    cfg.Journal.MaxFieldBytes,
 		instruction: instruction,
 		locks:       map[string]*sync.Mutex{},
+		fixed:       opts.FixedAgent,
+		subs:        append([]trpcagent.Agent(nil), opts.SubAgents...),
 	}
-	r := runner.NewRunnerWithAgentFactory(appName, "grape", rt.agentFactory, runner.WithSessionService(sessions))
+	if cfg.Evolution.Enabled {
+		if err := os.MkdirAll(cfg.Evolution.Root, 0o755); err != nil {
+			_ = sessions.Close()
+			return nil, err
+		}
+		eopts := []evolution.Option{
+			evolution.WithManagedSkillsDir(filepath.Join(cfg.Evolution.Root, "skills")),
+			evolution.WithCandidateStore(evolution.NewFileCandidateStore(filepath.Join(cfg.Evolution.Root, "candidates"))),
+			evolution.WithHumanGate(evolution.NewAlwaysHoldGate()),
+		}
+		if opts.EvolutionReviewer != nil {
+			eopts = append(eopts, evolution.WithReviewer(opts.EvolutionReviewer))
+		}
+		rt.evolution = evolution.NewService(mdl, eopts...)
+	}
+	if err := rt.collectExtensions(opts.PluginManager, dataDir); err != nil {
+		_ = sessions.Close()
+		return nil, err
+	}
+	runnerOpts := []runner.Option{runner.WithSessionService(sessions)}
+	if rt.hookRunner != nil {
+		runnerOpts = append(runnerOpts, runner.WithPlugins(&hookPlugin{rt: rt}))
+	}
+	if rt.evolution != nil {
+		runnerOpts = append(runnerOpts, runner.WithEvolutionService(rt.evolution))
+	}
+	var r runner.Runner
+	if rt.fixed != nil {
+		r = runner.NewRunner(appName, rt.fixed, runnerOpts...)
+	} else {
+		r = runner.NewRunnerWithAgentFactory(appName, "grape", rt.agentFactory, runnerOpts...)
+	}
 	rt.runner = r
 	secrets := rt.secrets
 	var jw *journal.Writer
@@ -172,9 +228,25 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		return nil, err
 	}
 	tools = append(tools, rt.tools...)
+	mode := ""
+	if ro.RuntimeState != nil {
+		mode, _ = ro.RuntimeState["mode"].(string)
+	}
+	if len(rt.subs) > 0 {
+		for _, sub := range rt.subs {
+			tools = append(tools, agenttool.NewTool(sub))
+		}
+	}
+	if rt.cfg.Memory.Enabled {
+		tools = append(tools, rt.memoryTool())
+	}
+	instruction := rt.instruction
+	if text, err := rt.ruleTextFor(ws); err == nil && text != "" {
+		instruction += "\n\nRules:\n" + text
+	}
 	opts := []llmagent.Option{
 		llmagent.WithModel(rt.model),
-		llmagent.WithInstruction(rt.instruction),
+		llmagent.WithInstruction(instruction),
 		llmagent.WithGenerationConfig(generationConfig(rt.cfg)),
 		llmagent.WithEnableCodeExecutionResponseProcessor(false),
 		llmagent.WithWorkspaceExecSurfaceEnabled(false),
@@ -182,8 +254,45 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		llmagent.WithMaxToolIterations(positiveLimit(rt.cfg.Context.MaxToolIterations)),
 		llmagent.WithTools(tools),
 	}
+	if repo, err := rt.skillRepository(); err != nil {
+		return nil, err
+	} else if repo != nil {
+		opts = append(opts,
+			llmagent.WithSkills(repo),
+			llmagent.WithSkillToolProfile(llmagent.SkillToolProfileKnowledgeOnly),
+		)
+	}
+	if mode == string(agent.ModeGoal) {
+		retries := rt.cfg.Goal.MaxIterations
+		if retries <= 0 {
+			retries = 1
+		}
+		opts = append(opts, llmagent.WithExtensions(goal.New(goal.WithMaxRetries(retries))))
+	}
+	if len(rt.subs) > 0 {
+		opts = append(opts, llmagent.WithSubAgents(rt.subs))
+	}
 	return llmagent.New("grape", opts...), nil
 }
+
+func (rt *Runtime) memoryTool() tool.Tool {
+	return function.NewFunctionTool(
+		func(ctx context.Context, in struct {
+			Query string `json:"query"`
+		}) ([]memory.Entry, error) {
+			store, err := memory.Open(rt.cfg.Memory.Root)
+			if err != nil {
+				return nil, err
+			}
+			return store.Recall(in.Query)
+		},
+		function.WithName("memory_recall"),
+		function.WithDescription("Search Markdown memory notes. This does not write memories or call a model."),
+	)
+}
+
+// EvolutionEnabled reports whether an evolution service was constructed.
+func (rt *Runtime) EvolutionEnabled() bool { return rt.evolution != nil }
 
 func resolvePaths(cfg config.Config, dataDir string) (config.Config, error) {
 	var err error
@@ -464,6 +573,11 @@ func (rt *Runtime) Close() error {
 	rt.closeOnce.Do(func() {
 		if rt.runner != nil {
 			rt.closeErr = rt.runner.Close()
+		}
+		if rt.evolution != nil {
+			if err := rt.evolution.Close(); err != nil && rt.closeErr == nil {
+				rt.closeErr = err
+			}
 		}
 		if rt.sessions != nil {
 			if err := rt.sessions.Close(); err != nil && rt.closeErr == nil {
