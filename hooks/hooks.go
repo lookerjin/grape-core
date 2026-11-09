@@ -28,11 +28,12 @@ const (
 
 // Spec is one shell hook.
 type Spec struct {
-	Event    string        `json:"event"`
-	Command  string        `json:"command"`
-	Args     []string      `json:"args,omitempty"`
-	Timeout  time.Duration `json:"timeout,omitempty"`
-	Blocking bool          `json:"blocking"`
+	Event      string        `json:"event"`
+	Command    string        `json:"command"`
+	Args       []string      `json:"args,omitempty"`
+	Timeout    time.Duration `json:"timeout,omitempty"`
+	Blocking   bool          `json:"blocking"`
+	ExpectJSON bool          `json:"expect_json,omitempty"`
 }
 
 // Result is the executor result plus whether the hook blocked the step.
@@ -120,6 +121,9 @@ func (r *Runner) Run(ctx context.Context, event, workspace, input string) ([]Res
 		return nil, fmt.Errorf("hook event %q is unsupported", event)
 	}
 	var out []Result
+	if strings.TrimSpace(input) != "" && !json.Valid([]byte(input)) {
+		return nil, fmt.Errorf("hook input is not JSON")
+	}
 	for _, hook := range r.hooks {
 		if hook.Event != event {
 			continue
@@ -164,10 +168,19 @@ func (r *Runner) one(ctx context.Context, hook Spec, workspace, input string) (R
 	})
 	result := Result{Event: hook.Event, ExitCode: res.ExitCode, Stdout: res.Stdout, Stderr: res.Stderr}
 	if err != nil {
+		if hook.Blocking {
+			result.Blocked = true
+		}
 		return result, err
 	}
-	if res.ExitCode != 0 && hook.Blocking {
-		return result, fmt.Errorf("hook %s exited %d", hook.Event, res.ExitCode)
+	if res.ExitCode != 0 {
+		err = fmt.Errorf("hook %s exited %d", hook.Event, res.ExitCode)
+	} else if hook.ExpectJSON && !json.Valid([]byte(strings.TrimSpace(res.Stdout))) {
+		err = fmt.Errorf("hook %s returned malformed JSON", hook.Event)
+	}
+	if err != nil && hook.Blocking {
+		result.Blocked = true
+		return result, err
 	}
 	return result, nil
 }
