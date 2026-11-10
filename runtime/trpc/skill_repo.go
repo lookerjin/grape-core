@@ -2,21 +2,20 @@ package trpcruntime
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/lookerjin/grape-core/skill"
 	trpcskill "trpc.group/trpc-go/trpc-agent-go/skill"
 )
 
-// skillSnapshot is the Discover result. Get and Path read that selection.
-// They do not scan again. tRPC FSRepository keeps the first name and skips
-// a file that fails to parse. Discover returns those as errors.
+// skillSnapshot records which directory Discover selected for each name.
+// Get and Path load that directory through tRPC's FSRepository. They do not
+// parse SKILL.md again to decide the winner. tRPC's own scan, given every
+// root at once, keeps the first name and skips a file that fails to parse.
+// Discover returns those as errors before this snapshot is built.
 type skillSnapshot struct {
 	roots []string
 	order []skill.Summary
-	byDir map[string]skill.Summary
+	repos map[string]*trpcskill.FSRepository
 }
 
 func newSkillSnapshot(policy string, roots []string) (trpcskill.Repository, error) {
@@ -29,11 +28,20 @@ func newSkillSnapshot(policy string, roots []string) (trpcskill.Repository, erro
 	}
 	snap := &skillSnapshot{
 		order: found,
-		byDir: map[string]skill.Summary{},
+		repos: map[string]*trpcskill.FSRepository{},
 	}
 	seenRoot := map[string]struct{}{}
 	for _, item := range found {
-		snap.byDir[item.Name] = item
+		// The selected skill directory is a repository root. tRPC indexes
+		// the SKILL.md in that directory and loads its docs from there.
+		repo, err := trpcskill.NewFSRepository(item.Dir)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := repo.Get(item.Name); err != nil {
+			return nil, fmt.Errorf("skill %q from %s: %w", item.Name, item.Dir, err)
+		}
+		snap.repos[item.Name] = repo
 		if _, ok := seenRoot[item.Root]; ok {
 			continue
 		}
@@ -55,11 +63,11 @@ func (s *skillSnapshot) Summaries() []trpcskill.Summary {
 }
 
 func (s *skillSnapshot) Path(name string) (string, error) {
-	item, ok := s.byDir[name]
+	repo, ok := s.repos[name]
 	if !ok {
 		return "", fmt.Errorf("skill %q not found", name)
 	}
-	return item.Dir, nil
+	return repo.Path(name)
 }
 
 func (s *skillSnapshot) Roots() []string {
@@ -70,59 +78,9 @@ func (s *skillSnapshot) Roots() []string {
 }
 
 func (s *skillSnapshot) Get(name string) (*trpcskill.Skill, error) {
-	item, ok := s.byDir[name]
+	repo, ok := s.repos[name]
 	if !ok {
 		return nil, fmt.Errorf("skill %q not found", name)
 	}
-	body, err := skillBody(item.Dir)
-	if err != nil {
-		return nil, err
-	}
-	docs, err := skillDocs(item.Dir)
-	if err != nil {
-		return nil, err
-	}
-	return &trpcskill.Skill{
-		Summary: trpcskill.Summary{Name: item.Name, Description: item.Description},
-		Body:    body,
-		Docs:    docs,
-	}, nil
-}
-
-func skillBody(dir string) (string, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, "SKILL.md"))
-	if err != nil {
-		return "", err
-	}
-	text := string(raw)
-	if !strings.HasPrefix(text, "---") {
-		return text, nil
-	}
-	rest := strings.TrimPrefix(text, "---")
-	rest = strings.TrimPrefix(rest, "\r\n")
-	rest = strings.TrimPrefix(rest, "\n")
-	idx := strings.Index(rest, "\n---")
-	if idx < 0 {
-		return text, nil
-	}
-	return strings.TrimPrefix(rest[idx+4:], "\n"), nil
-}
-
-func skillDocs(dir string) ([]trpcskill.Doc, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	var docs []trpcskill.Doc
-	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() == "SKILL.md" {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(dir, entry.Name()))
-		if err != nil {
-			return nil, err
-		}
-		docs = append(docs, trpcskill.Doc{Path: entry.Name(), Content: string(raw)})
-	}
-	return docs, nil
+	return repo.Get(name)
 }

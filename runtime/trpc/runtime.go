@@ -916,6 +916,21 @@ type sessionHold struct {
 	st     *runState
 }
 
+func (rt *Runtime) removeTaskHost(h *TaskHost) {
+	if rt == nil || h == nil {
+		return
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	kept := make([]*TaskHost, 0, len(rt.taskHosts))
+	for _, item := range rt.taskHosts {
+		if item != h {
+			kept = append(kept, item)
+		}
+	}
+	rt.taskHosts = kept
+}
+
 func (rt *Runtime) sessionOf(user, session string) sessionKey {
 	return sessionKey{app: rt.appName, user: user, session: session}
 }
@@ -1141,7 +1156,7 @@ func (rt *Runtime) Close() error {
 		hosts := append([]*TaskHost(nil), rt.taskHosts...)
 		rt.mu.Unlock()
 		for _, host := range hosts {
-			host.cancelAll()
+			host.Close()
 		}
 		rt.stopPumps()
 		if rt.runner != nil {

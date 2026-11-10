@@ -77,6 +77,10 @@ type SessionRelease struct {
 	AcceptConcurrentTools bool
 }
 
+// TaskInterrupted is the error stored when a task was still running at
+// process restart. Compare this value; do not match the text by hand.
+const TaskInterrupted = "interrupted by previous runtime restart"
+
 // Task is a background task whose lifetime is owned by a TaskHost, not by
 // the caller context that requested it.
 type Task struct {

@@ -18,9 +18,15 @@ type TaskHost struct {
 	rt    *Runtime
 	index string
 
-	mu     sync.Mutex
-	cancel map[string]context.CancelFunc
+	mu        sync.Mutex
+	cancel    map[string]context.CancelFunc
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
+
+// taskGoroutineWait is how long Runtime.Close waits for hosted task
+// goroutines after cancelling them. It is not a caller-facing setting.
+const taskGoroutineWait = 5 * time.Second
 
 // NewTaskHost stores task status next to the runtime data directory.
 func NewTaskHost(rt *Runtime) (*TaskHost, error) {
@@ -38,8 +44,8 @@ func NewTaskHost(rt *Runtime) (*TaskHost, error) {
 	return h, nil
 }
 
-// normalize marks tasks left running by a previous process as failed and
-// drops tasks that had already finished.
+// normalize marks tasks left running by a previous process as failed.
+// Terminal rows stay. There is no retention limit.
 func (h *TaskHost) normalize() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -52,11 +58,10 @@ func (h *TaskHost) normalize() error {
 	for id, task := range tasks {
 		switch task.Status {
 		case "completed", "failed", "cancelled":
-			delete(tasks, id)
-			changed = true
+			continue
 		default:
 			task.Status = "failed"
-			task.Error = "interrupted by previous runtime restart"
+			task.Error = agent.TaskInterrupted
 			task.UpdatedAt = now
 			tasks[id] = task
 			changed = true
@@ -66,6 +71,29 @@ func (h *TaskHost) normalize() error {
 		return nil
 	}
 	return h.writeLocked(tasks)
+}
+
+// Close cancels hosted tasks, waits a bounded time for their goroutines,
+// and drops this host from the runtime.
+func (h *TaskHost) Close() {
+	if h == nil {
+		return
+	}
+	h.closeOnce.Do(func() {
+		h.cancelAll()
+		done := make(chan struct{})
+		go func() {
+			h.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(taskGoroutineWait):
+		}
+		if h.rt != nil {
+			h.rt.removeTaskHost(h)
+		}
+	})
 }
 
 func (h *TaskHost) cancelAll() {
@@ -108,7 +136,11 @@ func (h *TaskHost) Start(req agent.RunRequest) (agent.Task, error) {
 		cancel()
 		return agent.Task{}, err
 	}
-	go h.run(ctx, task, req)
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		h.run(ctx, task, req)
+	}()
 	return task, nil
 }
 

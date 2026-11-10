@@ -220,12 +220,23 @@ func TestTaskReloadAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := host.Get("done"); ok {
-		t.Fatal("finished task was kept")
+	done, ok := host.Get("done")
+	if !ok || done.Status != "completed" {
+		t.Fatalf("finished task %#v ok=%v", done, ok)
 	}
 	got, ok := host.Get("live")
-	if !ok || got.Status != "failed" || got.Error != "interrupted by previous runtime restart" {
+	if !ok || got.Status != "failed" || got.Error != agent.TaskInterrupted {
 		t.Fatalf("reloaded %#v ok=%v", got, ok)
+	}
+	again, err := NewTaskHost(rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done, ok = again.Get("done"); !ok || done.Status != "completed" {
+		t.Fatalf("second reload finished %#v ok=%v", done, ok)
+	}
+	if got, ok = again.Get("live"); !ok || got.Error != agent.TaskInterrupted {
+		t.Fatalf("second reload interrupted %#v ok=%v", got, ok)
 	}
 	failedStart, err := host.Start(agent.RunRequest{UserID: "u", SessionID: "s"})
 	if err != nil {
@@ -277,6 +288,12 @@ func TestTaskReloadAndClose(t *testing.T) {
 	for time.Now().Before(deadline) {
 		got, ok = host2.Get(task.ID)
 		if ok && (got.Status == "cancelled" || got.Status == "failed") {
+			rt2.mu.Lock()
+			left := len(rt2.taskHosts)
+			rt2.mu.Unlock()
+			if left != 0 {
+				t.Fatalf("task hosts left %d", left)
+			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -319,6 +336,48 @@ func TestSkillSnapshotServesTheDiscoverChoice(t *testing.T) {
 	}
 	if got.Summary.Description != "first" {
 		t.Fatalf("description %q", got.Summary.Description)
+	}
+}
+
+func TestSkillGetUsesTRPCDocLoading(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "review")
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "---\r\nname: review\r\ndescription: crlf\r\n---\r\nBody line.\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "run.sh"), []byte("echo hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "img.png"), []byte("not text"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "ref.md"), []byte("see this\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := newSkillSnapshot("error", []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.Get("review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(got.Body, "\r") || strings.HasPrefix(got.Body, "\n") {
+		t.Fatalf("body %q", got.Body)
+	}
+	if !strings.Contains(got.Body, "Body line.") {
+		t.Fatalf("body %q", got.Body)
+	}
+	if len(got.Docs) != 1 || got.Docs[0].Path != "sub/ref.md" {
+		var paths []string
+		for _, doc := range got.Docs {
+			paths = append(paths, doc.Path)
+		}
+		t.Fatalf("docs %v", paths)
 	}
 }
 
