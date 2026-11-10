@@ -77,9 +77,20 @@ type ToolPayload struct {
 }
 
 // TerminalPayload is the body of a terminal event.
+// Terminal reason and scope values carried on a failed run.
+const (
+	ReasonBudgetExceeded = "budget_exceeded"
+	ReasonAgentStopped   = "agent_stopped"
+	ScopeRun             = "run"
+	ScopeAgent           = "agent"
+)
+
 type TerminalPayload struct {
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+	Status  string `json:"status"`
+	Error   string `json:"error,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Scope   string `json:"scope,omitempty"`
+	AgentID string `json:"agent_id,omitempty"`
 }
 
 // ErrorPayload is the body of an error event.

@@ -50,8 +50,8 @@ memory:
 	if cfg.Memory.Enabled {
 		t.Fatal("explicit false was lost")
 	}
-	if cfg.Context.MaxLLMCalls != 4 {
-		t.Fatalf("max calls %d", cfg.Context.MaxLLMCalls)
+	if cfg.Context.MaxLLMCalls == nil || *cfg.Context.MaxLLMCalls != 4 {
+		t.Fatalf("max calls %v", cfg.Context.MaxLLMCalls)
 	}
 	if cfg.Evolution.Enabled {
 		t.Fatal("evolution defaulted on")
@@ -138,5 +138,46 @@ func TestDefaultMemoryAndEvolutionOff(t *testing.T) {
 	cfg := Default()
 	if cfg.Memory.Enabled || cfg.Evolution.Enabled {
 		t.Fatalf("%+v", cfg)
+	}
+}
+
+func TestNilBudgetDefaultsAndExplicitZeroStaysUnlimited(t *testing.T) {
+	cfg := Default()
+	if cfg.Context.MaxLLMCalls == nil || *cfg.Context.MaxLLMCalls != 128 {
+		t.Fatalf("llm default %v", cfg.Context.MaxLLMCalls)
+	}
+	if cfg.Context.MaxToolIterations == nil || *cfg.Context.MaxToolIterations != 64 {
+		t.Fatalf("tool default %v", cfg.Context.MaxToolIterations)
+	}
+	if cfg.Context.TotalMaxLLMCalls == nil || *cfg.Context.TotalMaxLLMCalls != 128 {
+		t.Fatalf("total llm %v", cfg.Context.TotalMaxLLMCalls)
+	}
+	if cfg.Context.TotalMaxToolIterations == nil || *cfg.Context.TotalMaxToolIterations != 64 {
+		t.Fatalf("total tools %v", cfg.Context.TotalMaxToolIterations)
+	}
+	if cfg.Context.MaxToolCalls != nil {
+		t.Fatalf("tool calls default %v", cfg.Context.MaxToolCalls)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	body := "context:\n  max_llm_calls: 0\n  max_tool_iterations: 0\n  total_max_llm_calls: 0\n  total_max_tool_iterations: 0\n  max_tool_calls: 0\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []*int{
+		loaded.Context.MaxLLMCalls,
+		loaded.Context.MaxToolIterations,
+		loaded.Context.TotalMaxLLMCalls,
+		loaded.Context.TotalMaxToolIterations,
+		loaded.Context.MaxToolCalls,
+	} {
+		if p == nil || *p != 0 {
+			t.Fatalf("explicit zero became %v", p)
+		}
 	}
 }

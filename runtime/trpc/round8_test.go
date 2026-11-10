@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lookerjin/grape-core/agent"
+	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/internal/mockmodel"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
@@ -77,8 +78,9 @@ func (rt *Runtime) retainedReadTools() int { return 0 }
 func TestMaxLLMCallsFailsTheRun(t *testing.T) {
 	cfg := quietConfig(t)
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
-	cfg.Context.MaxLLMCalls = 20
-	cfg.Context.MaxToolIterations = 200
+	cfg.Context.MaxLLMCalls = config.Int(20)
+	cfg.Context.MaxToolIterations = config.Int(200)
+	cfg.Context.TotalMaxToolIterations = config.Int(200)
 	var calls atomic.Int32
 	mdl := mockmodel.New("llm-cap", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		n := calls.Add(1)
@@ -99,8 +101,12 @@ func TestMaxLLMCallsFailsTheRun(t *testing.T) {
 	if last.Kind != agent.EventFailed {
 		t.Fatalf("terminal %s calls=%d %s", last.Kind, calls.Load(), blob)
 	}
-	if !strings.Contains(blob, "max LLM calls") {
-		t.Fatalf("missing llm budget error: %s", blob)
+	var body agent.TerminalPayload
+	if err := json.Unmarshal(last.Payload, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Reason != agent.ReasonBudgetExceeded || body.Scope != agent.ScopeAgent || body.AgentID == "" {
+		t.Fatalf("terminal %#v calls=%d %s", body, calls.Load(), blob)
 	}
 }
 

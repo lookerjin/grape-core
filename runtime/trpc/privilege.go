@@ -3,11 +3,9 @@ package trpcruntime
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/lookerjin/grape-core/agent"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
-	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
 )
@@ -134,78 +132,6 @@ func unwrapGrape(item tool.Tool) tool.Tool {
 		}
 	}
 	return item
-}
-
-func (rt *Runtime) consumeLLMCall(ctx context.Context) error {
-	st := stateFrom(ctx)
-	if rt == nil || st == nil {
-		return nil
-	}
-	limit := rt.cfg.Context.MaxLLMCalls
-	n := st.addLLMCall()
-	if limit > 0 && n > limit {
-		return rt.noteBudget(ctx, fmt.Errorf("max LLM calls (%d) exceeded", limit))
-	}
-	return nil
-}
-
-func (rt *Runtime) consumeToolCall(ctx context.Context) error {
-	st := stateFrom(ctx)
-	if rt == nil || st == nil {
-		return nil
-	}
-	limit := rt.cfg.Context.MaxToolCalls
-	if limit <= 0 {
-		return nil
-	}
-	n := st.addToolCall()
-	if n > limit {
-		return rt.noteBudget(ctx, fmt.Errorf("max tool calls (%d) exceeded", limit))
-	}
-	return nil
-}
-
-func (rt *Runtime) noteToolRound(ctx context.Context, resp *model.Response) error {
-	if rt == nil || !responseRequestsTools(resp) {
-		return nil
-	}
-	st := stateFrom(ctx)
-	if st == nil {
-		return nil
-	}
-	limit := rt.cfg.Context.MaxToolIterations
-	n := st.addToolRound()
-	if limit > 0 && n > limit {
-		return rt.noteBudget(ctx, fmt.Errorf("max tool iterations (%d) exceeded", limit))
-	}
-	return nil
-}
-
-func responseRequestsTools(resp *model.Response) bool {
-	if resp == nil || resp.IsPartial {
-		return false
-	}
-	for _, choice := range resp.Choices {
-		if len(choice.Message.ToolCalls) > 0 || len(choice.Delta.ToolCalls) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func (rt *Runtime) noteBudget(ctx context.Context, err error) error {
-	if st := stateFrom(ctx); st != nil && err != nil {
-		st.markFailure(err.Error())
-		st.add(agent.Event{
-			Kind: agent.EventError,
-			Time: time.Now().UTC(),
-			Payload: agent.MustPayload(agent.ErrorPayload{
-				Message: err.Error(),
-				Type:    "budget",
-			}),
-		})
-	}
-	return err
 }
 
 func rejectSpecNames(specs []SubagentSpec) error {

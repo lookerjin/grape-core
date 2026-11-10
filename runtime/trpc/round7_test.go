@@ -86,7 +86,7 @@ func TestParallelRoundStaysInsideDefaultBudget(t *testing.T) {
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Approvals.Required = false
 	cfg.Model.Generation.Stream = boolPtr(false)
-	cfg.Context.MaxToolIterations = 24
+	cfg.Context.MaxToolIterations = config.Int(24)
 	var round atomic.Int32
 	mdl := mockmodel.New("parallel-budget", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if toolMessages(req) > 0 && round.Load() >= 3 {
@@ -176,8 +176,8 @@ func TestExceededToolBudgetFailsTheRun(t *testing.T) {
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Approvals.Required = false
 	cfg.Model.Generation.Stream = boolPtr(false)
-	cfg.Context.MaxToolIterations = 2
-	cfg.Context.MaxLLMCalls = 20
+	cfg.Context.MaxToolIterations = config.Int(2)
+	cfg.Context.MaxLLMCalls = config.Int(20)
 	mdl := mockmodel.New("over-budget", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if toolMessages(req) > 8 {
 			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("stop")}}}, nil
@@ -196,8 +196,12 @@ func TestExceededToolBudgetFailsTheRun(t *testing.T) {
 	if last.Kind != agent.EventFailed {
 		t.Fatalf("terminal %s %s", last.Kind, blob)
 	}
-	if !strings.Contains(blob, "max tool iterations") {
-		t.Fatalf("missing budget error: %s", blob)
+	var body agent.TerminalPayload
+	if err := json.Unmarshal(last.Payload, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Reason != agent.ReasonBudgetExceeded || body.Scope != agent.ScopeAgent {
+		t.Fatalf("terminal %#v %s", body, blob)
 	}
 }
 

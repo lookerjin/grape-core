@@ -86,6 +86,12 @@ func (p *hookPlugin) beforeTool(ctx context.Context, args *tool.BeforeToolArgs) 
 	if args == nil {
 		return nil, nil
 	}
+	// Count the attempt before a hook short-circuit or a later denial.
+	if p.rt != nil {
+		if err := p.rt.consumeToolCall(ctx); err != nil {
+			return nil, err
+		}
+	}
 	payload, _ := json.Marshal(map[string]any{
 		"name":      args.ToolName,
 		"id":        args.ToolCallID,
@@ -96,11 +102,6 @@ func (p *hookPlugin) beforeTool(ctx context.Context, args *tool.BeforeToolArgs) 
 			"denied": true,
 			"error":  err.Error(),
 		}}, nil
-	}
-	if p.rt != nil {
-		if err := p.rt.consumeToolCall(ctx); err != nil {
-			return nil, err
-		}
 	}
 	return nil, nil
 }

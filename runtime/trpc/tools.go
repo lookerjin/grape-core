@@ -26,9 +26,14 @@ type runState struct {
 	// rootInv is the invocation ID captured for the run's root agent.
 	rootInv       string
 	llmCalls      int
+	rootLLM       int
 	toolRounds    int
+	rootTools     int
 	toolCalls     int
-	failReason    string
+	stopSet       bool
+	stopReason    string
+	stopScope     string
+	stopAgent     string
 	finishClaimed bool
 }
 
@@ -130,47 +135,6 @@ func (st *runState) rootInvocation() string {
 	return st.rootInv
 }
 
-func (st *runState) addLLMCall() int {
-	if st == nil {
-		return 0
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.llmCalls++
-	return st.llmCalls
-}
-
-func (st *runState) addToolRound() int {
-	if st == nil {
-		return 0
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.toolRounds++
-	return st.toolRounds
-}
-
-func (st *runState) addToolCall() int {
-	if st == nil {
-		return 0
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.toolCalls++
-	return st.toolCalls
-}
-
-func (st *runState) markFailure(reason string) {
-	if st == nil || reason == "" {
-		return
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.failReason == "" {
-		st.failReason = reason
-	}
-}
-
 // claimFinish marks the run finished once. The first caller owns the
 // session lock. busy reports whether a tool is still inside Call.
 func (st *runState) claimFinish() (busy bool, owner bool) {
@@ -185,15 +149,6 @@ func (st *runState) claimFinish() (busy bool, owner bool) {
 	st.finishClaimed = true
 	st.stopping = true
 	return st.tools > 0, true
-}
-
-func (st *runState) failure() string {
-	if st == nil {
-		return ""
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.failReason
 }
 
 func (st *runState) drain() []agent.Event {

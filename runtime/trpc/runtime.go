@@ -3,7 +3,6 @@ package trpcruntime
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -717,8 +716,7 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 		if ctx.Err() != nil && !evt.Terminal() && evt.Kind != agent.EventToolEnd {
 			return
 		}
-		noteUpstreamBudget(st, evt)
-		evt = failIfBudget(st, evt)
+		evt = applyStop(st, evt)
 		if evt.Terminal() {
 			rt.finishSession(req.SessionID, runID, st, unlock)
 		}
@@ -759,6 +757,7 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 			if terminal {
 				continue
 			}
+			rt.observeLimit(st, evt)
 			for _, next := range conv.convert(evt) {
 				if next.Kind == agent.EventCompleted && ctx.Err() != nil {
 					next.Kind = agent.EventCancelled
@@ -841,36 +840,6 @@ func (rt *Runtime) eventIdleTimeout() time.Duration {
 		return 5 * time.Minute
 	}
 	return d
-}
-
-func noteUpstreamBudget(st *runState, evt agent.Event) {
-	if st == nil || evt.Kind != agent.EventError {
-		return
-	}
-	var body agent.ErrorPayload
-	if err := json.Unmarshal(evt.Payload, &body); err != nil {
-		return
-	}
-	msg := body.Message
-	if strings.Contains(msg, "max LLM calls") || strings.Contains(msg, "max tool iterations") || strings.Contains(msg, "max tool calls") {
-		st.markFailure(msg)
-	}
-}
-
-func failIfBudget(st *runState, evt agent.Event) agent.Event {
-	if st == nil || evt.Kind != agent.EventCompleted {
-		return evt
-	}
-	reason := st.failure()
-	if reason == "" {
-		return evt
-	}
-	evt.Kind = agent.EventFailed
-	evt.Payload = agent.MustPayload(agent.TerminalPayload{
-		Status: string(agent.EventFailed),
-		Error:  reason,
-	})
-	return evt
 }
 
 func (rt *Runtime) track(h *runHandle) {

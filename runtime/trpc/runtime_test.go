@@ -194,8 +194,10 @@ func TestCancelClosesChannel(t *testing.T) {
 func TestCancelUnblocksSameSession(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false
-	cfg.Context.MaxLLMCalls = 1000
-	cfg.Context.MaxToolIterations = 1000
+	cfg.Context.MaxLLMCalls = config.Int(1000)
+	cfg.Context.TotalMaxLLMCalls = config.Int(1000)
+	cfg.Context.MaxToolIterations = config.Int(1000)
+	cfg.Context.TotalMaxToolIterations = config.Int(1000)
 	var phase atomic.Int32
 	mdl := mockmodel.New("flood", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if phase.Load() == 0 {
@@ -547,8 +549,8 @@ func TestAbandonedRunsReleaseWithoutClose(t *testing.T) {
 	cfg.Journal.Enabled = false
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Context.EventHoldTimeout = "150ms"
-	cfg.Context.MaxLLMCalls = 30
-	cfg.Context.MaxToolIterations = 30
+	cfg.Context.MaxLLMCalls = config.Int(30)
+	cfg.Context.MaxToolIterations = config.Int(30)
 	payload := strings.Repeat("x", 4096)
 	var n atomic.Int32
 	mdl := mockmodel.New("leak", func(ctx context.Context, req *model.Request) (*model.Response, error) {
@@ -618,8 +620,9 @@ func TestSlowLiveReaderKeepsToolEvents(t *testing.T) {
 	// The first take cancels that clock, so all 20 tool_end events arrive.
 	cfg.Context.EventHoldTimeout = "300ms"
 	cfg.Context.EventIdleTimeout = "2s"
-	cfg.Context.MaxLLMCalls = 80
-	cfg.Context.MaxToolIterations = 80
+	cfg.Context.MaxLLMCalls = config.Int(80)
+	cfg.Context.MaxToolIterations = config.Int(80)
+	cfg.Context.TotalMaxToolIterations = config.Int(80)
 	var calls atomic.Int32
 	mdl := mockmodel.New("slow-reader", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if calls.Add(1) > 20 {
@@ -852,8 +855,10 @@ func TestSlowConsumerKeepsToolEvents(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
-	cfg.Context.MaxLLMCalls = calls + 5
-	cfg.Context.MaxToolIterations = calls + 5
+	cfg.Context.MaxLLMCalls = config.Int(calls + 5)
+	cfg.Context.TotalMaxLLMCalls = config.Int(calls + 5)
+	cfg.Context.MaxToolIterations = config.Int(calls + 5)
+	cfg.Context.TotalMaxToolIterations = config.Int(calls + 5)
 	var n atomic.Int32
 	mdl := mockmodel.New("keep", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if ctx.Err() != nil {
@@ -906,8 +911,10 @@ func TestLateConsumerReceivesTerminalEvent(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Journal.Enabled = false
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
-	cfg.Context.MaxLLMCalls = 800
-	cfg.Context.MaxToolIterations = 800
+	cfg.Context.MaxLLMCalls = config.Int(800)
+	cfg.Context.TotalMaxLLMCalls = config.Int(800)
+	cfg.Context.MaxToolIterations = config.Int(800)
+	cfg.Context.TotalMaxToolIterations = config.Int(800)
 	var calls atomic.Int32
 	mdl := mockmodel.New("flood2", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if ctx.Err() != nil {

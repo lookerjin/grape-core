@@ -185,19 +185,25 @@ type PlanConfig struct {
 	RequireApproval *bool `yaml:"require_approval"`
 }
 
-// ContextConfig bounds one run. Negative values mean unlimited.
-// Zero on the numeric limits selects the default, except MaxToolCalls,
-// where zero means unlimited.
+// ContextConfig bounds one run.
+// A nil limit uses the documented default. Zero and negative mean unlimited.
 type ContextConfig struct {
-	// MaxLLMCalls bounds model calls for the whole run, including nested
-	// agents. Zero uses 128.
-	MaxLLMCalls int `yaml:"max_llm_calls"`
-	// MaxToolIterations bounds model turns that request tools (one round,
-	// however many calls it contains) for the whole run, including nested
-	// agents. Zero uses 64.
-	MaxToolIterations int `yaml:"max_tool_iterations"`
-	// MaxToolCalls bounds individual tool executions. Zero means unlimited.
-	MaxToolCalls int `yaml:"max_tool_calls"`
+	// MaxLLMCalls is the per-agent model-call limit passed to tRPC.
+	// Nil uses 128. The framework resets this counter on each invocation.
+	MaxLLMCalls *int `yaml:"max_llm_calls"`
+	// MaxToolIterations is the per-agent limit on model turns that request
+	// tools, one round however many calls it contains. Nil uses 64.
+	MaxToolIterations *int `yaml:"max_tool_iterations"`
+	// TotalMaxLLMCalls bounds model calls for the whole run, including
+	// nested agents. Nil uses 128. tRPC has no cross-invocation total.
+	TotalMaxLLMCalls *int `yaml:"total_max_llm_calls"`
+	// TotalMaxToolIterations bounds tool rounds for the whole run,
+	// including nested agents. Nil uses 64.
+	TotalMaxToolIterations *int `yaml:"total_max_tool_iterations"`
+	// MaxToolCalls bounds tool-call attempts for the whole run, including
+	// calls later denied or short-circuited. Nil, zero, and negative mean
+	// unlimited.
+	MaxToolCalls *int `yaml:"max_tool_calls"`
 	// ToolDrainTimeout is how long a cancelled run waits for tool calls
 	// to return before the session is marked poisoned. Zero uses 30s.
 	// ForceReleaseSession is the explicit recovery.
@@ -215,6 +221,12 @@ type ContextConfig struct {
 // ApprovalConfig requires an approval for mutating tools when true.
 type ApprovalConfig struct {
 	Required bool `yaml:"required"`
+}
+
+// Int returns a pointer to n for an optional numeric limit.
+func Int(n int) *int {
+	v := n
+	return &v
 }
 
 // Default returns configuration with built-in defaults applied.
@@ -282,11 +294,17 @@ func (c *Config) applyDefaults() {
 		v := true
 		c.Plan.RequireApproval = &v
 	}
-	if c.Context.MaxLLMCalls == 0 {
-		c.Context.MaxLLMCalls = 128
+	if c.Context.MaxLLMCalls == nil {
+		c.Context.MaxLLMCalls = Int(128)
 	}
-	if c.Context.MaxToolIterations == 0 {
-		c.Context.MaxToolIterations = 64
+	if c.Context.MaxToolIterations == nil {
+		c.Context.MaxToolIterations = Int(64)
+	}
+	if c.Context.TotalMaxLLMCalls == nil {
+		c.Context.TotalMaxLLMCalls = Int(128)
+	}
+	if c.Context.TotalMaxToolIterations == nil {
+		c.Context.TotalMaxToolIterations = Int(64)
 	}
 	if c.Context.ToolDrainTimeout == "" {
 		c.Context.ToolDrainTimeout = "30s"

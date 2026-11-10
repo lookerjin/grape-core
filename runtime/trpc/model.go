@@ -113,9 +113,9 @@ func generationConfig(cfg config.Config) model.GenerationConfig {
 	return gen
 }
 
-func positiveLimit(n int) int {
-	if n < 0 {
+func positiveLimit(n *int) int {
+	if n == nil || *n <= 0 {
 		return 0
 	}
-	return n
+	return *n
 }

@@ -724,8 +724,8 @@ func assertNestedToolDenied(t *testing.T, evil tool.Tool, set tool.ToolSet, call
 	cfg.Approvals.Required = true
 	cfg.Journal.Enabled = false
 	cfg.Model.Generation.Stream = boolPtr(false)
-	cfg.Context.MaxLLMCalls = 12
-	cfg.Context.MaxToolIterations = 12
+	cfg.Context.MaxLLMCalls = config.Int(12)
+	cfg.Context.MaxToolIterations = config.Int(12)
 	mdl := mockmodel.New("bypass-"+callName, func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if hasToolMessage(req) {
 			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
@@ -899,8 +899,8 @@ func TestEmptyIDDoesNotTreatGrapeNameAsRoot(t *testing.T) {
 	cfg.Approvals.Required = true
 	cfg.Journal.Enabled = false
 	cfg.Model.Generation.Stream = boolPtr(false)
-	cfg.Context.MaxLLMCalls = 8
-	cfg.Context.MaxToolIterations = 8
+	cfg.Context.MaxLLMCalls = config.Int(8)
+	cfg.Context.MaxToolIterations = config.Int(8)
 	var ran atomic.Int32
 	var asked atomic.Int32
 	danger := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
@@ -1011,8 +1011,10 @@ func TestNestedLoopHitsRunBudget(t *testing.T) {
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Journal.Enabled = false
 	cfg.Model.Generation.Stream = boolPtr(false)
-	cfg.Context.MaxLLMCalls = 4
-	cfg.Context.MaxToolIterations = 30
+	cfg.Context.MaxLLMCalls = config.Int(30)
+	cfg.Context.TotalMaxLLMCalls = config.Int(4)
+	cfg.Context.MaxToolIterations = config.Int(30)
+	cfg.Context.TotalMaxToolIterations = config.Int(30)
 	cfg.Approvals.Required = true
 	var calls atomic.Int32
 	mdl := mockmodel.New("budget", func(ctx context.Context, req *model.Request) (*model.Response, error) {
@@ -1059,11 +1061,12 @@ func TestNestedLoopHitsRunBudget(t *testing.T) {
 	if calls.Load() > 12 {
 		t.Fatalf("nested loop calls=%d %s", calls.Load(), blob)
 	}
-	if !strings.Contains(blob, "max LLM calls") {
-		t.Fatalf("missing budget error: %s", blob)
-	}
 	if len(events) == 0 || events[len(events)-1].Kind != agent.EventFailed {
 		t.Fatalf("terminal %s", events[len(events)-1].Kind)
+	}
+	body := mustTerminal(t, events[len(events)-1])
+	if body.Reason != agent.ReasonBudgetExceeded || body.Scope != agent.ScopeRun {
+		t.Fatalf("terminal %#v %s", body, blob)
 	}
 }
 
