@@ -3,6 +3,7 @@ package trpcruntime
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -71,6 +72,15 @@ func (st *runState) enterTool() {
 	st.mu.Lock()
 	st.tools++
 	st.mu.Unlock()
+}
+
+func (st *runState) toolBusy() bool {
+	if st == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.tools > 0
 }
 
 func (st *runState) leaveTool() {
@@ -499,13 +509,49 @@ type streamTracking struct {
 	stream tool.StreamableTool
 }
 
+// streamForwardBuffer is an internal queue between a streaming tool and the
+// reader the framework consumes. It is not a caller-facing limit.
+const streamForwardBuffer = 8
+
 func (t streamTracking) StreamableCall(ctx context.Context, args []byte) (*tool.StreamReader, error) {
 	st := stateFrom(ctx)
 	if st != nil {
 		st.enterTool()
-		defer st.leaveTool()
 	}
-	return t.stream.StreamableCall(ctx, args)
+	inner, err := t.stream.StreamableCall(ctx, args)
+	if err != nil || inner == nil {
+		if st != nil {
+			st.leaveTool()
+		}
+		return inner, err
+	}
+	// Leave when the producer finishes or the consumer closes the reader.
+	// StreamableCall itself returns before either of those.
+	out := tool.NewStream(streamForwardBuffer)
+	go forwardStream(inner, out, st)
+	return out.Reader, nil
+}
+
+func forwardStream(inner *tool.StreamReader, out *tool.Stream, st *runState) {
+	defer func() {
+		out.Writer.Close()
+		if st != nil {
+			st.leaveTool()
+		}
+	}()
+	defer inner.Close()
+	for {
+		chunk, err := inner.Recv()
+		if err != nil {
+			if err != io.EOF {
+				_ = out.Writer.Send(tool.StreamChunk{}, err)
+			}
+			return
+		}
+		if out.Writer.Send(chunk, nil) {
+			return
+		}
+	}
 }
 
 func (t streamTracking) StreamInner() bool { return streamInner(t.stream) }

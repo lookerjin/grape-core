@@ -206,7 +206,8 @@ type ContextConfig struct {
 	MaxToolCalls *int `yaml:"max_tool_calls"`
 	// ToolDrainTimeout is how long a cancelled run waits for tool calls
 	// to return before the session is marked poisoned. Zero uses 30s.
-	// ForceReleaseSession is the explicit recovery.
+	// ForceReleaseSession is not safe recovery. It refuses while a tool
+	// may still be running unless the caller sets AcceptConcurrentTools.
 	ToolDrainTimeout string `yaml:"tool_drain_timeout"`
 	// EventHoldTimeout is how long a finished run waits for a consumer
 	// who has not taken an event. The first take cancels that wait.

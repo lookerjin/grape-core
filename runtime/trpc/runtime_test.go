@@ -384,7 +384,7 @@ func TestPoisonedSessionForceRelease(t *testing.T) {
 	if nextErr == nil || !strings.Contains(nextErr.Error(), "poisoned") {
 		t.Fatalf("error %v", nextErr)
 	}
-	if err := rt.ForceReleaseSession("poison"); err != nil {
+	if err := rt.ForceReleaseSession("poison", agent.SessionRelease{UserID: "u", AcceptConcurrentTools: true}); err != nil {
 		t.Fatal(err)
 	}
 	phase.Store(1)
@@ -467,7 +467,7 @@ func TestStaleDrainDoesNotReleaseNextRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
-	if err := rt.ForceReleaseSession("same"); err != nil {
+	if err := rt.ForceReleaseSession("same", agent.SessionRelease{UserID: "u", AcceptConcurrentTools: true}); err != nil {
 		t.Fatal(err)
 	}
 	phase.Store(1)

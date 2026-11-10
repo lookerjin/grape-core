@@ -33,6 +33,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sqlitesession "trpc.group/trpc-go/trpc-agent-go/session/sqlite"
+	trpcskill "trpc.group/trpc-go/trpc-agent-go/skill"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
@@ -144,11 +145,13 @@ type Runtime struct {
 	nested         map[string]map[string]struct{}
 
 	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	locks map[sessionKey]*countedLock
 	// holds is the in-flight drain for a session, keyed so an older run
 	// cannot release or poison the run that replaced it.
-	holds  map[string]*sessionHold
-	active map[*runHandle]struct{}
+	holds     map[sessionKey]*sessionHold
+	active    map[*runHandle]struct{}
+	taskHosts []*TaskHost
+	skills    trpcskill.Repository
 
 	closeOnce sync.Once
 	closeErr  error
@@ -233,8 +236,8 @@ func New(opts Options) (*Runtime, error) {
 		secrets:      secretValues(cfg),
 		maxField:     cfg.Journal.MaxFieldBytes,
 		instruction:  instruction,
-		locks:        map[string]*sync.Mutex{},
-		holds:        map[string]*sessionHold{},
+		locks:        map[sessionKey]*countedLock{},
+		holds:        map[sessionKey]*sessionHold{},
 		fixed:        opts.FixedAgent,
 		subagents:    cloneSpecs(opts.Subagents),
 		nested:       nestedReadIndex(opts.NestedReads),
@@ -636,7 +639,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	default:
 		return nil, agent.Invalid("mode", fmt.Errorf("unsupported mode %q", req.Mode))
 	}
-	unlock, err := rt.lockSession(ctx, req.SessionID)
+	unlock, err := rt.lockSession(ctx, req.UserID, req.SessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -654,17 +657,25 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	st := newRunState(runID, req.SessionID, req.Mode)
 	runCtx = withState(runCtx, st)
 	runCtx = context.WithValue(runCtx, workspaceKey{}, workspace)
-	events, err := rt.runner.Run(
-		runCtx,
-		req.UserID,
-		req.SessionID,
-		model.NewUserMessage(req.Message),
+	runOpts := []trpcagent.RunOption{
 		trpcagent.WithRequestID(runID),
 		trpcagent.WithToolPermissionPolicyFunc(rt.toolPermission),
 		trpcagent.WithRuntimeState(map[string]any{
 			"workspace": workspace,
 			"mode":      string(req.Mode),
 		}),
+	}
+	if req.AgentID != "" {
+		// tRPC resolves the name. An unknown name is an error from the
+		// runner. Grape does not keep its own agent registry.
+		runOpts = append(runOpts, trpcagent.WithAgentByName(req.AgentID))
+	}
+	events, err := rt.runner.Run(
+		runCtx,
+		req.UserID,
+		req.SessionID,
+		model.NewUserMessage(req.Message),
+		runOpts...,
 	)
 	if err != nil {
 		cancel()
@@ -710,7 +721,7 @@ func classifyRunError(err error) error {
 }
 
 func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID string, st *runState, in <-chan *event.Event, out *eventBox, h *runHandle, unlock func()) {
-	defer rt.finishSession(req.SessionID, runID, st, unlock)
+	defer rt.finishSession(req.UserID, req.SessionID, runID, st, unlock)
 	defer out.close()
 	conv := newConverter(runID, req.SessionID, rt.maxField, rt.secrets)
 	terminal := false
@@ -733,7 +744,7 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 			if h != nil {
 				h.noteResult(evt, ctx.Err() == context.Canceled)
 			}
-			rt.finishSession(req.SessionID, runID, st, unlock)
+			rt.finishSession(req.UserID, req.SessionID, runID, st, unlock)
 		}
 		if rt.journal != nil {
 			_ = rt.journal.Append(evt)
@@ -883,14 +894,34 @@ func (rt *Runtime) toolDrainTimeout() time.Duration {
 	return d
 }
 
+// sessionKey is one app, user, and session. tRPC does not serialize
+// concurrent runs, so grape keeps this lock. The entry is removed when
+// its refcount hits zero.
+type sessionKey struct {
+	app     string
+	user    string
+	session string
+}
+
+type countedLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // sessionHold is one run's claim on a session lock while its tools drain.
 type sessionHold struct {
 	runID  string
 	unlock func()
 	err    error
+	st     *runState
 }
 
-func (rt *Runtime) finishSession(id, runID string, st *runState, unlock func()) {
+func (rt *Runtime) sessionOf(user, session string) sessionKey {
+	return sessionKey{app: rt.appName, user: user, session: session}
+}
+
+func (rt *Runtime) finishSession(user, session, runID string, st *runState, unlock func()) {
+	key := rt.sessionOf(user, session)
 	if st == nil {
 		unlock()
 		return
@@ -904,10 +935,11 @@ func (rt *Runtime) finishSession(id, runID string, st *runState, unlock func()) 
 		return
 	}
 	rt.mu.Lock()
-	rt.holds[id] = &sessionHold{
+	rt.holds[key] = &sessionHold{
 		runID:  runID,
 		unlock: unlock,
-		err:    fmt.Errorf("session %s is still finishing tool execution", id),
+		st:     st,
+		err:    fmt.Errorf("session %s is still finishing tool execution", session),
 	}
 	rt.mu.Unlock()
 	timeout := rt.toolDrainTimeout()
@@ -921,11 +953,11 @@ func (rt *Runtime) finishSession(id, runID string, st *runState, unlock func()) 
 		defer timer.Stop()
 		select {
 		case <-done:
-			rt.releaseHold(id, runID)
+			rt.releaseHold(key, runID)
 		case <-timer.C:
 			rt.mu.Lock()
-			if hold := rt.holds[id]; hold != nil && hold.runID == runID {
-				hold.err = fmt.Errorf("session %s is poisoned: a tool did not finish within %s", id, timeout)
+			if hold := rt.holds[key]; hold != nil && hold.runID == runID {
+				hold.err = fmt.Errorf("session %s is poisoned: a tool did not finish within %s", session, timeout)
 			}
 			rt.mu.Unlock()
 		}
@@ -933,33 +965,47 @@ func (rt *Runtime) finishSession(id, runID string, st *runState, unlock func()) 
 }
 
 // ForceReleaseSession drops the current poisoned or draining lock.
-// The stuck tool may still be running. The next Start is allowed.
+// It refuses while a tool, streaming reader, or child may still be running
+// unless AcceptConcurrentTools is set. That flag is not safe recovery.
 // An older run cannot release a later run's lock.
-func (rt *Runtime) ForceReleaseSession(id string) error {
+func (rt *Runtime) ForceReleaseSession(sessionID string, rel agent.SessionRelease) error {
 	if rt == nil {
 		return fmt.Errorf("runtime is nil")
 	}
+	if rel.UserID == "" || sessionID == "" {
+		return agent.Invalid("session", fmt.Errorf("user_id and session_id are required"))
+	}
+	key := rt.sessionOf(rel.UserID, sessionID)
 	rt.mu.Lock()
-	hold := rt.holds[id]
+	hold := rt.holds[key]
 	runID := ""
+	var st *runState
 	if hold != nil {
 		runID = hold.runID
+		st = hold.st
 	}
 	rt.mu.Unlock()
-	if runID == "" || !rt.releaseHold(id, runID) {
-		return fmt.Errorf("session %s is not held", id)
+	busy := st != nil && st.toolBusy()
+	if runID == "" {
+		return fmt.Errorf("session %s is not held", sessionID)
+	}
+	if busy && !rel.AcceptConcurrentTools {
+		return agent.Wrap(agent.ErrSession, "session", fmt.Errorf("session %s has a tool still running; ForceRelease is not safe recovery", sessionID))
+	}
+	if !rt.releaseHold(key, runID) {
+		return fmt.Errorf("session %s is not held", sessionID)
 	}
 	return nil
 }
 
-func (rt *Runtime) releaseHold(id, runID string) bool {
+func (rt *Runtime) releaseHold(key sessionKey, runID string) bool {
 	rt.mu.Lock()
-	hold := rt.holds[id]
+	hold := rt.holds[key]
 	if hold == nil || hold.runID != runID {
 		rt.mu.Unlock()
 		return false
 	}
-	delete(rt.holds, id)
+	delete(rt.holds, key)
 	unlock := hold.unlock
 	rt.mu.Unlock()
 	if unlock != nil {
@@ -968,28 +1014,43 @@ func (rt *Runtime) releaseHold(id, runID string) bool {
 	return true
 }
 
-func (rt *Runtime) lockSession(ctx context.Context, id string) (func(), error) {
+func (rt *Runtime) lockSession(ctx context.Context, user, session string) (func(), error) {
+	key := rt.sessionOf(user, session)
 	rt.mu.Lock()
-	if hold := rt.holds[id]; hold != nil && hold.err != nil {
+	if hold := rt.holds[key]; hold != nil && hold.err != nil {
 		err := hold.err
 		rt.mu.Unlock()
 		return nil, agent.Wrap(agent.ErrSession, "session", err)
 	}
-	mu := rt.locks[id]
-	if mu == nil {
-		mu = &sync.Mutex{}
-		rt.locks[id] = mu
+	lk := rt.locks[key]
+	if lk == nil {
+		lk = &countedLock{}
+		rt.locks[key] = lk
 	}
+	lk.refs++
 	rt.mu.Unlock()
-	if rt.reject {
-		if !mu.TryLock() {
-			return nil, agent.Wrap(agent.ErrSession, "session", fmt.Errorf("session %s already has an active run", id))
+	drop := func() {
+		rt.mu.Lock()
+		lk.refs--
+		if lk.refs <= 0 {
+			delete(rt.locks, key)
 		}
-		return mu.Unlock, nil
+		rt.mu.Unlock()
+	}
+	unlock := func() {
+		lk.mu.Unlock()
+		drop()
+	}
+	if rt.reject {
+		if !lk.mu.TryLock() {
+			drop()
+			return nil, agent.Wrap(agent.ErrSession, "session", fmt.Errorf("session %s already has an active run", session))
+		}
+		return unlock, nil
 	}
 	locked := make(chan struct{})
 	go func() {
-		mu.Lock()
+		lk.mu.Lock()
 		close(locked)
 	}()
 	ticker := time.NewTicker(5 * time.Millisecond)
@@ -997,24 +1058,26 @@ func (rt *Runtime) lockSession(ctx context.Context, id string) (func(), error) {
 	for {
 		select {
 		case <-locked:
-			return mu.Unlock, nil
+			return unlock, nil
 		case <-ctx.Done():
 			go func() {
 				<-locked
-				mu.Unlock()
+				lk.mu.Unlock()
+				drop()
 			}()
 			return nil, agent.Wrap(agent.ErrRunCancelled, "session", ctx.Err())
 		case <-ticker.C:
 			rt.mu.Lock()
 			var err error
-			if hold := rt.holds[id]; hold != nil {
+			if hold := rt.holds[key]; hold != nil {
 				err = hold.err
 			}
 			rt.mu.Unlock()
 			if err != nil {
 				go func() {
 					<-locked
-					mu.Unlock()
+					lk.mu.Unlock()
+					drop()
 				}()
 				return nil, agent.Wrap(agent.ErrSession, "session", err)
 			}
@@ -1074,6 +1137,12 @@ func (rt *Runtime) Close() error {
 		return nil
 	}
 	rt.closeOnce.Do(func() {
+		rt.mu.Lock()
+		hosts := append([]*TaskHost(nil), rt.taskHosts...)
+		rt.mu.Unlock()
+		for _, host := range hosts {
+			host.cancelAll()
+		}
 		rt.stopPumps()
 		if rt.runner != nil {
 			rt.closeErr = rt.runner.Close()

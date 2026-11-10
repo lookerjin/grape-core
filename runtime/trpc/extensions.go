@@ -10,7 +10,6 @@ import (
 	"github.com/lookerjin/grape-core/mcp"
 	"github.com/lookerjin/grape-core/plugin"
 	"github.com/lookerjin/grape-core/rules"
-	"github.com/lookerjin/grape-core/skill"
 	trpcskill "trpc.group/trpc-go/trpc-agent-go/skill"
 )
 
@@ -103,9 +102,11 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 		}
 		rt.hookRunner = hooks.NewRunner(rt.exec, hookSpecs, rt.cfg.Hooks.MaxConcurrent, timeout)
 	}
-	if _, err := skill.Discover(rt.cfg.Plugins.Conflict, rt.skillRoots...); err != nil {
+	repo, err := newSkillSnapshot(rt.cfg.Plugins.Conflict, rt.skillRoots)
+	if err != nil {
 		return err
 	}
+	rt.skills = repo
 	text, err := rt.ruleTextFor(rt.cfg.Workspace.Root)
 	if err != nil {
 		return err
@@ -136,17 +137,11 @@ func (rt *Runtime) ruleTextFor(workspace string) (string, error) {
 	return rules.Summary(loaded), nil
 }
 
-func (rt *Runtime) skillRepository() (*trpcskill.FSRepository, error) {
-	var roots []string
-	for _, root := range rt.skillRoots {
-		if _, err := os.Stat(root); err == nil {
-			roots = append(roots, root)
-		}
-	}
-	if len(roots) == 0 {
+func (rt *Runtime) skillRepository() (trpcskill.Repository, error) {
+	if rt == nil {
 		return nil, nil
 	}
-	return trpcskill.NewFSRepository(roots...)
+	return rt.skills, nil
 }
 
 // Plugins returns the component snapshot captured when the runtime was built.

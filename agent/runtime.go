@@ -69,6 +69,14 @@ type SessionInfo struct {
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
+// SessionRelease names the session to unlock and whether a tool may still
+// be running. AcceptConcurrentTools is not safe recovery: the next run can
+// overlap a tool or child that has not finished.
+type SessionRelease struct {
+	UserID                string
+	AcceptConcurrentTools bool
+}
+
 // Task is a background task whose lifetime is owned by a TaskHost, not by
 // the caller context that requested it.
 type Task struct {

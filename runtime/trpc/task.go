@@ -28,7 +28,65 @@ func NewTaskHost(rt *Runtime) (*TaskHost, error) {
 	if err := os.MkdirAll(filepath.Dir(index), 0o755); err != nil {
 		return nil, err
 	}
-	return &TaskHost{rt: rt, index: index, cancel: map[string]context.CancelFunc{}}, nil
+	h := &TaskHost{rt: rt, index: index, cancel: map[string]context.CancelFunc{}}
+	if err := h.normalize(); err != nil {
+		return nil, err
+	}
+	rt.mu.Lock()
+	rt.taskHosts = append(rt.taskHosts, h)
+	rt.mu.Unlock()
+	return h, nil
+}
+
+// normalize marks tasks left running by a previous process as failed and
+// drops tasks that had already finished.
+func (h *TaskHost) normalize() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	tasks, err := h.loadLocked()
+	if err != nil {
+		return err
+	}
+	changed := false
+	now := time.Now().UTC()
+	for id, task := range tasks {
+		switch task.Status {
+		case "completed", "failed", "cancelled":
+			delete(tasks, id)
+			changed = true
+		default:
+			task.Status = "failed"
+			task.Error = "interrupted by previous runtime restart"
+			task.UpdatedAt = now
+			tasks[id] = task
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return h.writeLocked(tasks)
+}
+
+func (h *TaskHost) cancelAll() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(h.cancel))
+	for _, cancel := range h.cancel {
+		cancels = append(cancels, cancel)
+	}
+	h.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (h *TaskHost) clearCancel(id string) {
+	h.mu.Lock()
+	delete(h.cancel, id)
+	h.mu.Unlock()
 }
 
 // Start launches req on a host-owned context and returns immediately.
@@ -46,6 +104,7 @@ func (h *TaskHost) Start(req agent.RunRequest) (agent.Task, error) {
 	h.cancel[task.ID] = cancel
 	h.mu.Unlock()
 	if err := h.save(task); err != nil {
+		h.clearCancel(task.ID)
 		cancel()
 		return agent.Task{}, err
 	}
@@ -74,6 +133,7 @@ func (h *TaskHost) Get(id string) (agent.Task, bool) {
 }
 
 func (h *TaskHost) run(ctx context.Context, task agent.Task, req agent.RunRequest) {
+	defer h.clearCancel(task.ID)
 	handle, err := h.rt.Start(ctx, req)
 	if err != nil {
 		task.Status = "failed"
@@ -84,16 +144,27 @@ func (h *TaskHost) run(ctx context.Context, task agent.Task, req agent.RunReques
 	}
 	task.RunID = handle.ID()
 	_ = h.save(task)
-	status := "completed"
-	for evt := range handle.Events() {
-		if evt.Kind == agent.EventFailed {
-			status = "failed"
+	for range handle.Events() {
+	}
+	// The stream can close without the terminal when the runtime is closed.
+	// Status is the result after the run stops.
+	switch handle.Status().Status {
+	case string(agent.EventCancelled):
+		task.Status = "cancelled"
+	case string(agent.EventFailed):
+		task.Status = "failed"
+		if task.Error == "" {
+			task.Error = handle.Status().Error
 		}
-		if evt.Kind == agent.EventCancelled {
-			status = "cancelled"
+	case string(agent.EventCompleted):
+		task.Status = "completed"
+	default:
+		if ctx.Err() != nil {
+			task.Status = "cancelled"
+		} else {
+			task.Status = "failed"
 		}
 	}
-	task.Status = status
 	task.UpdatedAt = time.Now().UTC()
 	_ = h.save(task)
 }
@@ -106,6 +177,10 @@ func (h *TaskHost) save(task agent.Task) error {
 		return err
 	}
 	tasks[task.ID] = task
+	return h.writeLocked(tasks)
+}
+
+func (h *TaskHost) writeLocked(tasks map[string]agent.Task) error {
 	raw, err := json.MarshalIndent(tasks, "", "  ")
 	if err != nil {
 		return err

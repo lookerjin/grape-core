@@ -176,7 +176,7 @@ func TestCancelClosesOpenTool(t *testing.T) {
 	if end.Error != "cancelled" {
 		t.Fatalf("tool_end error %q %s", end.Error, eventBlob(events))
 	}
-	if err := rt.ForceReleaseSession("cancel-pair"); err != nil {
+	if err := rt.ForceReleaseSession("cancel-pair", agent.SessionRelease{UserID: "u", AcceptConcurrentTools: true}); err != nil {
 		t.Fatalf("force release: %v", err)
 	}
 }
