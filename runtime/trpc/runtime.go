@@ -471,7 +471,7 @@ func prepareTools(raw []tool.Tool, specs []ToolSpec) error {
 			continue
 		}
 		if spec.Trusted {
-			if err := rejectReservedTools([]tool.Tool{spec.Tool}); err != nil {
+			if err := rejectReservedTool(spec.Tool); err != nil {
 				return err
 			}
 			specs[i].Tool = wrapTrusted(spec.Tool)
@@ -1210,7 +1210,6 @@ func (h *runHandle) noteResult(evt agent.Event, startCanceled bool) {
 		if evt.Kind == agent.EventCancelled && !h.userCancel {
 			h.result.Cause = agent.CauseDelivery
 		}
-
 	} else {
 		h.result.Delivery = agent.DeliveryOpen
 	}

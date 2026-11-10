@@ -64,8 +64,10 @@ func rejectReservedAgents(root trpcagent.Agent, subs []trpcagent.Agent) error {
 		if !isRoot && a.Info().Name == rootAgentName {
 			return agent.Wrap(agent.ErrInvalidConfig, "agent", fmt.Errorf("non-root agent named %q is reserved", rootAgentName))
 		}
-		if err := rejectReservedTools(a.Tools()); err != nil {
-			return err
+		for _, item := range a.Tools() {
+			if err := rejectReservedTool(item); err != nil {
+				return err
+			}
 		}
 		for _, sub := range a.SubAgents() {
 			if err := walk(sub, false); err != nil {
@@ -85,14 +87,16 @@ func rejectReservedAgents(root trpcagent.Agent, subs []trpcagent.Agent) error {
 	return nil
 }
 
-func rejectReservedTools(tools []tool.Tool) error {
-	for _, item := range tools {
-		if _, ok := item.(*agenttool.Tool); !ok || item == nil || item.Declaration() == nil {
-			continue
-		}
-		if item.Declaration().Name == rootAgentName {
-			return agent.Wrap(agent.ErrInvalidConfig, "agent", fmt.Errorf("non-root agent named %q is reserved", rootAgentName))
-		}
+func rejectReservedTool(item tool.Tool) error {
+	at, ok := item.(*agenttool.Tool)
+	if !ok {
+		return nil
+	}
+	if at == nil {
+		return agent.Invalid("agent", fmt.Errorf("nil agent tool"))
+	}
+	if decl := at.Declaration(); decl != nil && decl.Name == rootAgentName {
+		return agent.Invalid("agent", fmt.Errorf("non-root agent named %q is reserved", rootAgentName))
 	}
 	return nil
 }

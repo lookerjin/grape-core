@@ -146,6 +146,9 @@ func rejectRawAgentTool(item tool.Tool) error {
 		return agent.Invalid("tool", fmt.Errorf("untrusted tools must implement Call"))
 	}
 	if _, ok := item.(*agenttool.Tool); ok {
+		if err := rejectReservedTool(item); err != nil {
+			return err
+		}
 		return agent.Invalid("tool", fmt.Errorf("a raw agent tool requires ToolSpec.Trusted; register child agents through Options.Subagents"))
 	}
 	return nil
