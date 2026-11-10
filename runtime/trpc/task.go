@@ -3,6 +3,7 @@ package trpcruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,6 +21,7 @@ type TaskHost struct {
 
 	mu        sync.Mutex
 	cancel    map[string]context.CancelFunc
+	closed    bool
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 }
@@ -30,6 +32,14 @@ const taskGoroutineWait = 5 * time.Second
 
 // NewTaskHost stores task status next to the runtime data directory.
 func NewTaskHost(rt *Runtime) (*TaskHost, error) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.closed {
+		return nil, errors.New("runtime closed")
+	}
+	if rt.taskHost != nil {
+		return rt.taskHost, nil
+	}
 	index := filepath.Join(filepath.Dir(rt.cfg.Session.Path), "tasks.json")
 	if err := os.MkdirAll(filepath.Dir(index), 0o755); err != nil {
 		return nil, err
@@ -38,9 +48,7 @@ func NewTaskHost(rt *Runtime) (*TaskHost, error) {
 	if err := h.normalize(); err != nil {
 		return nil, err
 	}
-	rt.mu.Lock()
-	rt.taskHosts = append(rt.taskHosts, h)
-	rt.mu.Unlock()
+	rt.taskHost = h
 	return h, nil
 }
 
@@ -84,14 +92,14 @@ func (h *TaskHost) Close() {
 		done := make(chan struct{})
 		go func() {
 			h.wg.Wait()
+			h.rt.mu.Lock()
+			h.rt.taskHost = nil
+			h.rt.mu.Unlock()
 			close(done)
 		}()
 		select {
 		case <-done:
 		case <-time.After(taskGoroutineWait):
-		}
-		if h.rt != nil {
-			h.rt.removeTaskHost(h)
 		}
 	})
 }
@@ -101,6 +109,7 @@ func (h *TaskHost) cancelAll() {
 		return
 	}
 	h.mu.Lock()
+	h.closed = true
 	cancels := make([]context.CancelFunc, 0, len(h.cancel))
 	for _, cancel := range h.cancel {
 		cancels = append(cancels, cancel)
@@ -113,6 +122,9 @@ func (h *TaskHost) cancelAll() {
 
 func (h *TaskHost) clearCancel(id string) {
 	h.mu.Lock()
+	if cancel := h.cancel[id]; cancel != nil {
+		cancel()
+	}
 	delete(h.cancel, id)
 	h.mu.Unlock()
 }
@@ -129,14 +141,20 @@ func (h *TaskHost) Start(req agent.RunRequest) (agent.Task, error) {
 		UpdatedAt: time.Now().UTC(),
 	}
 	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		cancel()
+		return agent.Task{}, errors.New("task host closed")
+	}
+	h.wg.Add(1)
 	h.cancel[task.ID] = cancel
 	h.mu.Unlock()
 	if err := h.save(task); err != nil {
 		h.clearCancel(task.ID)
+		h.wg.Done()
 		cancel()
 		return agent.Task{}, err
 	}
-	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
 		h.run(ctx, task, req)
@@ -170,6 +188,9 @@ func (h *TaskHost) run(ctx context.Context, task agent.Task, req agent.RunReques
 	if err != nil {
 		task.Status = "failed"
 		task.Error = err.Error()
+		if ctx.Err() != nil {
+			task.Status = "cancelled"
+		}
 		task.UpdatedAt = time.Now().UTC()
 		_ = h.save(task)
 		return
@@ -180,13 +201,15 @@ func (h *TaskHost) run(ctx context.Context, task agent.Task, req agent.RunReques
 	}
 	// The stream can close without the terminal when the runtime is closed.
 	// Status is the result after the run stops.
-	switch handle.Status().Status {
+	<-handle.(*runHandle).resultDone
+	status := handle.Status()
+	switch status.Status {
 	case string(agent.EventCancelled):
 		task.Status = "cancelled"
 	case string(agent.EventFailed):
 		task.Status = "failed"
 		if task.Error == "" {
-			task.Error = handle.Status().Error
+			task.Error = status.Error
 		}
 	case string(agent.EventCompleted):
 		task.Status = "completed"

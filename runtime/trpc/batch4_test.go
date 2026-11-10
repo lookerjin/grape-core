@@ -289,10 +289,10 @@ func TestTaskReloadAndClose(t *testing.T) {
 		got, ok = host2.Get(task.ID)
 		if ok && (got.Status == "cancelled" || got.Status == "failed") {
 			rt2.mu.Lock()
-			left := len(rt2.taskHosts)
+			left := rt2.taskHost
 			rt2.mu.Unlock()
-			if left != 0 {
-				t.Fatalf("task hosts left %d", left)
+			if left != nil {
+				t.Fatal("task host still registered")
 			}
 			return
 		}

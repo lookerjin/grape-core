@@ -48,11 +48,13 @@ const defaultAppName = "grape-core"
 // root's tools. Nested Subagents are also built by grape and exposed
 // as agent tools, not as transfer_to_agent.
 type SubagentSpec struct {
-	Name            string
-	Instruction     string
-	Model           model.Model
-	Tools           []tool.Tool
-	ToolSpecs       []ToolSpec
+	Name        string
+	Instruction string
+	Model       model.Model
+	Tools       []tool.Tool
+	ToolSpecs   []ToolSpec
+	// TrustToolSets authorizes provider discovery and provider-owned tools, including their own permission checkers.
+	TrustToolSets   bool
 	ToolSets        []tool.ToolSet
 	RefreshToolSets bool
 	Subagents       []SubagentSpec
@@ -148,11 +150,13 @@ type Runtime struct {
 	locks map[sessionKey]*countedLock
 	// holds is the in-flight drain for a session, keyed so an older run
 	// cannot release or poison the run that replaced it.
-	holds     map[sessionKey]*sessionHold
-	active    map[*runHandle]struct{}
-	taskHosts []*TaskHost
-	skills    trpcskill.Repository
+	holds    map[sessionKey]*sessionHold
+	active   map[*runHandle]struct{}
+	taskHost *TaskHost
+	starting sync.WaitGroup
+	skills   trpcskill.Repository
 
+	closed    bool
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -309,9 +313,9 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		}
 	}
 	allowWrite := rt.cfg.Workspace.Permission != agent.PermissionReadOnly
-	tools, err := rt.workspaceTools(ws, allowWrite)
-	if err != nil {
-		return nil, err
+	var tools []tool.Tool
+	if !rt.cfg.Workspace.DisableCodingTools {
+		tools = rt.workspaceTools(ws, allowWrite)
 	}
 	for _, spec := range rt.specs {
 		if spec.Tool == nil {
@@ -348,9 +352,6 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	}
 	if mode == string(agent.ModeGoal) {
 		retries := rt.cfg.Goal.MaxIterations
-		if retries <= 0 {
-			retries = 1
-		}
 		opts = append(opts, llmagent.WithExtensions(goal.New(goal.WithMaxRetries(retries))))
 	}
 	// Spec subagents are tRPC AgentTools. WithSubAgents would also
@@ -480,6 +481,9 @@ func (rt *Runtime) prepareSurface(trusted []trpcagent.Agent) error {
 
 func (rt *Runtime) prepareSpecs(specs []SubagentSpec) error {
 	for i := range specs {
+		if len(specs[i].ToolSets) > 0 && !specs[i].TrustToolSets {
+			return agent.Invalid("subagent.tool_sets", fmt.Errorf("provider code requires TrustToolSets"))
+		}
 		if strings.TrimSpace(specs[i].Name) == "" {
 			return agent.Invalid("subagent", fmt.Errorf("name is required"))
 		}
@@ -643,6 +647,15 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	if err != nil {
 		return nil, err
 	}
+	rt.mu.Lock()
+	if rt.closed {
+		rt.mu.Unlock()
+		unlock()
+		return nil, agent.Invalid("start", fmt.Errorf("runtime is closed"))
+	}
+	rt.starting.Add(1)
+	rt.mu.Unlock()
+	defer rt.starting.Done()
 	workspace := req.Workspace
 	if workspace == "" {
 		workspace = rt.cfg.Workspace.Root
@@ -685,10 +698,11 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	box := newEventBox(256)
 	ch := make(chan agent.Event, 3)
 	h := &runHandle{
-		id:     runID,
-		events: ch,
-		box:    box,
-		stop:   make(chan struct{}),
+		id:         runID,
+		events:     ch,
+		box:        box,
+		stop:       make(chan struct{}),
+		resultDone: make(chan struct{}),
 		cancel: func() error {
 			cancel()
 			if managed, ok := rt.runner.(runner.ManagedRunner); ok {
@@ -916,21 +930,6 @@ type sessionHold struct {
 	st     *runState
 }
 
-func (rt *Runtime) removeTaskHost(h *TaskHost) {
-	if rt == nil || h == nil {
-		return
-	}
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	kept := make([]*TaskHost, 0, len(rt.taskHosts))
-	for _, item := range rt.taskHosts {
-		if item != h {
-			kept = append(kept, item)
-		}
-	}
-	rt.taskHosts = kept
-}
-
 func (rt *Runtime) sessionOf(user, session string) sessionKey {
 	return sessionKey{app: rt.appName, user: user, session: session}
 }
@@ -1032,6 +1031,10 @@ func (rt *Runtime) releaseHold(key sessionKey, runID string) bool {
 func (rt *Runtime) lockSession(ctx context.Context, user, session string) (func(), error) {
 	key := rt.sessionOf(user, session)
 	rt.mu.Lock()
+	if rt.closed {
+		rt.mu.Unlock()
+		return nil, agent.Invalid("start", fmt.Errorf("runtime is closed"))
+	}
 	if hold := rt.holds[key]; hold != nil && hold.err != nil {
 		err := hold.err
 		rt.mu.Unlock()
@@ -1153,9 +1156,11 @@ func (rt *Runtime) Close() error {
 	}
 	rt.closeOnce.Do(func() {
 		rt.mu.Lock()
-		hosts := append([]*TaskHost(nil), rt.taskHosts...)
+		rt.closed = true
+		host := rt.taskHost
 		rt.mu.Unlock()
-		for _, host := range hosts {
+		rt.starting.Wait()
+		if host != nil {
 			host.Close()
 		}
 		rt.stopPumps()
@@ -1197,6 +1202,7 @@ type runHandle struct {
 
 	mu           sync.Mutex
 	result       agent.RunStatus
+	resultDone   chan struct{}
 	hasResult    bool
 	userCancel   bool
 	terminalSent bool
@@ -1214,6 +1220,10 @@ func (h *runHandle) noteResult(evt agent.Event, startCanceled bool) {
 		return
 	}
 	h.hasResult = true
+	delivery := h.result.Delivery
+	if h.resultDone != nil {
+		defer close(h.resultDone)
+	}
 	h.result = agent.RunStatus{
 		Status:  body.Status,
 		Error:   body.Error,
@@ -1227,7 +1237,12 @@ func (h *runHandle) noteResult(evt agent.Event, startCanceled bool) {
 	if evt.Kind == agent.EventCancelled && h.result.Cause == "" && (h.userCancel || startCanceled) {
 		h.result.Cause = agent.CauseUser
 	}
-	if h.terminalSent {
+	if delivery == agent.DeliveryAbandoned {
+		h.result.Delivery = delivery
+		if evt.Kind == agent.EventCancelled && !h.userCancel {
+			h.result.Cause = agent.CauseDelivery
+		}
+	} else if h.terminalSent {
 		h.result.Delivery = agent.DeliveryDelivered
 	} else {
 		h.result.Delivery = agent.DeliveryOpen
@@ -1253,17 +1268,8 @@ func (h *runHandle) noteDeliveryClosed() {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.hasResult {
-		if h.result.Delivery != agent.DeliveryDelivered {
-			h.result.Delivery = agent.DeliveryAbandoned
-		}
-		return
-	}
-	h.hasResult = true
-	h.result = agent.RunStatus{
-		Status:   string(agent.EventCancelled),
-		Cause:    agent.CauseDelivery,
-		Delivery: agent.DeliveryAbandoned,
+	if h.result.Delivery != agent.DeliveryDelivered {
+		h.result.Delivery = agent.DeliveryAbandoned
 	}
 }
 
@@ -1274,7 +1280,11 @@ func (h *runHandle) Status() agent.RunStatus {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if !h.hasResult {
-		return agent.RunStatus{Status: agent.StatusPending, Delivery: agent.DeliveryOpen}
+		delivery := h.result.Delivery
+		if delivery == "" {
+			delivery = agent.DeliveryOpen
+		}
+		return agent.RunStatus{Status: agent.StatusPending, Delivery: delivery}
 	}
 	return h.result
 }

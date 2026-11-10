@@ -127,6 +127,12 @@ func mergeValue(base, overlay any) any {
 
 // Validate checks enumerated fields and duration syntax.
 func (c Config) Validate() error {
+	if c.Goal.Promise != "" && c.Goal.Promise != "<promise>DONE</promise>" {
+		return agent.Invalid("goal.promise", fmt.Errorf("custom promise markers are unsupported; use the native update_goal tool"))
+	}
+	if c.Goal.MaxIterations < 0 {
+		return agent.Invalid("goal.max_iterations", fmt.Errorf("must be non-negative"))
+	}
 	switch c.Runtime.Provider {
 	case "", "trpc":
 	default:

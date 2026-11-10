@@ -65,9 +65,7 @@ func TestReadOnlyRejectsCommand(t *testing.T) {
 }
 
 func TestManagedSandboxDoesNotHideHostReads(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Fatal("bubblewrap is required to verify host-read behavior")
-	}
+	requireLinuxSandbox(t)
 	dir := t.TempDir()
 	secret := filepath.Join(t.TempDir(), "secret.txt")
 	const secretText = "super-secret-value"
@@ -103,9 +101,7 @@ func TestManagedSandboxDoesNotHideHostReads(t *testing.T) {
 }
 
 func TestManagedSandboxDeniesHostListener(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Fatal("bubblewrap is required to verify network isolation")
-	}
+	requireLinuxSandbox(t)
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Fatal("python3 is required to dial the test listener")
 	}
@@ -153,9 +149,7 @@ func TestManagedSandboxDeniesHostListener(t *testing.T) {
 }
 
 func TestManagedSandboxDeniesOutsideWrite(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bubblewrap is not installed; managed sandbox was not executed")
-	}
+	requireLinuxSandbox(t)
 	dir := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "escape.txt")
 	cfg := config.Default()
@@ -183,9 +177,7 @@ func TestManagedSandboxDeniesOutsideWrite(t *testing.T) {
 }
 
 func TestManagedSandboxMasksSensitivePathOnly(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Fatal("bubblewrap is required to verify sensitive path masks")
-	}
+	requireLinuxSandbox(t)
 	home := t.TempDir()
 	sshDir := filepath.Join(home, ".ssh")
 	if err := os.MkdirAll(sshDir, 0o700); err != nil {
@@ -274,6 +266,7 @@ func TestManagedCommandDoesNotInheritHostSecrets(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("bwrap verification is Linux")
 	}
+	requireLinuxSandbox(t)
 	t.Setenv("FAKE_API_KEY", "host-secret-value")
 	ws := t.TempDir()
 	cfg := config.Default()
@@ -310,4 +303,16 @@ func TestManagedCommandDoesNotInheritHostSecrets(t *testing.T) {
 
 func shellSingle(path string) string {
 	return "'" + strings.ReplaceAll(path, "'", `'\''`) + "'"
+}
+
+// Probe the test environment independently of the implementation under test.
+func requireLinuxSandbox(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return
+	}
+	out, err := exec.Command("bwrap", "--ro-bind", "/", "/", "--unshare-net", "--", "/bin/true").CombinedOutput()
+	if err != nil {
+		t.Skipf("Linux network namespace unavailable: %v %s", err, out)
+	}
 }

@@ -1,7 +1,6 @@
 package trpcruntime
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/lookerjin/grape-core/agent"
@@ -20,68 +19,7 @@ type NestedRead struct {
 	Tool  string
 }
 
-// grapeReadLevel is implemented only by grape's own tool types. The method
-// is unexported, so another module cannot satisfy the check.
-type grapeReadLevel interface {
-	grapeReadLevel() bool
-}
-
-// builtinReadTool marks a grape-built read tool. Identity is the concrete
-// type, not the tool's name or description.
-type builtinReadTool struct {
-	inner tool.CallableTool
-}
-
-func (t builtinReadTool) grapeReadLevel() bool { return true }
-
-func (t builtinReadTool) Declaration() *tool.Declaration {
-	if t.inner == nil {
-		return nil
-	}
-	return t.inner.Declaration()
-}
-
-func (t builtinReadTool) Call(ctx context.Context, args []byte) (any, error) {
-	return t.inner.Call(ctx, args)
-}
-
-func (rt *Runtime) asRead(item tool.Tool) tool.Tool {
-	callable, ok := item.(tool.CallableTool)
-	if !ok {
-		return item
-	}
-	return &builtinReadTool{inner: callable}
-}
-
-// grapeReadTool wraps a read-level tool grape constructed, such as a
-// knowledge skill tool. The type is unexported, so another module cannot
-// build a value that passes the nested read check.
-type grapeReadTool struct {
-	inner tool.CallableTool
-}
-
-func (t *grapeReadTool) Declaration() *tool.Declaration {
-	if t == nil || t.inner == nil {
-		return nil
-	}
-	return t.inner.Declaration()
-}
-
-func (t *grapeReadTool) Call(ctx context.Context, args []byte) (any, error) {
-	return t.inner.Call(ctx, args)
-}
-
-func wrapGrapeRead(item tool.Tool) tool.Tool {
-	callable, ok := item.(tool.CallableTool)
-	if !ok || item == nil {
-		return item
-	}
-	return &grapeReadTool{inner: callable}
-}
-
-func (t hostMCPTool) grapeReadLevel() bool {
-	return t.kind == "read"
-}
+func (rt *Runtime) asRead(item tool.Tool) tool.Tool { return bindTool(item, "read", false) }
 
 func nestedReadIndex(entries []NestedRead) map[string]map[string]struct{} {
 	if len(entries) == 0 {
@@ -110,28 +48,6 @@ func (rt *Runtime) allowNestedRead(agentName, toolName string) bool {
 	}
 	_, ok := tools[toolName]
 	return ok
-}
-
-// unwrapGrape removes only wrappers this package constructs. It does not
-// follow Original or any other exported unwrap method.
-func unwrapGrape(item tool.Tool) tool.Tool {
-	for i := 0; item != nil && i < 8; i++ {
-		switch inner := item.(type) {
-		case trackingTool:
-			if inner.inner == nil {
-				return item
-			}
-			item = inner.inner
-		case kindedTool:
-			if inner.inner == nil {
-				return item
-			}
-			item = inner.inner
-		default:
-			return item
-		}
-	}
-	return item
 }
 
 func rejectSpecNames(specs []SubagentSpec) error {

@@ -21,8 +21,8 @@ func (rt *Runtime) toolPermission(ctx context.Context, req *tool.PermissionReque
 	if rt == nil || req == nil {
 		return tool.DenyPermission("missing permission request"), nil
 	}
-	item := unwrapTracking(frameworkNamed(req.Tool))
-	if _, ok := item.(interface{ grapeTrusted() }); ok {
+	item := frameworkNamed(req.Tool)
+	if t, ok := adapted(item); ok && t.trusted {
 		return tool.AllowPermission(), nil
 	}
 	name := req.ToolName
@@ -75,12 +75,12 @@ func approvalTarget(name string, args []byte) (detail, path string) {
 // isGrapeRead reports grape's own read types. A same-sized foreign tool
 // does not qualify, and neither does a caller Original wrapper.
 func isGrapeRead(item tool.Tool) bool {
-	switch unwrapGrape(frameworkNamed(item)).(type) {
-	case *builtinReadTool, *grapeReadTool:
-		return true
+	if t, ok := adapted(item); ok {
+		return t.kind == "read"
+	}
+	switch t := item.(type) {
 	case *hostMCPTool:
-		mcpTool := unwrapGrape(frameworkNamed(item)).(*hostMCPTool)
-		return mcpTool != nil && mcpTool.kind == "read"
+		return t != nil && t.kind == "read"
 	case *skilltool.LoadTool, *skilltool.ListDocsTool, *skilltool.SelectDocsTool:
 		return true
 	default:
@@ -97,11 +97,8 @@ func (rt *Runtime) toolKind(ctx context.Context, item tool.Tool, name string) st
 	if rt.allowNestedRead(agentName, name) {
 		return "read"
 	}
-	if kind, ok := labeledKind(item); ok {
-		if kind == "" {
-			return "side_effect"
-		}
-		return kind
+	if t, ok := adapted(item); ok {
+		return t.kind
 	}
 	if isGrapeRead(item) {
 		return "read"
@@ -116,28 +113,8 @@ func (rt *Runtime) toolKind(ctx context.Context, item tool.Tool, name string) st
 	}
 }
 
-// unwrapTracking removes only the in-flight counter wrapper.
-// Kind tags stay visible so the policy can read them.
-func unwrapTracking(item tool.Tool) tool.Tool {
-	for i := 0; item != nil && i < 8; i++ {
-		switch current := item.(type) {
-		case streamTracking:
-			if current.inner == nil {
-				return item
-			}
-			item = current.inner
-		case trackingTool:
-			if current.inner == nil {
-				return item
-			}
-			item = current.inner
-		default:
-			return item
-		}
-	}
-	return item
-}
-
+// v1.12.0 passes its internal NamedTool for ToolSet entries. It exposes no
+// public semantic unwrap. Verify the wrapper type before trusting Original.
 func frameworkNamed(item tool.Tool) tool.Tool {
 	for i := 0; item != nil && i < 4; i++ {
 		value := reflect.ValueOf(item)
@@ -148,12 +125,11 @@ func frameworkNamed(item tool.Tool) tool.Tool {
 		if typ.PkgPath() != "trpc.group/trpc-go/trpc-agent-go/internal/tool" || typ.Name() != "NamedTool" {
 			return item
 		}
-		method := value.MethodByName("Original")
-		if !method.IsValid() || method.Type().NumIn() != 0 || method.Type().NumOut() != 1 {
+		named, ok := item.(interface{ Original() tool.Tool })
+		if !ok {
 			return item
 		}
-		out := method.Call(nil)
-		inner, _ := out[0].Interface().(tool.Tool)
+		inner := named.Original()
 		if inner == nil {
 			return item
 		}
@@ -182,6 +158,9 @@ func rejectUntrustedAgentTools(tools []tool.Tool, specs []ToolSpec) error {
 func rejectRawAgentTool(item tool.Tool) error {
 	if item == nil {
 		return nil
+	}
+	if _, ok := item.(tool.CallableTool); !ok {
+		return agent.Invalid("tool", fmt.Errorf("untrusted tools must implement Call"))
 	}
 	if _, ok := item.(*agenttool.Tool); ok {
 		return agent.Invalid("tool", fmt.Errorf("a raw agent tool requires ToolSpec.Trusted; register child agents through Options.Subagents"))

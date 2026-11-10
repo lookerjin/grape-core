@@ -311,7 +311,7 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 	return tools
 }
 
-func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) ([]tool.Tool, error) {
+func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) []tool.Tool {
 	tools := rt.fileTools(workspace, allowWrite)
 	tools = append(tools,
 		kindTool(function.NewFunctionTool(
@@ -342,7 +342,7 @@ func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) ([]tool.Too
 			function.WithDescription("Read-only git diff. Does not add, commit, push, reset, or clean."),
 		)),
 	)
-	return tools, nil
+	return tools
 }
 
 func (rt *Runtime) runCommand(ctx context.Context, in cmdIn) (cmdOut, error) {
@@ -377,119 +377,44 @@ type ToolSpec struct {
 	Trusted bool
 }
 
-// kindedTool labels a tool grape assembled. Call does not authorize.
-type kindedTool struct {
-	inner tool.CallableTool
-	kind  string
+// Static tools carry their permission classification and drain accounting on
+// the same adapter. Only the streaming variant implements StreamableTool.
+type trackingTool struct {
+	inner   tool.Tool
+	kind    string
+	trusted bool
 }
 
-func (t kindedTool) Declaration() *tool.Declaration {
-	if t.inner == nil {
-		return nil
-	}
-	return t.inner.Declaration()
-}
-
-func (t kindedTool) Call(ctx context.Context, args []byte) (any, error) {
-	return t.inner.Call(ctx, args)
-}
-
-func (t kindedTool) LongRunning() bool { return longRunning(t.inner) }
-
-func labeledKind(item tool.Tool) (string, bool) {
+func adapted(item tool.Tool) (trackingTool, bool) {
 	switch t := item.(type) {
-	case kindedTool:
-		return t.kind, true
-	case streamKinded:
-		return t.kind, true
+	case trackingTool:
+		return t, true
+	case streamTracking:
+		return t.trackingTool, true
 	default:
-		return "", false
+		return trackingTool{}, false
 	}
 }
 
-type streamKinded struct{ kindedTool }
-
-func (t streamKinded) StreamableCall(ctx context.Context, args []byte) (*tool.StreamReader, error) {
-	return t.inner.(tool.StreamableTool).StreamableCall(ctx, args)
-}
-
-func (t streamKinded) StreamInner() bool { return streamInner(t.inner) }
-
-func kindTool(item tool.Tool, kind string) tool.Tool {
-	callable, ok := item.(tool.CallableTool)
-	if !ok {
-		return item
-	}
-	if kind == "" {
-		kind = "side_effect"
-	}
-	if kind == "read" {
-		if isGrapeRead(item) {
-			return item
-		}
-		return &builtinReadTool{inner: callable}
-	}
-	if kind == "side_effect" && isGrapeRead(item) {
-		return item
-	}
-	base := kindedTool{inner: callable, kind: kind}
-	if _, ok := item.(tool.StreamableTool); ok {
-		return streamKinded{kindedTool: base}
-	}
-	return base
-}
-
-// trustedTool is applied once at New. The policy allows it by type.
-// The wrapper does not use the tool value as a map key.
-type trustedTool struct {
-	inner tool.Tool
-}
-
-func (t trustedTool) Declaration() *tool.Declaration {
-	if t.inner == nil {
-		return nil
-	}
-	return t.inner.Declaration()
-}
-
-func (t trustedTool) Call(ctx context.Context, args []byte) (any, error) {
-	callable, ok := t.inner.(tool.CallableTool)
-	if !ok {
-		return nil, fmt.Errorf("tool is not callable")
-	}
-	return callable.Call(ctx, args)
-}
-
-func (t trustedTool) grapeTrusted() {}
-
-func (t trustedTool) LongRunning() bool { return longRunning(t.inner) }
-
-type streamTrusted struct{ trustedTool }
-
-func (t streamTrusted) StreamableCall(ctx context.Context, args []byte) (*tool.StreamReader, error) {
-	return t.inner.(tool.StreamableTool).StreamableCall(ctx, args)
-}
-
-func (t streamTrusted) StreamInner() bool { return streamInner(t.inner) }
-
-func wrapTrusted(item tool.Tool) tool.Tool {
+func bindTool(item tool.Tool, kind string, trusted bool) tool.Tool {
 	if item == nil {
 		return nil
 	}
-	if _, ok := item.(trustedTool); ok {
-		return item
-	}
-	if _, ok := item.(streamTrusted); ok {
-		return item
-	}
-	base := trustedTool{inner: item}
-	if _, ok := item.(tool.StreamableTool); ok {
-		return streamTrusted{trustedTool: base}
+	base := trackingTool{inner: item, kind: kind, trusted: trusted}
+	if stream, ok := item.(tool.StreamableTool); ok {
+		return streamTracking{trackingTool: base, stream: stream}
 	}
 	return base
 }
 
-type trackingTool struct{ inner tool.CallableTool }
+func kindTool(item tool.Tool, kind string) tool.Tool {
+	if kind == "side_effect" && isGrapeRead(item) {
+		return item
+	}
+	return bindTool(item, kind, false)
+}
+
+func wrapTrusted(item tool.Tool) tool.Tool { return bindTool(item, "", true) }
 
 func (t trackingTool) Declaration() *tool.Declaration { return t.inner.Declaration() }
 
@@ -499,7 +424,11 @@ func (t trackingTool) Call(ctx context.Context, args []byte) (any, error) {
 		st.enterTool()
 		defer st.leaveTool()
 	}
-	return t.inner.Call(ctx, args)
+	callable, ok := t.inner.(tool.CallableTool)
+	if !ok {
+		return nil, fmt.Errorf("tool is not callable")
+	}
+	return callable.Call(ctx, args)
 }
 
 func (t trackingTool) LongRunning() bool { return longRunning(t.inner) }
@@ -578,15 +507,10 @@ func streamInner(item tool.Tool) bool {
 }
 
 func trackTool(item tool.Tool) tool.Tool {
-	callable, ok := item.(tool.CallableTool)
-	if !ok {
+	if _, ok := adapted(item); ok {
 		return item
 	}
-	base := trackingTool{inner: callable}
-	if stream, ok := item.(tool.StreamableTool); ok {
-		return streamTracking{trackingTool: base, stream: stream}
-	}
-	return base
+	return bindTool(item, "side_effect", false)
 }
 
 func trackTools(tools []tool.Tool) []tool.Tool {
@@ -599,10 +523,10 @@ func trackTools(tools []tool.Tool) []tool.Tool {
 
 func mutatingKind(kind string) bool {
 	switch kind {
-	case "command", "write", "side_effect":
-		return true
-	default:
+	case "read":
 		return false
+	default:
+		return true
 	}
 }
 

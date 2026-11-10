@@ -238,7 +238,7 @@ func alreadyDue() <-chan time.Time {
 func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event, stop <-chan struct{}, bound <-chan time.Time) bool {
 	n, kept := b.compact()
 	if held != nil && keepOnCancel(*held) {
-		kept = append(kept, *held)
+		kept = append([]agent.Event{*held}, kept...)
 	} else if held != nil {
 		n++
 	}

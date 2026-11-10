@@ -83,6 +83,11 @@ func TestCloseWithoutTerminalReportsDelivery(t *testing.T) {
 		}
 	}
 closed:
+	select {
+	case <-h.(*runHandle).resultDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not stop")
+	}
 	status := h.Status()
 	if status.Status != string(agent.EventCancelled) || status.Cause != agent.CauseDelivery {
 		t.Fatalf("status %#v", status)
@@ -415,6 +420,11 @@ func TestCloseMidRunStopsTheRun(t *testing.T) {
 	if err := h.Close(); err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case <-h.(*runHandle).resultDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not stop")
+	}
 	status := h.Status()
 	if status.Status != string(agent.EventCancelled) || status.Cause != agent.CauseDelivery {
 		t.Fatalf("status %#v", status)
@@ -455,4 +465,18 @@ func TestStartContextCancelReportsCauseUser(t *testing.T) {
 func configInt(n int) *int {
 	v := n
 	return &v
+}
+
+func TestCloseLeavesExecutionPendingUntilRunnerResult(t *testing.T) {
+	h := &runHandle{stop: make(chan struct{})}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s := h.Status(); s.Status != agent.StatusPending || s.Delivery != agent.DeliveryAbandoned {
+		t.Fatal(s)
+	}
+	h.noteResult(agent.Event{Kind: agent.EventFailed}, false)
+	if s := h.Status(); s.Status != string(agent.EventFailed) || s.Delivery != agent.DeliveryAbandoned {
+		t.Fatal(s)
+	}
 }

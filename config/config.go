@@ -67,8 +67,10 @@ type SessionConfig struct {
 
 // WorkspaceConfig is the project the agent may read or edit.
 type WorkspaceConfig struct {
-	Root       string `yaml:"root"`
-	Permission string `yaml:"permission"`
+	// DisableCodingTools omits the built-in filesystem, command, and Git tools.
+	DisableCodingTools bool   `yaml:"disable_coding_tools"`
+	Root               string `yaml:"root"`
+	Permission         string `yaml:"permission"`
 	// MaxReadBytes caps read_file and each file search_content opens.
 	// Zero uses 1 MiB.
 	MaxReadBytes int `yaml:"max_read_bytes"`

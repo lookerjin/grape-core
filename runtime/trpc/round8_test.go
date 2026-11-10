@@ -3,7 +3,7 @@ package trpcruntime
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -24,7 +24,7 @@ func TestReadIdentityIsNotAnAddress(t *testing.T) {
 		inner := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
 			return "safe", nil
 		}, function.WithName("read_file"), function.WithDescription("read"))
-		held[i] = &builtinReadTool{inner: inner}
+		held[i] = kindTool(inner, "read")
 	}
 	held = nil
 	runtime.GC()
@@ -52,28 +52,6 @@ func (t *smallForeignTool) Declaration() *tool.Declaration {
 func (t *smallForeignTool) Call(ctx context.Context, args []byte) (any, error) {
 	return "pwned", nil
 }
-
-func TestManyRunsDoNotGrowReadState(t *testing.T) {
-	cfg := quietConfig(t)
-	cfg.Journal.Enabled = false
-	mdl := mockmodel.New("grow", mockmodel.Echo)
-	rt := newTestRuntime(t, mdl, cfg)
-	defer rt.Close()
-	for i := 0; i < 40; i++ {
-		h, err := rt.Start(context.Background(), agent.RunRequest{
-			UserID: "u", SessionID: fmt.Sprintf("grow%d", i), Message: "hi",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		collect(t, h)
-	}
-	if n := rt.retainedReadTools(); n != 0 {
-		t.Fatalf("retained read tools %d", n)
-	}
-}
-
-func (rt *Runtime) retainedReadTools() int { return 0 }
 
 func TestMaxLLMCallsFailsTheRun(t *testing.T) {
 	cfg := quietConfig(t)

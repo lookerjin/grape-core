@@ -17,6 +17,7 @@ import (
 )
 
 func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
+	requireLinuxSandbox(t)
 	root := t.TempDir()
 	ws := filepath.Join(root, "ws")
 	if err := os.MkdirAll(ws, 0o755); err != nil {
@@ -158,6 +159,7 @@ func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
 }
 
 func TestHooksFireOncePerLogicalEvent(t *testing.T) {
+	requireLinuxSandbox(t)
 	root := t.TempDir()
 	ws := filepath.Join(root, "ws")
 	if err := os.MkdirAll(ws, 0o755); err != nil {
@@ -214,6 +216,7 @@ func TestHooksFireOncePerLogicalEvent(t *testing.T) {
 }
 
 func TestHooksRunAgainAcrossSessions(t *testing.T) {
+	requireLinuxSandbox(t)
 	root := t.TempDir()
 	ws := filepath.Join(root, "ws")
 	if err := os.MkdirAll(ws, 0o755); err != nil {

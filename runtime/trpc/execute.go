@@ -68,7 +68,6 @@ func (e *commandExecutor) probe(ctx context.Context) (sandbox.Capabilities, erro
 	if e.probed {
 		return e.caps, nil
 	}
-	e.probed = true
 	if e.platform == "windows" {
 		e.caps = sandbox.Assess(sandbox.Probe{Platform: "windows"})
 		return e.caps, nil
@@ -82,12 +81,18 @@ func (e *commandExecutor) probe(ctx context.Context) (sandbox.Capabilities, erro
 	ws, err := rt.CreateWorkspace(ctx, "probe", codeexecutor.WorkspacePolicy{})
 	if err != nil {
 		preflight = err
-	} else if _, err = rt.RunProgram(ctx, ws, codeexecutor.RunProgramSpec{
+	} else if res, runErr := rt.RunProgram(ctx, ws, codeexecutor.RunProgramSpec{
 		Cmd:     "/bin/true",
 		Timeout: 20 * time.Second,
-	}); err != nil {
-		preflight = err
+	}); runErr != nil {
+		preflight = runErr
+	} else if res.ExitCode != 0 || res.TimedOut {
+		preflight = fmt.Errorf("sandbox probe exited %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
+	if err := ctx.Err(); err != nil {
+		return sandbox.Capabilities{}, err
+	}
+	e.probed = true
 	masked, err := e.denyList("")
 	if err != nil && preflight == nil {
 		preflight = err

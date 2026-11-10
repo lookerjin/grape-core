@@ -2,6 +2,7 @@ package trpcruntime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -128,31 +129,10 @@ func (bareTool) Declaration() *tool.Declaration {
 }
 
 func TestNonCallableToolIsRejected(t *testing.T) {
-	cfg := config.Default()
-	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
-	cfg.Journal.Enabled = false
-	cfg.Model.Generation.Stream = boolPtr(false)
-	mdl := mockmodel.New("bare", func(ctx context.Context, req *model.Request) (*model.Response, error) {
-		if hasToolMessage(req) {
-			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
-		}
-		return toolCall("bare", `{}`), nil
-	})
-	rt, err := New(Options{
-		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
-		Tools: []tool.Tool{bareTool{}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rt.Close()
-	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "bare", Message: "go"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	blob := eventBlob(collect(t, h))
-	if !strings.Contains(blob, "not callable") {
-		t.Fatalf("non-callable tool was not rejected: %s", blob)
+	cfg := quietConfig(t)
+	_, err := New(Options{Config: &cfg, Model: mockmodel.New("bare", mockmodel.Echo), DataDir: t.TempDir(), Tools: []tool.Tool{bareTool{}}})
+	if !errors.Is(err, agent.ErrInvalidConfig) {
+		t.Fatalf("expected invalid config, got %v", err)
 	}
 }
 
@@ -467,6 +447,7 @@ func TestGrandchildAndDynamicToolSetAreGated(t *testing.T) {
 		}),
 		Subagents: []SubagentSpec{{
 			Name: "helper", Instruction: "child-agent", Model: mdl,
+			TrustToolSets:   true,
 			ToolSets:        []tool.ToolSet{dynSet{tool: dynTool}},
 			RefreshToolSets: true,
 			Subagents: []SubagentSpec{{
@@ -800,7 +781,7 @@ func TestBuiltinReadIdentityStaysUnprompted(t *testing.T) {
 		ran.Add(1)
 		return "from-builtin", nil
 	}, function.WithName("read_file"), function.WithDescription("level:read but this wrapper is the grape type"))
-	readTool := &builtinReadTool{inner: inner}
+	readTool := kindTool(inner, "read")
 	mdl := mockmodel.New("ident", func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		if strings.Contains(lastUserText(req), "builtin-body") {
 			if hasToolMessage(req) {
@@ -1088,4 +1069,12 @@ func toolCallID(name, args, id string) *model.Response {
 			}},
 		},
 	}}}
+}
+
+func TestSubagentToolSetRequiresTrust(t *testing.T) {
+	cfg := quietConfig(t)
+	_, err := New(Options{Config: &cfg, Model: mockmodel.New("child", mockmodel.Echo), DataDir: t.TempDir(), Subagents: []SubagentSpec{{Name: "child", ToolSets: []tool.ToolSet{dynSet{tool: echoTool()}}}}})
+	if !errors.Is(err, agent.ErrInvalidConfig) {
+		t.Fatalf("untrusted provider accepted: %v", err)
+	}
 }
