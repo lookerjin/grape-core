@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -231,4 +232,200 @@ func TestTrustedAgentToolStreamsChildEvents(t *testing.T) {
 	if !found {
 		t.Fatalf("child text was not streamed: %s", eventBlob(events))
 	}
+}
+
+func TestStatusIsPendingUntilTheRunStops(t *testing.T) {
+	cfg := quietConfig(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	mdl := mockmodel.New("pending", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+	})
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "pending", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	status := h.Status()
+	if status.Status != agent.StatusPending || status.Delivery != agent.DeliveryOpen {
+		t.Fatalf("status %#v", status)
+	}
+	_ = h.Cancel()
+}
+
+func TestSlowConsumerAfterCancelGetsOneTerminal(t *testing.T) {
+	cfg := quietConfig(t)
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Approvals.Required = false
+	cfg.Context.MaxToolCalls = configInt(20)
+	var step atomic.Int32
+	mdl := mockmodel.New("slow-cancel", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if step.Add(1) == 1 {
+			calls := make([]model.ToolCall, 0, 13)
+			for i := 0; i < 12; i++ {
+				calls = append(calls, model.ToolCall{
+					ID:   "echo",
+					Type: "function",
+					Function: model.FunctionDefinitionParam{
+						Name:      "echo",
+						Arguments: []byte(`{"text":"x"}`),
+					},
+				})
+			}
+			calls = append(calls, model.ToolCall{
+				ID:   "block",
+				Type: "function",
+				Function: model.FunctionDefinitionParam{
+					Name:      "block",
+					Arguments: []byte(`{}`),
+				},
+			})
+			return &model.Response{Choices: []model.Choice{{
+				Message: model.Message{Role: model.RoleAssistant, ToolCalls: calls},
+			}}}, nil
+		}
+		return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+	})
+	block := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}, function.WithName("block"), function.WithDescription("blocks"))
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Tools: []tool.Tool{echoTool(), block},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "slow-cancel", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.AfterFunc(150*time.Millisecond, func() { _ = h.Cancel() })
+	var terminals int
+	deadline := time.After(8 * time.Second)
+	for {
+		select {
+		case evt, ok := <-h.Events():
+			if !ok {
+				goto done
+			}
+			if evt.Terminal() {
+				terminals++
+			}
+			time.Sleep(30 * time.Millisecond)
+		case <-deadline:
+			t.Fatal("events did not close")
+		}
+	}
+done:
+	if terminals != 1 {
+		t.Fatalf("terminals %d", terminals)
+	}
+	status := h.Status()
+	if status.Status != string(agent.EventCancelled) || status.Cause != agent.CauseUser {
+		t.Fatalf("status %#v", status)
+	}
+}
+
+func TestCloseKeepsAFinishedResult(t *testing.T) {
+	cfg := quietConfig(t)
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Approvals.Required = false
+	cfg.Context.MaxToolCalls = configInt(1)
+	cfg.Context.MaxLLMCalls = configInt(0)
+	cfg.Context.TotalMaxLLMCalls = configInt(0)
+	cfg.Context.MaxToolIterations = configInt(0)
+	cfg.Context.TotalMaxToolIterations = configInt(0)
+	mdl := mockmodel.New("budget-close", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return toolCall("echo", `{"text":"x"}`), nil
+	})
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "budget-close", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var status agent.RunStatus
+	for time.Now().Before(deadline) {
+		status = h.Status()
+		if status.Reason == agent.ReasonBudgetExceeded && status.Scope == agent.ScopeRun {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status.Reason != agent.ReasonBudgetExceeded {
+		t.Fatalf("before close %#v", h.Status())
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	status = h.Status()
+	if status.Status != string(agent.EventFailed) || status.Reason != agent.ReasonBudgetExceeded || status.Scope != agent.ScopeRun {
+		t.Fatalf("status %#v", status)
+	}
+	if status.Delivery != agent.DeliveryAbandoned && status.Delivery != agent.DeliveryDelivered {
+		t.Fatalf("delivery %#v", status)
+	}
+}
+
+func TestCloseMidRunStopsTheRun(t *testing.T) {
+	cfg := quietConfig(t)
+	var calls atomic.Int32
+	started := make(chan struct{})
+	mdl := mockmodel.New("mid-close", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		n := calls.Add(1)
+		if n == 1 {
+			close(started)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+		return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("again")}}}, nil
+	})
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "mid-close", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if status := h.Status(); status.Status != agent.StatusPending {
+		t.Fatalf("before close %#v", status)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	status := h.Status()
+	if status.Status != string(agent.EventCancelled) || status.Cause != agent.CauseDelivery {
+		t.Fatalf("status %#v", status)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if calls.Load() != 1 {
+		t.Fatalf("model kept running, calls=%d", calls.Load())
+	}
+}
+
+func configInt(n int) *int {
+	v := n
+	return &v
 }

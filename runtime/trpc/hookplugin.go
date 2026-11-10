@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/lookerjin/grape-core/agent"
 	"github.com/lookerjin/grape-core/hooks"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
@@ -68,13 +66,6 @@ func (p *hookPlugin) beforeModel(ctx context.Context, args *model.BeforeModelArg
 func (p *hookPlugin) afterModel(ctx context.Context, args *model.AfterModelArgs) (*model.AfterModelResult, error) {
 	if args != nil && args.Response != nil && args.Response.IsPartial {
 		return nil, nil
-	}
-	// toolcallid's canonical id is prefix:invocation:response:raw:cN:tN.
-	// It does not fill an empty response id, so two rounds with an empty
-	// response id and an empty raw id would collide. Set the response id
-	// the plugin already reads. This is not a call-id registry.
-	if args != nil && args.Response != nil && args.Response.ID == "" && responseRequestsTools(args.Response) {
-		args.Response.ID = uuid.NewString()
 	}
 	if p.rt != nil {
 		resp := (*model.Response)(nil)

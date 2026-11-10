@@ -264,8 +264,8 @@ func New(opts Options) (*Runtime, error) {
 	}
 	runnerOpts := []runner.Option{
 		runner.WithSessionService(sessions),
-		// The hook runs first so an empty response id is filled before
-		// toolcallid canonicalizes tool call ids.
+		// toolcallid canonicalizes tool call ids. llmflow already fills an
+		// empty response id before these callbacks run.
 		runner.WithPlugins(&hookPlugin{rt: rt}, toolcallid.New()),
 	}
 	if rt.evolution != nil {
@@ -691,7 +691,9 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	}
 	rt.track(h)
 	go func() {
-		if !box.pump(ch, h.stop, runCtx, rt.eventHoldTimeout(), rt.eventIdleTimeout()) {
+		if box.pump(ch, h.stop, runCtx, rt.eventHoldTimeout(), rt.eventIdleTimeout()) {
+			h.noteStreamDelivered()
+		} else {
 			h.noteDeliveryClosed()
 		}
 		rt.untrack(h)
@@ -794,20 +796,33 @@ drained:
 		}
 		emit(conv.stamp(evt))
 	}
-	if !terminal && ctx.Err() != nil {
-		for _, next := range conv.closeOpenTools(nil, "cancelled") {
-			emit(next)
+	if !terminal {
+		if ctx.Err() != nil {
+			for _, next := range conv.closeOpenTools(nil, "cancelled") {
+				emit(next)
+			}
+			emit(conv.stamp(agent.Event{
+				RunID:     runID,
+				SessionID: req.SessionID,
+				Kind:      agent.EventCancelled,
+				Time:      time.Now().UTC(),
+				Payload: agent.MustPayload(agent.TerminalPayload{
+					Status: string(agent.EventCancelled),
+					Error:  ctx.Err().Error(),
+				}),
+			}))
+		} else {
+			emit(conv.stamp(agent.Event{
+				RunID:     runID,
+				SessionID: req.SessionID,
+				Kind:      agent.EventFailed,
+				Time:      time.Now().UTC(),
+				Payload: agent.MustPayload(agent.TerminalPayload{
+					Status: string(agent.EventFailed),
+					Reason: agent.ReasonError,
+				}),
+			}))
 		}
-		emit(conv.stamp(agent.Event{
-			RunID:     runID,
-			SessionID: req.SessionID,
-			Kind:      agent.EventCancelled,
-			Time:      time.Now().UTC(),
-			Payload: agent.MustPayload(agent.TerminalPayload{
-				Status: string(agent.EventCancelled),
-				Error:  ctx.Err().Error(),
-			}),
-		}))
 	}
 }
 
@@ -1096,9 +1111,11 @@ type runHandle struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 
-	mu       sync.Mutex
-	result   agent.RunStatus
-	delivery bool
+	mu           sync.Mutex
+	result       agent.RunStatus
+	hasResult    bool
+	userCancel   bool
+	terminalSent bool
 }
 
 func (h *runHandle) noteResult(evt agent.Event) {
@@ -1109,9 +1126,10 @@ func (h *runHandle) noteResult(evt agent.Event) {
 	_ = json.Unmarshal(evt.Payload, &body)
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.delivery {
+	if h.hasResult {
 		return
 	}
+	h.hasResult = true
 	h.result = agent.RunStatus{
 		Status:  body.Status,
 		Error:   body.Error,
@@ -1122,6 +1140,27 @@ func (h *runHandle) noteResult(evt agent.Event) {
 	if h.result.Status == "" {
 		h.result.Status = string(evt.Kind)
 	}
+	if evt.Kind == agent.EventCancelled && h.userCancel && h.result.Cause == "" {
+		h.result.Cause = agent.CauseUser
+	}
+	if h.terminalSent {
+		h.result.Delivery = agent.DeliveryDelivered
+	} else {
+		h.result.Delivery = agent.DeliveryOpen
+	}
+}
+
+func (h *runHandle) noteStreamDelivered() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.terminalSent = true
+	if h.result.Delivery == agent.DeliveryAbandoned {
+		return
+	}
+	h.result.Delivery = agent.DeliveryDelivered
 }
 
 func (h *runHandle) noteDeliveryClosed() {
@@ -1130,10 +1169,17 @@ func (h *runHandle) noteDeliveryClosed() {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.delivery = true
+	if h.hasResult {
+		if h.result.Delivery != agent.DeliveryDelivered {
+			h.result.Delivery = agent.DeliveryAbandoned
+		}
+		return
+	}
+	h.hasResult = true
 	h.result = agent.RunStatus{
-		Status: string(agent.EventCancelled),
-		Cause:  agent.CauseDelivery,
+		Status:   string(agent.EventCancelled),
+		Cause:    agent.CauseDelivery,
+		Delivery: agent.DeliveryAbandoned,
 	}
 }
 
@@ -1143,6 +1189,9 @@ func (h *runHandle) Status() agent.RunStatus {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.hasResult {
+		return agent.RunStatus{Status: agent.StatusPending, Delivery: agent.DeliveryOpen}
+	}
 	return h.result
 }
 
@@ -1155,6 +1204,21 @@ func (h *runHandle) Close() error {
 		return nil
 	}
 	h.stopOnce.Do(func() {
+		h.mu.Lock()
+		has := h.hasResult
+		if has && h.result.Delivery != agent.DeliveryDelivered {
+			h.result.Delivery = agent.DeliveryAbandoned
+		}
+		h.mu.Unlock()
+		if !has {
+			// The stream is closing before a result exists. Cancel the run
+			// so that state is true, and record delivery rather than a
+			// result the run has not produced.
+			h.noteDeliveryClosed()
+			if h.cancel != nil {
+				_ = h.cancel()
+			}
+		}
 		if h.box != nil {
 			h.box.abandon()
 		}
@@ -1165,7 +1229,15 @@ func (h *runHandle) Close() error {
 
 func (h *runHandle) ID() string                 { return h.id }
 func (h *runHandle) Events() <-chan agent.Event { return h.events }
-func (h *runHandle) Cancel() error              { return h.cancel() }
+func (h *runHandle) Cancel() error {
+	if h == nil || h.cancel == nil {
+		return nil
+	}
+	h.mu.Lock()
+	h.userCancel = true
+	h.mu.Unlock()
+	return h.cancel()
+}
 func (h *runHandle) Enqueue(message string) error {
 	if h.enqueue == nil {
 		return agent.Wrap(agent.ErrInvalidConfig, "enqueue", fmt.Errorf("runner cannot steer"))

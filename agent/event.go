@@ -84,21 +84,35 @@ const (
 	ReasonError          = "error"
 	ScopeRun             = "run"
 	ScopeAgent           = "agent"
-	// CauseDelivery means the stream closed because of Close, hold, or idle
-	// before a terminal event was delivered. It is not the run's own result.
+	// StatusPending is Status before the run has stopped.
+	StatusPending = "pending"
+	// CauseUser is a cancel requested by Cancel or the Start context.
+	CauseUser = "user"
+	// CauseDelivery means Close, hold, or idle closed the stream before a
+	// result existed. It is not a result the run itself produced.
 	CauseDelivery = "delivery"
+	// DeliveryOpen means the stream has not closed.
+	DeliveryOpen = "open"
+	// DeliveryDelivered means the consumer was sent the terminal event.
+	DeliveryDelivered = "delivered"
+	// DeliveryAbandoned means Close, hold, or idle closed the stream
+	// without delivering the terminal event.
+	DeliveryAbandoned = "abandoned"
 )
 
 // RunStatus is the run result, separate from whether the stream delivered it.
-// Cause is CauseDelivery when Close, hold, or idle closed the stream before
-// a terminal event was delivered.
+// Before the run stops, Status is StatusPending and Delivery is DeliveryOpen.
+// Cause is CauseUser for a caller cancel and CauseDelivery when the stream
+// was closed before a result existed. Delivery records open, delivered, or
+// abandoned. A result that already exists is kept when the stream is abandoned.
 type RunStatus struct {
-	Status  string `json:"status,omitempty"`
-	Error   string `json:"error,omitempty"`
-	Reason  string `json:"reason,omitempty"`
-	Scope   string `json:"scope,omitempty"`
-	AgentID string `json:"agent_id,omitempty"`
-	Cause   string `json:"cause,omitempty"`
+	Status   string `json:"status,omitempty"`
+	Error    string `json:"error,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+	Scope    string `json:"scope,omitempty"`
+	AgentID  string `json:"agent_id,omitempty"`
+	Cause    string `json:"cause,omitempty"`
+	Delivery string `json:"delivery,omitempty"`
 }
 
 type TerminalPayload struct {

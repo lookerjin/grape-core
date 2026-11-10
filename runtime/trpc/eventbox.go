@@ -139,16 +139,26 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx contex
 	var lastTake time.Time
 	pulse := time.NewTicker(10 * time.Millisecond)
 	defer pulse.Stop()
-	finish := func(held *agent.Event) {
-		if b.deliverFinal(out, held) {
+	finish := func(held *agent.Event, bound <-chan time.Time) {
+		if b.deliverFinal(out, held, stop, bound) {
 			sentTerminal = true
 		}
+	}
+	boundOr := func(fallback time.Duration) <-chan time.Time {
+		if timed != nil {
+			return timed
+		}
+		if fallback <= 0 {
+			fallback = hold
+		}
+		timer = time.NewTimer(fallback)
+		return timer.C
 	}
 	for {
 		evt, ok := b.pop(stop, done)
 		if !ok {
 			if ctx != nil && ctx.Err() != nil {
-				finish(nil)
+				finish(nil, boundOr(hold))
 			}
 			return
 		}
@@ -159,7 +169,7 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx contex
 					wait = idle - time.Since(lastTake)
 				}
 				if wait <= 0 {
-					finish(&evt)
+					finish(&evt, alreadyDue())
 					return
 				}
 				timer = time.NewTimer(wait)
@@ -167,11 +177,15 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx contex
 			}
 			select {
 			case <-timed:
-				finish(&evt)
+				finish(&evt, alreadyDue())
 				return
 			case <-done:
 				if b.isClosed() {
-					finish(&evt)
+					wait := hold
+					if !lastTake.IsZero() {
+						wait = idle - time.Since(lastTake)
+					}
+					finish(&evt, boundOr(wait))
 					return
 				}
 			case <-stop:
@@ -212,7 +226,16 @@ func keepOnCancel(evt agent.Event) bool {
 	return evt.Terminal() || evt.Kind == agent.EventToolEnd
 }
 
-func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event) bool {
+func alreadyDue() <-chan time.Time {
+	ch := make(chan time.Time)
+	close(ch)
+	return ch
+}
+
+// deliverFinal drops ordinary events when out is full. The terminal and
+// tool_end are sent blocking. stop and the hold or idle timer bound that
+// wait. The run context does not.
+func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event, stop <-chan struct{}, bound <-chan time.Time) bool {
 	n, kept := b.compact()
 	if held != nil && keepOnCancel(*held) {
 		kept = append(kept, *held)
@@ -227,12 +250,22 @@ func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event) bool 
 	}
 	sentTerminal := false
 	for _, evt := range kept {
+		if !keepOnCancel(evt) {
+			select {
+			case out <- evt:
+			default:
+			}
+			continue
+		}
 		select {
 		case out <- evt:
 			if evt.Terminal() {
 				sentTerminal = true
 			}
-		default:
+		case <-stop:
+			return sentTerminal
+		case <-bound:
+			return sentTerminal
 		}
 	}
 	return sentTerminal

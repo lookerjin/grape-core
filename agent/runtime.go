@@ -42,8 +42,9 @@ type RunRequest struct {
 type RunHandle interface {
 	ID() string
 	Events() <-chan Event
-	// Status reports the run result. It is cancelled with CauseDelivery when
-	// the stream closed before a terminal event was delivered.
+	// Status reports the run result. It is pending until the run stops.
+	// A caller cancel has cause user. Close, hold, or idle mark delivery
+	// abandoned and, if no result exists yet, cancel the run.
 	Status() RunStatus
 	Cancel() error
 	// Close releases the event pump. It is safe to call more than once.
