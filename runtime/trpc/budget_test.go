@@ -179,6 +179,50 @@ func TestDeniedAttemptsCountTowardMaxToolCalls(t *testing.T) {
 	}
 }
 
+func TestMaxToolCallsEndsTheRunBeforeTheNextModelCall(t *testing.T) {
+	cfg := quietConfig(t)
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Approvals.Required = false
+	cfg.Context.MaxToolCalls = config.Int(2)
+	cfg.Context.MaxLLMCalls = config.Int(0)
+	cfg.Context.TotalMaxLLMCalls = config.Int(0)
+	cfg.Context.MaxToolIterations = config.Int(0)
+	cfg.Context.TotalMaxToolIterations = config.Int(0)
+	var calls atomic.Int32
+	var ran atomic.Int32
+	mdl := mockmodel.New("tool-cap", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		calls.Add(1)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return toolCall("echo", `{"text":"again"}`), nil
+	})
+	echo := function.NewFunctionTool(func(ctx context.Context, in struct {
+		Text string `json:"text"`
+	}) (string, error) {
+		ran.Add(1)
+		return in.Text, nil
+	}, function.WithName("echo"), function.WithDescription("echo"))
+	rt, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir(), Tools: []tool.Tool{echo}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "tool-cap", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collect(t, h)
+	last := events[len(events)-1]
+	body := mustTerminal(t, last)
+	if last.Kind != agent.EventFailed || body.Reason != agent.ReasonBudgetExceeded || body.Scope != agent.ScopeRun {
+		t.Fatalf("terminal %s %#v calls=%d ran=%d %s", last.Kind, body, calls.Load(), ran.Load(), eventBlob(events))
+	}
+	if calls.Load() != 3 || ran.Load() != 2 {
+		t.Fatalf("model calls %d tool runs %d", calls.Load(), ran.Load())
+	}
+}
+
 func TestToolAttemptReserveIsAtomic(t *testing.T) {
 	st := newRunState("r", "s", agent.ModeDefault)
 	var allowed atomic.Int32

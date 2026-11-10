@@ -71,6 +71,15 @@ func (st *runState) reserveToolCall(limit int) (allowed bool) {
 	return true
 }
 
+func (st *runState) runBudgetExhausted() bool {
+	if st == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.stopSet && st.stopReason == agent.ReasonBudgetExceeded && st.stopScope == agent.ScopeRun
+}
+
 func (st *runState) rootCounts() (llm, tools int) {
 	if st == nil {
 		return 0, 0
@@ -112,6 +121,9 @@ func (rt *Runtime) consumeLLMCall(ctx context.Context) error {
 	if rt == nil || st == nil {
 		return nil
 	}
+	if st.runBudgetExhausted() {
+		return trpcagent.NewStopError("run budget exceeded")
+	}
 	id, name := invocationMeta(ctx)
 	_, total := st.addLLM(id)
 	limit := positiveLimit(rt.cfg.Context.TotalMaxLLMCalls)
@@ -133,7 +145,9 @@ func (rt *Runtime) consumeToolCall(ctx context.Context) error {
 	}
 	_, name := invocationMeta(ctx)
 	st.setStop(agent.ReasonBudgetExceeded, agent.ScopeRun, name)
-	return errRunBudget
+	// A plain callback error only rejects this call. StopError ends the
+	// invocation, so the model is not called again.
+	return trpcagent.NewStopError("run budget exceeded")
 }
 
 func (rt *Runtime) noteToolRound(ctx context.Context, resp *model.Response) error {

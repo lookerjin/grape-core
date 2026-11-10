@@ -51,12 +51,20 @@ func approvalTarget(name string, args []byte) (detail, path string) {
 	var body struct {
 		Argv     []string `json:"argv"`
 		FileName string   `json:"file_name"`
+		Skill    string   `json:"skill"`
+		Command  string   `json:"command"`
 	}
 	if err := json.Unmarshal(args, &body); err != nil {
 		return detail, ""
 	}
 	if len(body.Argv) > 0 {
 		return strings.Join(body.Argv, " "), ""
+	}
+	if body.Command != "" {
+		if body.Skill != "" {
+			return body.Skill + ": " + body.Command, ""
+		}
+		return body.Command, ""
 	}
 	if body.FileName != "" {
 		return body.FileName, body.FileName

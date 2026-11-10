@@ -682,6 +682,59 @@ func (f functionTool) Call(context.Context, []byte) (any, error) {
 	return "ok", nil
 }
 
+func TestSkillRunDenySeesTheCommand(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, filepath.Join(dir, "skills"))
+	marker := filepath.Join(t.TempDir(), "pwned")
+	command := "touch " + marker
+	cfg := config.Default()
+	cfg.Skills.Paths = []string{filepath.Join(dir, "skills")}
+	cfg.Skills.KnowledgeOnly = boolPtr(false)
+	cfg.Workspace.Permission = agent.PermissionDangerFullAccess
+	cfg.Workspace.Root = dir
+	cfg.Sandbox.Mode = sandbox.ModeDangerFullAccess
+	cfg.Approvals.Required = true
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	var step int
+	var got agent.ApprovalRequest
+	mdl := mockmodel.New("skill-deny", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		step++
+		switch step {
+		case 1:
+			return toolCall("skill_load", `{"skill":"review"}`), nil
+		case 2:
+			return toolCall("skill_run", `{"skill":"review","command":`+fmt.Sprintf("%q", command)+`}`), nil
+		default:
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+	})
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			got = req
+			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{
+		UserID: "u", SessionID: "skill-deny", Workspace: dir, Message: "run",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collect(t, h)
+	if !strings.Contains(got.Detail, "review") || !strings.Contains(got.Detail, command) {
+		t.Fatalf("decider saw %#v", got)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("denied skill_run created %s (%v)", marker, err)
+	}
+}
+
 func writeSkill(t *testing.T, root string) {
 	t.Helper()
 	dir := filepath.Join(root, "review")
