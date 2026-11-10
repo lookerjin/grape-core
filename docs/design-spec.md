@@ -495,13 +495,15 @@ Commands→ 解析为可复用指令模板, 由调用方决定何时触发
 - 默认不向模型完整注入全部 Skills
 - Skill 资源包与 Skill 执行权限分离; 文档文件可读, 脚本执行遵守 CodeExecutor/Sandbox 策略
 - **强制显式配置 CodeExecutor**, 禁止 `WithSkills` 自动回退到未隔离本地 Executor; 对不执行脚本的产品可选择 KnowledgeOnly
-- 明确禁用自动执行响应 Markdown 代码块, 统一通过 Tool Call 启动受控执行
+- `skills.knowledge_only: false` 使用受管沙箱执行器; `danger_full_access` 使用宿主执行并报告 isolation `none`, 不称为 managed。Windows `managed` 失败关闭, 不回退宿主
+- 明确禁用自动执行响应 Markdown 代码块 (`WithEnableCodeExecutionResponseProcessor(false)`), 统一通过 Tool Call 启动受控执行
 
 ### 12.3 Hooks Package
 
 - 支持 `BeforeRun`, `AfterRun`, `BeforeModel`, `AfterModel`, `BeforeTool`, `AfterTool`, `OnEvent`, `OnError` 等语义中具有对应实现的位置
 - 对应 Runtime Callback 直接使用 tRPC 原生 `plugin.Plugin` 或 `agent/extension.Extension`
-- Shell Hook 是独立资源型机制, 通过统一权限与受控执行器启动, 不直接调用裸 `os/exec`
+- Shell Hook 是独立资源型机制, 通过受控执行器启动, 不直接调用裸 `os/exec`
+- 安装或启用插件不授予 Hook 执行。`hooks.allow` 列出组件键后才启动; 嵌入方通过 `Options.Hooks` 单独授予。允许后的 Hook 不再逐次进入工具审批。`BeforeTool` 发生在工具策略之前, 沙箱仍然生效
 - Hook 需要明确超时、输入/输出 JSON Schema、退出码语义、阻断策略、并发限制和去重
 - 对上游不支持的 Hook 事件明确标记 unsupported, 不创造假回调
 

@@ -160,6 +160,11 @@ type EvolutionConfig struct {
 type HooksConfig struct {
 	Timeout       string `yaml:"timeout"`
 	MaxConcurrent int    `yaml:"max_concurrent"`
+	// Allow lists plugin component keys, such as "name/hooks", that may
+	// execute. Installing or enabling a plugin does not grant this.
+	// An empty list runs no plugin hooks. Embedder-supplied hooks are a
+	// separate grant on runtime Options.
+	Allow []string `yaml:"allow"`
 }
 
 // JournalConfig optionally writes a redacted NDJSON journal.

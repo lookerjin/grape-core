@@ -114,80 +114,6 @@ func (rt *Runtime) allowNestedRead(agentName, toolName string) bool {
 	return ok
 }
 
-// nestedCaller reports whether this tool call is outside the root invocation
-// captured at run start. The agent name is not the signal: a nested agent
-// named "grape" is still nested when its invocation ID differs.
-func (rt *Runtime) nestedCaller(ctx context.Context) bool {
-	inv, ok := trpcagent.InvocationFromContext(ctx)
-	if !ok || inv == nil || inv.InvocationID == "" {
-		return true
-	}
-	st := stateFrom(ctx)
-	if st == nil {
-		return true
-	}
-	root := st.rootInvocation()
-	if root == "" {
-		return true
-	}
-	return inv.InvocationID != root
-}
-
-// nestedToolKind classifies a nested tool call. Read is granted only by
-// grape's own tool types, a user-config MCP server level carried on
-// hostMCPTool, or Options.NestedReads. Names and description text grant nothing.
-func (rt *Runtime) nestedToolKind(ctx context.Context, name string) string {
-	inv, _ := trpcagent.InvocationFromContext(ctx)
-	agentName := ""
-	if inv != nil {
-		agentName = inv.AgentName
-	}
-	if rt.allowNestedRead(agentName, name) {
-		return "read"
-	}
-	matched := toolsNamed(inv, name)
-	if len(matched) == 0 {
-		return "side_effect"
-	}
-	for _, item := range matched {
-		if !isGrapeRead(item) {
-			return "side_effect"
-		}
-	}
-	return "read"
-}
-
-// isGrapeRead reports whether the tool is one grape constructed. The check
-// is a type assertion on unexported types. It does not use pointer identity.
-func isGrapeRead(item tool.Tool) bool {
-	switch t := unwrapGrape(item).(type) {
-	case *builtinReadTool:
-		return t != nil
-	case *grapeReadTool:
-		return t != nil
-	case *hostMCPTool:
-		return t != nil && t.kind == "read"
-	default:
-		return false
-	}
-}
-
-func toolsNamed(inv *trpcagent.Invocation, name string) []tool.Tool {
-	if inv == nil || inv.Agent == nil || name == "" {
-		return nil
-	}
-	var out []tool.Tool
-	for _, item := range inv.Agent.Tools() {
-		if item == nil || item.Declaration() == nil {
-			continue
-		}
-		if item.Declaration().Name == name {
-			out = append(out, item)
-		}
-	}
-	return out
-}
-
 // unwrapGrape removes only wrappers this package constructs. It does not
 // follow Original or any other exported unwrap method.
 func unwrapGrape(item tool.Tool) tool.Tool {
@@ -198,7 +124,7 @@ func unwrapGrape(item tool.Tool) tool.Tool {
 				return item
 			}
 			item = inner.inner
-		case gatedTool:
+		case kindedTool:
 			if inner.inner == nil {
 				return item
 			}

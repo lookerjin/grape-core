@@ -39,6 +39,7 @@ func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
 	cfg.Model.Generation.Stream = boolPtr(false)
 	cfg.Journal.Enabled = false
 	cfg.Plugins.Enabled = []string{"trace"}
+	cfg.Hooks.Allow = []string{"trace/hooks"}
 	rt, err := New(Options{
 		Config:        &cfg,
 		Model:         mockmodel.New("hooks", mockmodel.ToolThenText("echo", `{"text":"x"}`, "done")),
@@ -91,6 +92,7 @@ func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
 	ro.Model.Generation.Stream = boolPtr(false)
 	ro.Journal.Enabled = false
 	ro.Plugins.Enabled = []string{"allow"}
+	ro.Hooks.Allow = []string{"allow/hooks"}
 	roRT, err := New(Options{
 		Config:        &ro,
 		Model:         mockmodel.New("ro", mockmodel.ToolThenText("echo", `{"text":"x"}`, "done")),
@@ -127,6 +129,7 @@ func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
 	slowCfg.Model.Generation.Stream = boolPtr(false)
 	slowCfg.Journal.Enabled = false
 	slowCfg.Plugins.Enabled = []string{"slow"}
+	slowCfg.Hooks.Allow = []string{"slow/hooks"}
 	slowRT, err := New(Options{
 		Config:        &slowCfg,
 		Model:         mockmodel.New("slow", mockmodel.ToolThenText("echo", `{"text":"x"}`, "done")),
@@ -174,6 +177,7 @@ func TestHooksFireOncePerLogicalEvent(t *testing.T) {
 	cfg.Journal.Enabled = false
 	cfg.Hooks.MaxConcurrent = 1
 	cfg.Plugins.Enabled = []string{"once"}
+	cfg.Hooks.Allow = []string{"once/hooks"}
 	mdl := mockmodel.New("once", mockmodel.Echo).WithStream()
 	rt, err := New(Options{
 		Config: &cfg, Model: mdl, DataDir: t.TempDir(), PluginManager: mgr,
@@ -224,6 +228,7 @@ func TestHooksRunAgainAcrossSessions(t *testing.T) {
 	cfg.Journal.Enabled = false
 	cfg.Hooks.MaxConcurrent = 1
 	cfg.Plugins.Enabled = []string{"again"}
+	cfg.Hooks.Allow = []string{"again/hooks"}
 	rt, err := New(Options{
 		Config:        &cfg,
 		Model:         mockmodel.New("again", mockmodel.ToolThenText("echo", `{"text":"x"}`, "done")),

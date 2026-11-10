@@ -25,6 +25,7 @@ import (
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/extension/goal"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/evolution"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -56,11 +57,23 @@ type Options struct {
 	Platform      string
 	External      sandbox.Backend
 	PluginManager *plugin.Manager
-	FixedAgent    trpcagent.Agent
-	SubAgents     []trpcagent.Agent
+	// FixedAgent replaces the grape agent. The caller controls that
+	// agent's tools, executor, and any calls it makes itself. The run
+	// policy is still attached for framework-scheduled tool calls.
+	// Grape does not promise those internal calls stay inside the policy
+	// or the sandbox.
+	FixedAgent trpcagent.Agent
+	// SubAgents are static child agents. Each one is registered with
+	// tRPC's AgentTool. transfer_to_agent is not registered. Child tool
+	// calls inherit the run policy. This is not a trust bypass.
+	SubAgents []trpcagent.Agent
 	// ToolSpecs classifies extra tools. An empty Kind is side_effect.
-	// Trusted tools skip the approval gate; Options.Tools are untrusted.
-	ToolSpecs         []ToolSpec
+	// Options.Tools are untrusted side effects. Trusted skips the run
+	// policy. A raw *tool/agent.Tool is rejected unless Trusted.
+	ToolSpecs []ToolSpec
+	// Hooks are shell hooks the embedder has already authorized.
+	// Plugin hooks stay off until config hooks.allow lists their key.
+	Hooks             []hooks.Spec
 	EvolutionReviewer evolution.Reviewer
 	// NestedReads are agent/tool pairs a nested caller may run as read.
 	// Privilege comes from this list, not from the tool's name or description.
@@ -72,34 +85,39 @@ type Options struct {
 // It owns the SQLite session service it opens. Close releases that database
 // and the runner. A caller-supplied model is not closed.
 type Runtime struct {
-	cfg         config.Config
-	appName     string
-	runner      runner.Runner
-	sessions    *sqlitesession.Service
-	counter     *countingModel
-	model       model.Model
-	exec        *commandExecutor
-	tools       []tool.Tool
-	specs       []ToolSpec
-	skillRoots  []string
-	ruleText    string
-	ruleSources []rules.Source
-	globalRules string
-	hookRunner  *hooks.Runner
-	mcpServers  []mcp.Server
-	resolved    plugin.Resolved
-	fixed       trpcagent.Agent
-	subs        []trpcagent.Agent
-	evolution   evolution.Service
-	mcpSets     []tool.ToolSet
-	mcpStatus   []mcp.Status
-	decider     agent.Decider
-	reject      bool
-	journal     *journal.Writer
-	secrets     []string
-	maxField    int
-	instruction string
-	nested      map[string]map[string]struct{}
+	cfg            config.Config
+	appName        string
+	runner         runner.Runner
+	sessions       *sqlitesession.Service
+	counter        *countingModel
+	model          model.Model
+	exec           *commandExecutor
+	tools          []tool.Tool
+	specs          []ToolSpec
+	skillRoots     []string
+	ruleText       string
+	ruleSources    []rules.Source
+	globalRules    string
+	hookRunner     *hooks.Runner
+	pluginHooks    []hooks.Spec
+	mcpServers     []mcp.Server
+	resolved       plugin.Resolved
+	fixed          trpcagent.Agent
+	subs           []trpcagent.Agent
+	evolution      evolution.Service
+	mcpSets        []tool.ToolSet
+	mcpStatus      []mcp.Status
+	decider        agent.Decider
+	trusted        map[tool.Tool]struct{}
+	grantedHooks   []hooks.Spec
+	reject         bool
+	boundExec      codeexecutor.CodeExecutor
+	boundIsolation string
+	journal        *journal.Writer
+	secrets        []string
+	maxField       int
+	instruction    string
+	nested         map[string]map[string]struct{}
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -122,6 +140,9 @@ func New(opts Options) (*Runtime, error) {
 		return nil, err
 	}
 	if err := rejectReservedAgents(opts.FixedAgent, opts.SubAgents, opts.Tools, specTools(opts.ToolSpecs)); err != nil {
+		return nil, err
+	}
+	if err := rejectUntrustedAgentTools(opts.Tools, opts.ToolSpecs); err != nil {
 		return nil, err
 	}
 	dataDir := opts.DataDir
@@ -171,24 +192,26 @@ func New(opts Options) (*Runtime, error) {
 		appName = defaultAppName
 	}
 	rt := &Runtime{
-		cfg:         cfg,
-		appName:     appName,
-		sessions:    sessions,
-		counter:     counter,
-		model:       mdl,
-		exec:        newCommandExecutor(cfg, filepath.Join(os.TempDir(), "grape-core-sandbox"), dataDir, opts.Platform, opts.External),
-		tools:       append([]tool.Tool(nil), opts.Tools...),
-		specs:       append([]ToolSpec(nil), opts.ToolSpecs...),
-		decider:     opts.Decider,
-		reject:      opts.RejectConcurrentSession,
-		secrets:     secretValues(cfg),
-		maxField:    cfg.Journal.MaxFieldBytes,
-		instruction: instruction,
-		locks:       map[string]*sync.Mutex{},
-		holds:       map[string]*sessionHold{},
-		fixed:       opts.FixedAgent,
-		subs:        append([]trpcagent.Agent(nil), opts.SubAgents...),
-		nested:      nestedReadIndex(opts.NestedReads),
+		cfg:          cfg,
+		appName:      appName,
+		sessions:     sessions,
+		counter:      counter,
+		model:        mdl,
+		exec:         newCommandExecutor(cfg, filepath.Join(os.TempDir(), "grape-core-sandbox"), dataDir, opts.Platform, opts.External),
+		tools:        append([]tool.Tool(nil), opts.Tools...),
+		specs:        append([]ToolSpec(nil), opts.ToolSpecs...),
+		decider:      opts.Decider,
+		trusted:      map[tool.Tool]struct{}{},
+		grantedHooks: append([]hooks.Spec(nil), opts.Hooks...),
+		reject:       opts.RejectConcurrentSession,
+		secrets:      secretValues(cfg),
+		maxField:     cfg.Journal.MaxFieldBytes,
+		instruction:  instruction,
+		locks:        map[string]*sync.Mutex{},
+		holds:        map[string]*sessionHold{},
+		fixed:        opts.FixedAgent,
+		subs:         append([]trpcagent.Agent(nil), opts.SubAgents...),
+		nested:       nestedReadIndex(opts.NestedReads),
 	}
 	if cfg.Evolution.Enabled {
 		if err := os.MkdirAll(cfg.Evolution.Root, 0o755); err != nil {
@@ -260,6 +283,7 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 			continue
 		}
 		if spec.Trusted {
+			rt.trusted[spec.Tool] = struct{}{}
 			tools = append(tools, spec.Tool)
 			continue
 		}
@@ -267,10 +291,10 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		if kind == "" {
 			kind = "side_effect"
 		}
-		tools = append(tools, rt.gate(spec.Tool, kind))
+		tools = append(tools, kindTool(spec.Tool, kind))
 	}
 	for _, item := range rt.tools {
-		tools = append(tools, rt.gate(item, "side_effect"))
+		tools = append(tools, kindTool(item, "side_effect"))
 	}
 	mode := ""
 	if ro.RuntimeState != nil {
@@ -278,7 +302,12 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	}
 	if len(rt.subs) > 0 {
 		for _, sub := range rt.subs {
-			tools = append(tools, rt.gate(agenttool.NewTool(sub), "side_effect"))
+			if sub == nil {
+				continue
+			}
+			// grape builds the AgentTool. The run policy is inherited
+			// by the child invocation. This is not a trusted bypass.
+			tools = append(tools, agenttool.NewTool(sub))
 		}
 	}
 	if rt.cfg.Memory.Enabled {
@@ -292,6 +321,8 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		llmagent.WithModel(rt.model),
 		llmagent.WithInstruction(instruction),
 		llmagent.WithGenerationConfig(generationConfig(rt.cfg)),
+		// The framework default executes fenced code blocks without the
+		// tool permission policy. Keep it off on every agent grape builds.
 		llmagent.WithEnableCodeExecutionResponseProcessor(false),
 		llmagent.WithWorkspaceExecSurfaceEnabled(false),
 		llmagent.WithMaxLLMCalls(positiveLimit(rt.cfg.Context.MaxLLMCalls)),
@@ -304,10 +335,24 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	if repo, err := rt.skillRepository(); err != nil {
 		return nil, err
 	} else if repo != nil {
-		opts = append(opts,
-			llmagent.WithSkills(repo),
-			llmagent.WithSkillToolProfile(llmagent.SkillToolProfileKnowledgeOnly),
-		)
+		opts = append(opts, llmagent.WithSkills(repo))
+		if rt.cfg.KnowledgeOnly() {
+			// Explicit knowledge-only also disables the local-executor fallback.
+			opts = append(opts, llmagent.WithSkillToolProfile(llmagent.SkillToolProfileKnowledgeOnly))
+		} else {
+			exec, isolation, err := rt.exec.skillCodeExecutor(ws)
+			if err != nil {
+				return nil, err
+			}
+			opts = append(opts,
+				llmagent.WithCodeExecutor(exec),
+				llmagent.WithSkillToolProfile(llmagent.SkillToolProfileFull),
+			)
+			rt.mu.Lock()
+			rt.boundExec = exec
+			rt.boundIsolation = isolation
+			rt.mu.Unlock()
+		}
 	}
 	if mode == string(agent.ModeGoal) {
 		retries := rt.cfg.Goal.MaxIterations
@@ -316,9 +361,12 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		}
 		opts = append(opts, llmagent.WithExtensions(goal.New(goal.WithMaxRetries(retries))))
 	}
-	// Subagents are exposed only as gated agent tools. WithSubAgents would
-	// also register transfer_to_agent, which bypasses that gate.
+	// Subagents are AgentTools registered above. WithSubAgents would also
+	// register transfer_to_agent, which this runtime does not expose.
 	ag := llmagent.New("grape", opts...)
+	rt.mu.Lock()
+	rt.boundExec = ag.CodeExecutor()
+	rt.mu.Unlock()
 	return ag, nil
 }
 
@@ -450,6 +498,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		req.SessionID,
 		model.NewUserMessage(req.Message),
 		trpcagent.WithRequestID(runID),
+		trpcagent.WithToolPermissionPolicyFunc(rt.toolPermission),
 		trpcagent.WithRuntimeState(map[string]any{
 			"workspace": workspace,
 			"mode":      string(req.Mode),
@@ -913,6 +962,11 @@ func (rt *Runtime) Close() error {
 		}
 		for _, set := range rt.mcpSets {
 			if err := set.Close(); err != nil && rt.closeErr == nil {
+				rt.closeErr = err
+			}
+		}
+		if rt.exec != nil {
+			if err := rt.exec.closeSkillExecutors(); err != nil && rt.closeErr == nil {
 				rt.closeErr = err
 			}
 		}

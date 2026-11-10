@@ -41,7 +41,9 @@ Managed mode on macOS is the tRPC Seatbelt path in upstream `codeexecutor/sandbo
 
 Windows has no managed native backend. `commandExecutor` returns `agent.ErrSandboxUnavailable` when `GOOS` is `windows` or when tests set `Options.Platform` to `windows`. That unit test runs on Linux and only checks the fail-closed branch. It is not a Windows execution. `host_windows.go` uses `CommandContext` for explicit `danger_full_access` and does not claim process-tree cleanup. Job Objects, WSL, and Docker are not labeled as a managed Windows sandbox. `sandbox.Backend` is the extension point for a future implementation that has passed the checks in design spec section 10.3.
 
-`run_command` takes an argv, not a shell string. The tool result includes `isolation`: `managed`, `none`, or `external`.
+`run_command` takes an argv, not a shell string. The tool result includes `isolation`: `managed`, `none`, or `external`. The tool permission policy decides whether the command may start. The executor enforces the sandbox again and does not ask for a second approval.
+
+Skill execution uses the same choice when `skills.knowledge_only` is false. `workspace_write` with `managed` uses the tRPC OS sandbox. `danger_full_access`, either as `workspace.permission` or `sandbox.mode`, runs on the host and is reported as isolation `none`, not as managed. Windows `managed` returns unavailable and does not run on the host. External skill execution is refused rather than falling back to the host. Fenced code blocks are not an execution path.
 
 Workspace file tools use `os.Root`. A symlink whose target is outside the workspace is rejected. An absolute symlink is also rejected, even when the target is inside the workspace. That is an `os.Root` limit, not a separate policy.
 

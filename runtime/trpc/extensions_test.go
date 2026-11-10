@@ -93,6 +93,7 @@ func TestHookCannotBypassExecutor(t *testing.T) {
 	cfg.Model.Generation.Stream = boolPtr(false)
 	cfg.Journal.Enabled = false
 	cfg.Plugins.Enabled = []string{"guard"}
+	cfg.Hooks.Allow = []string{"guard/hooks"}
 	mdl := mockmodel.New("hook", mockmodel.ToolThenText("echo", `{"text":"x"}`, "done"))
 	rt, err := New(Options{
 		Config:        &cfg,

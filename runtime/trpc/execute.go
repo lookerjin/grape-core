@@ -33,6 +33,9 @@ type commandExecutor struct {
 	mu     sync.Mutex
 	probed bool
 	caps   sandbox.Capabilities
+
+	skillMu   sync.Mutex
+	skillByWS map[string]cachedSkillExec
 }
 
 func newCommandExecutor(cfg config.Config, sandboxRoot, dataDir, platform string, external sandbox.Backend) *commandExecutor {
@@ -265,6 +268,120 @@ func (e *commandExecutor) managed(ctx context.Context, req sandbox.Request) (san
 		return out, agent.Wrap(agent.ErrTool, "command", err)
 	}
 	return out, nil
+}
+
+type cachedSkillExec struct {
+	exec      codeexecutor.CodeExecutor
+	isolation string
+}
+
+func (e *commandExecutor) skillCodeExecutor(workspace string) (codeexecutor.CodeExecutor, string, error) {
+	if e == nil {
+		return nil, "", agent.Wrap(agent.ErrInvalidConfig, "skill", fmt.Errorf("executor is nil"))
+	}
+	if workspace == "" {
+		workspace = e.cfg.Workspace.Root
+	}
+	isolation, host := e.skillTarget()
+	e.skillMu.Lock()
+	defer e.skillMu.Unlock()
+	if e.skillByWS == nil {
+		e.skillByWS = map[string]cachedSkillExec{}
+	}
+	key := isolation + "\x00" + workspace
+	if hit, ok := e.skillByWS[key]; ok {
+		return hit.exec, hit.isolation, nil
+	}
+	var exec codeexecutor.CodeExecutor
+	if host {
+		exec = &hostCodeExecutor{workspace: workspace}
+	} else if e.cfg.Sandbox.Mode == sandbox.ModeExternal {
+		return nil, "", agent.Wrap(agent.ErrSandboxUnavailable, "skill", fmt.Errorf("external skill execution is not wired and will not fall back to the host"))
+	} else if e.platform == "windows" {
+		return nil, "", agent.Wrap(agent.ErrSandboxUnavailable, "skill", fmt.Errorf("managed skill execution is unavailable on windows"))
+	} else {
+		if err := os.MkdirAll(e.sandboxRoot, 0o755); err != nil {
+			return nil, "", agent.Wrap(agent.ErrSandboxUnavailable, "skill", err)
+		}
+		exec = trpcsandbox.New(
+			trpcsandbox.WithWorkspaceRoot(e.sandboxRoot),
+			trpcsandbox.WithPermissionProfile(e.profile(workspace)),
+			trpcsandbox.WithShellEnvironmentPolicy(e.envPolicy()),
+		)
+		isolation = sandbox.IsolationManaged
+	}
+	e.skillByWS[key] = cachedSkillExec{exec: exec, isolation: isolation}
+	return exec, isolation, nil
+}
+
+// skillTarget reports the isolation actually used for skill execution.
+// danger_full_access is the host. It is never reported as managed.
+func (e *commandExecutor) skillTarget() (isolation string, host bool) {
+	if e.cfg.Workspace.Permission == agent.PermissionDangerFullAccess || e.cfg.Sandbox.Mode == sandbox.ModeDangerFullAccess {
+		return sandbox.IsolationNone, true
+	}
+	return sandbox.IsolationManaged, false
+}
+
+func (e *commandExecutor) closeSkillExecutors() error {
+	if e == nil {
+		return nil
+	}
+	e.skillMu.Lock()
+	defer e.skillMu.Unlock()
+	var err error
+	for _, item := range e.skillByWS {
+		closer, ok := item.exec.(interface{ Close() error })
+		if !ok {
+			continue
+		}
+		if closeErr := closer.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	e.skillByWS = nil
+	return err
+}
+
+// hostCodeExecutor runs skill code on the host. Isolation is none.
+// It is not the tRPC local executor and it is not a managed sandbox.
+type hostCodeExecutor struct {
+	workspace string
+}
+
+func (e *hostCodeExecutor) CodeBlockDelimiter() codeexecutor.CodeBlockDelimiter {
+	return codeexecutor.CodeBlockDelimiter{Start: "```", End: "```"}
+}
+
+func (e *hostCodeExecutor) ExecuteCode(ctx context.Context, in codeexecutor.CodeExecutionInput) (codeexecutor.CodeExecutionResult, error) {
+	if e == nil {
+		return codeexecutor.CodeExecutionResult{}, fmt.Errorf("host executor is nil")
+	}
+	var out strings.Builder
+	for i, block := range in.CodeBlocks {
+		fn, mode, cmd, args, err := codeexecutor.BuildBlockSpec(i, block)
+		if err != nil {
+			return codeexecutor.CodeExecutionResult{}, err
+		}
+		dir := e.workspace
+		if dir == "" {
+			dir = os.TempDir()
+		}
+		path := filepath.Join(dir, fn)
+		if err := os.WriteFile(path, []byte(block.Code), os.FileMode(mode)); err != nil {
+			return codeexecutor.CodeExecutionResult{}, err
+		}
+		argv := append(append([]string{}, args...), path)
+		stdout, stderr, _, _, runErr := runHost(ctx, dir, append([]string{cmd}, argv...), nil, 60*time.Second)
+		out.WriteString(stdout)
+		if stderr != "" {
+			out.WriteString(stderr)
+		}
+		if runErr != nil {
+			return codeexecutor.CodeExecutionResult{Output: out.String()}, runErr
+		}
+	}
+	return codeexecutor.CodeExecutionResult{Output: out.String()}, nil
 }
 
 func (e *commandExecutor) envPolicy() trpcsandbox.ShellEnvironmentPolicy {

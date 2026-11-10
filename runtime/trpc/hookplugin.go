@@ -101,15 +101,6 @@ func (p *hookPlugin) beforeTool(ctx context.Context, args *tool.BeforeToolArgs) 
 		if err := p.rt.consumeToolCall(ctx); err != nil {
 			return nil, err
 		}
-		if p.rt.nestedCaller(ctx) {
-			kind := p.rt.nestedToolKind(ctx, args.ToolName)
-			if err := p.rt.authorize(ctx, kind, args.ToolName, ""); err != nil {
-				return &tool.BeforeToolResult{CustomResult: map[string]any{
-					"denied": true,
-					"error":  err.Error(),
-				}}, nil
-			}
-		}
 	}
 	return nil, nil
 }

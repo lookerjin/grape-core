@@ -3,7 +3,6 @@ package trpcruntime
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -331,24 +330,18 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 		return tools
 	}
 	tools = append(tools,
-		function.NewFunctionTool(func(ctx context.Context, in saveIn) (map[string]any, error) {
-			if err := rt.authorize(ctx, "write", in.FileName, in.FileName); err != nil {
-				return map[string]any{"denied": true, "error": err.Error()}, nil
-			}
+		kindTool(function.NewFunctionTool(func(ctx context.Context, in saveIn) (map[string]any, error) {
 			if err := coding.Save(ws(ctx), in.FileName, in.Contents, in.Overwrite); err != nil {
 				return nil, err
 			}
 			return map[string]any{"file_name": in.FileName, "message": "saved"}, nil
-		}, function.WithName("save_file"), function.WithDescription("Write a UTF-8 file inside the workspace. Symlinks that leave the workspace are rejected.")),
-		function.NewFunctionTool(func(ctx context.Context, in replaceIn) (map[string]any, error) {
-			if err := rt.authorize(ctx, "write", in.FileName, in.FileName); err != nil {
-				return map[string]any{"denied": true, "error": err.Error()}, nil
-			}
+		}, function.WithName("save_file"), function.WithDescription("Write a UTF-8 file inside the workspace. Symlinks that leave the workspace are rejected.")), "write"),
+		kindTool(function.NewFunctionTool(func(ctx context.Context, in replaceIn) (map[string]any, error) {
 			if err := coding.Replace(ws(ctx), in.FileName, in.OldString, in.NewString, in.NumReplacements); err != nil {
 				return nil, err
 			}
 			return map[string]any{"file_name": in.FileName, "message": "replaced"}, nil
-		}, function.WithName("replace_content"), function.WithDescription("Replace text in a UTF-8 workspace file without following escaping symlinks.")),
+		}, function.WithName("replace_content"), function.WithDescription("Replace text in a UTF-8 workspace file without following escaping symlinks.")), "write"),
 	)
 	return tools
 }
@@ -356,11 +349,11 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) ([]tool.Tool, error) {
 	tools := rt.fileTools(workspace, allowWrite)
 	tools = append(tools,
-		function.NewFunctionTool(
+		kindTool(function.NewFunctionTool(
 			rt.runCommand,
 			function.WithName("run_command"),
 			function.WithDescription("Run an argv command in the workspace. argv is not a shell string. The result includes the isolation level that was actually used."),
-		),
+		), "command"),
 		rt.asRead(function.NewFunctionTool(
 			func(ctx context.Context, in pathIn) (map[string]string, error) {
 				text, err := coding.GitStatus(ctx, workspace)
@@ -388,10 +381,6 @@ func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) ([]tool.Too
 }
 
 func (rt *Runtime) runCommand(ctx context.Context, in cmdIn) (cmdOut, error) {
-	detail := strings.Join(in.Argv, " ")
-	if err := rt.authorize(ctx, "command", detail, ""); err != nil {
-		return cmdOut{}, err
-	}
 	ws := rt.cfg.Workspace.Root
 	if v, ok := ctx.Value(workspaceKey{}).(string); ok && v != "" {
 		ws = v
@@ -415,61 +404,43 @@ func (rt *Runtime) runCommand(ctx context.Context, in cmdIn) (cmdOut, error) {
 type ToolSpec struct {
 	Tool tool.Tool
 	// Kind is read, write, command, or side_effect. Empty means side_effect.
+	// The caller is classifying its own tool. A tool name or ToolMetadata
+	// value is not a kind.
 	Kind string
-	// Trusted skips the approval and read_only gate.
+	// Trusted skips the run policy. The caller then owns that tool's
+	// internals, including nested calls and whether they use the sandbox.
 	Trusted bool
 }
 
-type gatedTool struct {
-	rt    *Runtime
+// kindedTool labels a tool grape assembled. Call does not authorize.
+type kindedTool struct {
 	inner tool.CallableTool
 	kind  string
 }
 
-func (t gatedTool) Declaration() *tool.Declaration { return t.inner.Declaration() }
+func (t kindedTool) Declaration() *tool.Declaration {
+	if t.inner == nil {
+		return nil
+	}
+	return t.inner.Declaration()
+}
 
-func (t gatedTool) Call(ctx context.Context, args []byte) (any, error) {
-	name := ""
-	if decl := t.Declaration(); decl != nil {
-		name = decl.Name
-	}
-	if err := t.rt.authorize(ctx, t.kind, name, ""); err != nil {
-		return map[string]any{"denied": true, "error": err.Error()}, nil
-	}
+func (t kindedTool) Call(ctx context.Context, args []byte) (any, error) {
 	return t.inner.Call(ctx, args)
 }
 
-func (rt *Runtime) gate(item tool.Tool, kind string) tool.Tool {
+func kindTool(item tool.Tool, kind string) tool.Tool {
 	callable, ok := item.(tool.CallableTool)
-	if !ok || rt == nil {
-		return rejectedTool{inner: item, rt: rt, kind: kind}
+	if !ok {
+		return item
 	}
-	return gatedTool{rt: rt, inner: callable, kind: kind}
-}
-
-// rejectedTool is a non-callable tool exposed as a callable denial so it
-// cannot skip the approval gate.
-type rejectedTool struct {
-	inner tool.Tool
-	rt    *Runtime
-	kind  string
-}
-
-func (t rejectedTool) Declaration() *tool.Declaration {
-	if t.inner != nil && t.inner.Declaration() != nil {
-		return t.inner.Declaration()
+	if kind == "" {
+		kind = "side_effect"
 	}
-	return &tool.Declaration{Name: "rejected"}
-}
-
-func (t rejectedTool) Call(ctx context.Context, args []byte) (any, error) {
-	name := t.Declaration().Name
-	if t.rt != nil {
-		if err := t.rt.authorize(ctx, t.kind, name, ""); err != nil {
-			return map[string]any{"denied": true, "error": err.Error()}, nil
-		}
+	if kind == "read" {
+		return &builtinReadTool{inner: callable}
 	}
-	return map[string]any{"denied": true, "error": "tool is not callable"}, nil
+	return kindedTool{inner: callable, kind: kind}
 }
 
 type trackingTool struct{ inner tool.CallableTool }

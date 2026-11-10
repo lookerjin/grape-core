@@ -76,8 +76,8 @@ func TestUntrustedToolsAndSubagentsAreGated(t *testing.T) {
 				}
 				continue
 			}
-			if asked == 0 {
-				t.Fatalf("%s %s asked=0: %s", perm, mode, blob)
+			if asked != 1 {
+				t.Fatalf("%s %s asked=%d, want 1: %s", perm, mode, asked, blob)
 			}
 		}
 	}
@@ -1059,7 +1059,9 @@ func TestRootNameIsNotTheRootIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	blob := eventBlob(collect(t, h))
-	if ran.Load() != 1 || asked.Load() != 0 {
+	// The framework schedules this FixedAgent tool, so the run policy
+	// asks once. Allowing the decision runs the tool.
+	if ran.Load() != 1 || asked.Load() != 1 {
 		t.Fatalf("ran=%d asked=%d %s", ran.Load(), asked.Load(), blob)
 	}
 }
@@ -1078,29 +1080,23 @@ func TestNestedLoopHitsRunBudget(t *testing.T) {
 			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("stop")}}}, nil
 		}
 		text := messagesText(req)
-		if strings.Contains(text, "other-agent") {
-			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("other-done")}}}, nil
-		}
 		if strings.Contains(text, "child-agent") {
-			return toolCallID("transfer_to_agent", `{"agent_name":"other","message":"go"}`, ""), nil
+			return toolCallID("again", `{}`, ""), nil
 		}
 		if hasToolMessage(req) {
 			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
 		}
 		return toolCall("helper", `{"request":"go"}`), nil
 	})
-	other := llmagent.New("other",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("other-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-	)
+	again := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
+		return "ran", nil
+	}, function.WithName("again"), function.WithDescription("side effect"))
 	child := llmagent.New("helper",
 		llmagent.WithModel(mdl),
 		llmagent.WithInstruction("child-agent"),
 		llmagent.WithEnableCodeExecutionResponseProcessor(false),
 		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithSubAgents([]trpcagent.Agent{other}),
+		llmagent.WithTools([]tool.Tool{again}),
 	)
 	rt, err := New(Options{
 		Config: &cfg, Model: mdl, DataDir: t.TempDir(),

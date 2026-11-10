@@ -54,6 +54,9 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 			case plugin.KindRule:
 				rt.ruleSources = append(rt.ruleSources, rules.Source{Name: "plugin:" + comp.Name, Path: comp.Path})
 			case plugin.KindHook:
+				if !hookAllowed(rt.cfg.Hooks.Allow, comp.Name) {
+					continue
+				}
 				specs, err := hooks.Load(comp.Path)
 				if err != nil {
 					return err
@@ -89,13 +92,16 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 				}
 			}
 		}
-		if len(hookSpecs) > 0 {
-			timeout, err := config.Duration(rt.cfg.Hooks.Timeout)
-			if err != nil {
-				return err
-			}
-			rt.hookRunner = hooks.NewRunner(rt.exec, hookSpecs, rt.cfg.Hooks.MaxConcurrent, timeout)
+		rt.pluginHooks = hookSpecs
+	}
+	hookSpecs := append([]hooks.Spec{}, rt.pluginHooks...)
+	hookSpecs = append(hookSpecs, rt.grantedHooks...)
+	if len(hookSpecs) > 0 {
+		timeout, err := config.Duration(rt.cfg.Hooks.Timeout)
+		if err != nil {
+			return err
 		}
+		rt.hookRunner = hooks.NewRunner(rt.exec, hookSpecs, rt.cfg.Hooks.MaxConcurrent, timeout)
 	}
 	if _, err := skill.Discover(rt.cfg.Plugins.Conflict, rt.skillRoots...); err != nil {
 		return err
@@ -106,6 +112,15 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 	}
 	rt.ruleText = text
 	return nil
+}
+
+func hookAllowed(allow []string, name string) bool {
+	for _, item := range allow {
+		if item == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (rt *Runtime) ruleTextFor(workspace string) (string, error) {

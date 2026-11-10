@@ -21,8 +21,8 @@ my-plugin/
 
 `commands/*.md` and `agents/*.md` are discovery-only. The runtime lists them on the plugin snapshot (`discovery_only`) and does not turn them into tools or subagents.
 
-`hooks.json` events that have a callback are `BeforeRun`, `AfterRun`, `BeforeModel`, `AfterModel`, `BeforeTool`, `AfterTool`, and `OnEvent`. `OnError` is unsupported. Shell hooks run through `sandbox.Executor`, not `os/exec`.
+`hooks.json` events that have a callback are `BeforeRun`, `AfterRun`, `BeforeModel`, `AfterModel`, `BeforeTool`, `AfterTool`, and `OnEvent`. `OnError` is unsupported. Installing or enabling the plugin does not run these hooks. `hooks.allow` must list the component key `name/hooks`. Hooks passed to runtime `Options.Hooks` are a separate embedder grant. An allowed hook is not sent through the tool approval decider on every call. Shell hooks still run through `sandbox.Executor`, not `os/exec`.
 
-Skills are discovered as `SKILL.md` summaries. The runtime passes those directories to tRPC `skill.NewFSRepository` with `SkillToolProfileKnowledgeOnly` unless knowledge-only mode is turned off, and it always sets `WithEnableCodeExecutionResponseProcessor(false)`.
+Skills are discovered as `SKILL.md` summaries. The runtime passes those directories to tRPC `skill.NewFSRepository`. `skills.knowledge_only` defaults to true, which selects the knowledge-only tool profile and does not attach a code executor. Setting it false attaches the sandbox executor, or the host executor when the user chose `danger_full_access`. The runtime always sets `WithEnableCodeExecutionResponseProcessor(false)`, so a fenced code block in a model reply is not executed.
 
 Rules load from the global data directory, then plugin files, then `<workspace>/.grape/rules`, sorted inside each root. The runtime appends the applicable text to the agent instruction.

@@ -254,15 +254,6 @@ func (t hostMCPTool) Call(ctx context.Context, args []byte) (any, error) {
 		st.enterTool()
 		defer st.leaveTool()
 	}
-	if t.rt != nil {
-		name := ""
-		if decl := t.Declaration(); decl != nil {
-			name = decl.Name
-		}
-		if err := t.rt.authorize(ctx, t.kind, name, ""); err != nil {
-			return map[string]any{"isolation": "none", "denied": true, "error": err.Error()}, nil
-		}
-	}
 	res, err := t.inner.Call(ctx, args)
 	body := map[string]any{"isolation": "none", "result": res}
 	if err != nil {
