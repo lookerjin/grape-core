@@ -98,15 +98,11 @@ func TestUntrustedToolsAndSubagentsAreGated(t *testing.T) {
 		}
 		return toolCall("helper", `{"request":"child-task"}`), nil
 	})
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("answer"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-	)
 	rt, err := New(Options{
 		Config: &cfg, Model: mdl, DataDir: t.TempDir(), Decider: deny,
-		SubAgents: []trpcagent.Agent{child},
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "answer", Model: mdl,
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -190,13 +186,6 @@ func TestApprovedHelperStillGatesChildTools(t *testing.T) {
 			}
 			return toolCall("helper", `{"request":"child-task"}`), nil
 		})
-		child := llmagent.New("helper",
-			llmagent.WithModel(mdl),
-			llmagent.WithInstruction("child-agent"),
-			llmagent.WithEnableCodeExecutionResponseProcessor(false),
-			llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-			llmagent.WithTools([]tool.Tool{dangerTool}),
-		)
 		rt, err := New(Options{
 			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
 			Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
@@ -205,7 +194,10 @@ func TestApprovedHelperStillGatesChildTools(t *testing.T) {
 				}
 				return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
 			}),
-			SubAgents: []trpcagent.Agent{child},
+			Subagents: []SubagentSpec{{
+				Name: "helper", Instruction: "child-agent", Model: mdl,
+				Tools: []tool.Tool{dangerTool},
+			}},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -251,13 +243,6 @@ func TestChildToolNamedLikeParentIsStillGated(t *testing.T) {
 			}
 			return toolCall("helper", `{"request":"child-task"}`), nil
 		})
-		child := llmagent.New("helper",
-			llmagent.WithModel(mdl),
-			llmagent.WithInstruction("child-agent"),
-			llmagent.WithEnableCodeExecutionResponseProcessor(false),
-			llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-			llmagent.WithTools([]tool.Tool{childCmd}),
-		)
 		var asked []string
 		rt, err := New(Options{
 			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
@@ -268,7 +253,10 @@ func TestChildToolNamedLikeParentIsStillGated(t *testing.T) {
 				}
 				return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
 			}),
-			SubAgents: []trpcagent.Agent{child},
+			Subagents: []SubagentSpec{{
+				Name: "helper", Instruction: "child-agent", Model: mdl,
+				Tools: []tool.Tool{childCmd},
+			}},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -285,7 +273,7 @@ func TestChildToolNamedLikeParentIsStillGated(t *testing.T) {
 		if ran.Load() != 0 || strings.Contains(blob, "child-ran") {
 			t.Fatalf("%s child run_command ran %d asked=%v %s", mode, ran.Load(), asked, blob)
 		}
-		if !strings.Contains(blob, `"detail":"run_command"`) || !strings.Contains(blob, `"allowed":false`) {
+		if !strings.Contains(blob, `"detail":"true"`) || !strings.Contains(blob, `"allowed":false`) {
 			t.Fatalf("%s did not gate the child tool asked=%v %s", mode, asked, blob)
 		}
 	}
@@ -396,13 +384,6 @@ func TestNestedToolsDoNotStackAndGrandchildIsGated(t *testing.T) {
 		}
 		return toolCall("helper", `{"request":"x"}`), nil
 	})
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("child-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{childDanger}),
-	)
 	rt, err := New(Options{
 		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
 		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
@@ -414,7 +395,10 @@ func TestNestedToolsDoNotStackAndGrandchildIsGated(t *testing.T) {
 			}
 			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
 		}),
-		SubAgents: []trpcagent.Agent{child},
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "child-agent", Model: mdl,
+			Tools: []tool.Tool{childDanger},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -466,38 +450,30 @@ func TestGrandchildAndDynamicToolSetAreGated(t *testing.T) {
 		case strings.Contains(text, "grand-agent"):
 			return toolCall("grand_danger", `{}`), nil
 		case strings.Contains(text, "child-agent"):
-			return toolCall("transfer_to_agent", `{"agent_name":"grand","message":"go"}`), nil
+			return toolCall("grand", `{"request":"go"}`), nil
 		default:
 			return toolCall("helper", `{"request":"x"}`), nil
 		}
 	})
-	grandAgent := llmagent.New("grand",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("grand-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{grandTool}),
-	)
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("child-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithSubAgents([]trpcagent.Agent{grandAgent}),
-		llmagent.WithToolSets([]tool.ToolSet{dynSet{tool: dynTool}}),
-		llmagent.WithRefreshToolSetsOnRun(true),
-	)
 	rt, err := New(Options{
 		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
 		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
 			switch req.Detail {
-			case "helper", "transfer_to_agent":
+			case "helper", "grand":
 				return agent.Decision{ID: req.ID, Allow: true}, nil
 			default:
 				return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
 			}
 		}),
-		SubAgents: []trpcagent.Agent{child},
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "child-agent", Model: mdl,
+			ToolSets:        []tool.ToolSet{dynSet{tool: dynTool}},
+			RefreshToolSets: true,
+			Subagents: []SubagentSpec{{
+				Name: "grand", Instruction: "grand-agent", Model: mdl,
+				Tools: []tool.Tool{grandTool},
+			}},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -518,44 +494,42 @@ func TestGrandchildAndDynamicToolSetAreGated(t *testing.T) {
 
 func TestChildReadToolIsNotPromptedInReadOnly(t *testing.T) {
 	cfg := config.Default()
-	cfg.Workspace.Permission = agent.PermissionReadOnly
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Approvals.Required = true
 	cfg.Journal.Enabled = false
 	cfg.Model.Generation.Stream = boolPtr(false)
 	var asked atomic.Int32
+	var ran atomic.Int32
 	readTool := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
+		ran.Add(1)
 		return "child-notes", nil
 	}, function.WithName("read_notes"), function.WithDescription("notes"))
 	mdl := mockmodel.New("child-read", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if strings.Contains(lastUserText(req), "read-notes") {
+			if hasToolMessage(req) {
+				return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+			}
+			return toolCall("read_notes", `{}`), nil
+		}
 		if hasToolMessage(req) {
 			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
 		}
-		if strings.Contains(messagesText(req), "child-agent") {
-			return toolCall("read_notes", `{}`), nil
-		}
-		return toolCall("transfer_to_agent", `{"agent_name":"helper","message":"read"}`), nil
+		return toolCall("helper", `{"request":"read-notes"}`), nil
 	})
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("child-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{readTool}),
-	)
-	root := llmagent.New("grape",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("root"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithSubAgents([]trpcagent.Agent{child}),
-	)
 	rt, err := New(Options{
-		Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root,
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
 		NestedReads: []NestedRead{{Agent: "helper", Tool: "read_notes"}},
 		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
 			asked.Add(1)
+			if req.Detail == "helper" {
+				return agent.Decision{ID: req.ID, Allow: true}, nil
+			}
 			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
 		}),
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "child-agent", Model: mdl,
+			Tools: []tool.Tool{readTool},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -566,11 +540,8 @@ func TestChildReadToolIsNotPromptedInReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	blob := eventBlob(collect(t, h))
-	if asked.Load() != 0 {
-		t.Fatalf("read tool asked %d: %s", asked.Load(), blob)
-	}
-	if !strings.Contains(blob, "child-notes") {
-		t.Fatalf("read tool did not run: %s", blob)
+	if asked.Load() != 1 || ran.Load() != 1 {
+		t.Fatalf("asked=%d ran=%d %s", asked.Load(), ran.Load(), blob)
 	}
 }
 
@@ -594,13 +565,6 @@ func TestConcurrentSubagentSessions(t *testing.T) {
 		}
 		return toolCall("helper", `{"request":"x"}`), nil
 	})
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("child-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{danger}),
-	)
 	rt, err := New(Options{
 		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
 		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
@@ -609,7 +573,10 @@ func TestConcurrentSubagentSessions(t *testing.T) {
 			}
 			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
 		}),
-		SubAgents: []trpcagent.Agent{child},
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "child-agent", Model: mdl,
+			Tools: []tool.Tool{danger},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -671,19 +638,15 @@ func TestTransferToAgentCannotRunSubagentTools(t *testing.T) {
 			}
 			return toolCall("transfer_to_agent", `{"agent_name":"helper"}`), nil
 		})
-		child := llmagent.New("helper",
-			llmagent.WithModel(mdl),
-			llmagent.WithInstruction("child-agent"),
-			llmagent.WithEnableCodeExecutionResponseProcessor(false),
-			llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-			llmagent.WithTools([]tool.Tool{dangerTool}),
-		)
 		rt, err := New(Options{
 			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
 			Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
 				return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
 			}),
-			SubAgents: []trpcagent.Agent{child},
+			Subagents: []SubagentSpec{{
+				Name: "helper", Instruction: "child-agent", Model: mdl,
+				Tools: []tool.Tool{dangerTool},
+			}},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -827,7 +790,7 @@ func assertNestedToolDenied(t *testing.T, evil tool.Tool, set tool.ToolSet, call
 
 func TestBuiltinReadIdentityStaysUnprompted(t *testing.T) {
 	cfg := config.Default()
-	cfg.Workspace.Permission = agent.PermissionReadOnly
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Approvals.Required = true
 	cfg.Journal.Enabled = false
 	cfg.Model.Generation.Stream = boolPtr(false)
@@ -839,34 +802,30 @@ func TestBuiltinReadIdentityStaysUnprompted(t *testing.T) {
 	}, function.WithName("read_file"), function.WithDescription("level:read but this wrapper is the grape type"))
 	readTool := &builtinReadTool{inner: inner}
 	mdl := mockmodel.New("ident", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if strings.Contains(lastUserText(req), "builtin-body") {
+			if hasToolMessage(req) {
+				return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+			}
+			return toolCall("read_file", `{}`), nil
+		}
 		if hasToolMessage(req) {
 			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
 		}
-		if strings.Contains(messagesText(req), "child-agent") {
-			return toolCall("read_file", `{}`), nil
-		}
-		return toolCall("transfer_to_agent", `{"agent_name":"helper","message":"go"}`), nil
+		return toolCall("helper", `{"request":"builtin-body"}`), nil
 	})
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("child-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{readTool}),
-	)
-	root := llmagent.New("grape",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("root"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithSubAgents([]trpcagent.Agent{child}),
-	)
 	rt, err := New(Options{
-		Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root,
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
 		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
 			asked.Add(1)
+			if req.Detail == "helper" {
+				return agent.Decision{ID: req.ID, Allow: true}, nil
+			}
 			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
 		}),
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "child-agent", Model: mdl,
+			Tools: []tool.Tool{readTool},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -877,7 +836,7 @@ func TestBuiltinReadIdentityStaysUnprompted(t *testing.T) {
 		t.Fatal(err)
 	}
 	blob := eventBlob(collect(t, h))
-	if asked.Load() != 0 || ran.Load() != 1 || !strings.Contains(blob, "from-builtin") {
+	if asked.Load() != 1 || ran.Load() != 1 {
 		t.Fatalf("asked=%d ran=%d %s", asked.Load(), ran.Load(), blob)
 	}
 }
@@ -904,17 +863,19 @@ func TestNewRejectsNonRootAgentNamedGrape(t *testing.T) {
 	t.Run("subagent", func(t *testing.T) {
 		_, err := New(Options{
 			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
-			SubAgents: []trpcagent.Agent{grapeAgent("grape", nil)},
+			Subagents: []SubagentSpec{{Name: "grape", Model: mdl}},
 		})
 		if err == nil || !strings.Contains(err.Error(), "reserved") {
 			t.Fatalf("err=%v", err)
 		}
 	})
 	t.Run("transfer-target", func(t *testing.T) {
-		child := grapeAgent("helper", []trpcagent.Agent{grapeAgent("grape", nil)})
 		_, err := New(Options{
 			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
-			SubAgents: []trpcagent.Agent{child},
+			Subagents: []SubagentSpec{{
+				Name: "helper", Model: mdl,
+				Subagents: []SubagentSpec{{Name: "grape", Model: mdl}},
+			}},
 		})
 		if err == nil || !strings.Contains(err.Error(), "reserved") {
 			t.Fatalf("err=%v", err)
@@ -956,50 +917,29 @@ func TestEmptyIDDoesNotTreatGrapeNameAsRoot(t *testing.T) {
 			}
 			return toolCallID("child_danger", `{}`, ""), nil
 		}
-		return toolCallID("transfer_to_agent", `{"agent_name":"helper","message":"go"}`, ""), nil
+		return toolCallID("helper", `{"request":"go"}`, ""), nil
 	})
-	child := llmagent.New("grape",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("child-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{danger}),
-	)
-	root := llmagent.New("orchestrator",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("root"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithSubAgents([]trpcagent.Agent{child}),
-	)
-	_, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root})
+	_, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Subagents: []SubagentSpec{{Name: "grape", Instruction: "child-agent", Model: mdl}},
+	})
 	if err == nil || !strings.Contains(err.Error(), "reserved") {
 		t.Fatalf("direct child named grape: %v", err)
 	}
 
-	helper := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("child-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{danger}),
-	)
-	root = llmagent.New("orchestrator",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("root"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
-			return "root-ok", nil
-		}, function.WithName("root_mark"), function.WithDescription("root tool"))}),
-		llmagent.WithSubAgents([]trpcagent.Agent{helper}),
-	)
 	rt, err := New(Options{
-		Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root,
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
 		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
 			asked.Add(1)
+			if req.Detail == "helper" {
+				return agent.Decision{ID: req.ID, Allow: true}, nil
+			}
 			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
 		}),
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "child-agent", Model: mdl,
+			Tools: []tool.Tool{danger},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1091,16 +1031,12 @@ func TestNestedLoopHitsRunBudget(t *testing.T) {
 	again := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
 		return "ran", nil
 	}, function.WithName("again"), function.WithDescription("side effect"))
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("child-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{again}),
-	)
 	rt, err := New(Options{
 		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
-		SubAgents: []trpcagent.Agent{child},
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "child-agent", Model: mdl,
+			Tools: []tool.Tool{again},
+		}},
 		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
 			if req.Detail == "helper" {
 				return agent.Decision{ID: req.ID, Allow: true}, nil

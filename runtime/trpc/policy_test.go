@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lookerjin/grape-core/agent"
@@ -14,10 +15,12 @@ import (
 	"github.com/lookerjin/grape-core/sandbox"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	localexec "trpc.group/trpc-go/trpc-agent-go/codeexecutor/local"
 	trpcsandbox "trpc.group/trpc-go/trpc-agent-go/codeexecutor/sandbox"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
+	transfertool "trpc.group/trpc-go/trpc-agent-go/tool/transfer"
 )
 
 func TestDeciderAllowRunsTheToolOnce(t *testing.T) {
@@ -196,14 +199,11 @@ func TestFencedCodeIsNotExecuted(t *testing.T) {
 	exec := rt.boundExec
 	isolation := rt.boundIsolation
 	rt.mu.Unlock()
-	if _, ok := exec.(*hostCodeExecutor); !ok {
+	if _, ok := exec.(*localexec.CodeExecutor); !ok {
 		t.Fatalf("executor %T isolation %s", exec, isolation)
 	}
 	if isolation != sandbox.IsolationNone {
 		t.Fatalf("danger_full_access isolation %q", isolation)
-	}
-	if strings.Contains(fmt.Sprintf("%T", exec), "local.CodeExecutor") {
-		t.Fatal("local executor was selected")
 	}
 }
 
@@ -274,17 +274,13 @@ func TestStaticSubagentIsNotARawAgentTool(t *testing.T) {
 		}
 		return toolCall("helper", `{"request":"child-task"}`), nil
 	})
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("answer"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-	)
 	rt, err := New(Options{
-		Config:    &cfg,
-		Model:     mdl,
-		DataDir:   t.TempDir(),
-		SubAgents: []trpcagent.Agent{child},
+		Config:  &cfg,
+		Model:   mdl,
+		DataDir: t.TempDir(),
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "answer", Model: mdl,
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -298,6 +294,392 @@ func TestStaticSubagentIsNotARawAgentTool(t *testing.T) {
 	if !strings.Contains(blob, "child-ok") {
 		t.Fatalf("static subagent did not run under the inherited policy: %s", blob)
 	}
+}
+
+func TestSkillRunUsesTheSelectedExecutor(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		permission string
+		mode       string
+		wantLocal  bool
+		isolation  string
+		marker     string
+	}{
+		{"managed", agent.PermissionWorkspaceWrite, sandbox.ModeManaged, false, sandbox.IsolationManaged, "sandbox-ok"},
+		{"danger", agent.PermissionDangerFullAccess, sandbox.ModeManaged, true, sandbox.IsolationNone, "host-ok"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeSkill(t, filepath.Join(dir, "skills"))
+			cfg := config.Default()
+			cfg.Skills.Paths = []string{filepath.Join(dir, "skills")}
+			cfg.Skills.KnowledgeOnly = boolPtr(false)
+			cfg.Workspace.Permission = tc.permission
+			cfg.Workspace.Root = dir
+			cfg.Sandbox.Mode = tc.mode
+			cfg.Journal.Enabled = false
+			cfg.Model.Generation.Stream = boolPtr(false)
+			marker := tc.marker
+			var step int
+			mdl := mockmodel.New(tc.name, func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				step++
+				switch step {
+				case 1:
+					return toolCall("skill_load", `{"skill":"review"}`), nil
+				case 2:
+					return toolCall("skill_run", `{"skill":"review","command":"echo `+marker+`"}`), nil
+				default:
+					return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+				}
+			})
+			rt, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rt.Close()
+			h, err := rt.Start(context.Background(), agent.RunRequest{
+				UserID: "u", SessionID: "skill-" + tc.name, Workspace: dir, Message: "run",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			blob := eventBlob(collect(t, h))
+			if !strings.Contains(blob, marker) {
+				t.Fatalf("skill_run did not return %s: %s", marker, blob)
+			}
+			if strings.Contains(blob, "falling back to local engine") {
+				t.Fatalf("implicit local fallback: %s", blob)
+			}
+			rt.mu.Lock()
+			exec := rt.boundExec
+			isolation := rt.boundIsolation
+			rt.mu.Unlock()
+			if isolation != tc.isolation {
+				t.Fatalf("isolation %q", isolation)
+			}
+			_, local := exec.(*localexec.CodeExecutor)
+			_, sand := exec.(*trpcsandbox.CodeExecutor)
+			if tc.wantLocal && !local {
+				t.Fatalf("executor %T", exec)
+			}
+			if !tc.wantLocal && !sand {
+				t.Fatalf("executor %T", exec)
+			}
+		})
+	}
+}
+
+func TestSpecSubagentDoesNotRunFencedCode(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "fence.txt")
+	fence := "```python\nopen('" + marker + "','w').write('x')\n```"
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Workspace.Root = dir
+	cfg.Approvals.Required = true
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	mdl := mockmodel.New("spec-fence", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if strings.Contains(lastUserText(req), "child-fence") {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage(fence)}}}, nil
+		}
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return toolCall("helper", `{"request":"child-fence"}`), nil
+	})
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			if req.Detail == "helper" {
+				return agent.Decision{ID: req.ID, Allow: true}, nil
+			}
+			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+		}),
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "child-fence", Model: mdl,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{
+		UserID: "u", SessionID: "spec-fence", Workspace: dir, Message: "go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("spec subagent executed a fenced block")
+	}
+	if strings.Contains(blob, "Code execution") {
+		t.Fatalf("spec subagent ran the code-execution processor: %s", blob)
+	}
+}
+
+func TestTrustedAgentCanBypassTheProcessor(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "trusted-fence.txt")
+	fence := "```python\nopen('" + marker + "','w').write('x')\n```"
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Workspace.Root = dir
+	cfg.Approvals.Required = true
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	mdl := mockmodel.New("trust-fence", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		if strings.Contains(lastUserText(req), "child-fence") {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage(fence)}}}, nil
+		}
+		if hasToolMessage(req) {
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+		return toolCall("helper", `{"request":"child-fence"}`), nil
+	})
+	child := llmagent.New("helper",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("child-fence"),
+		llmagent.WithCodeExecutor(localexec.New()),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+	)
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+		}),
+		TrustedAgents: []trpcagent.Agent{child},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{
+		UserID: "u", SessionID: "trust-fence", Workspace: dir, Message: "go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if !strings.Contains(blob, "Code execution") {
+		t.Fatalf("trusted agent did not run its code-execution processor: %s", blob)
+	}
+}
+
+func TestExternalTransferIsASideEffect(t *testing.T) {
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionReadOnly
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	mdl := mockmodel.New("xfer-ext", mockmodel.ToolThenText("transfer_to_agent", `{"agent_name":"helper"}`, "done"))
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Tools: []tool.Tool{transfertool.New(nil)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "xfer-ext", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if !strings.Contains(blob, "read_only") {
+		t.Fatalf("external transfer was allowed: %s", blob)
+	}
+}
+
+func TestApprovalSeesArgvAndPath(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Workspace.Root = dir
+	cfg.Approvals.Required = true
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	var got []agent.ApprovalRequest
+	var step int
+	mdl := mockmodel.New("argv", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		step++
+		switch step {
+		case 1:
+			return toolCall("run_command", `{"argv":["echo","hi"]}`), nil
+		case 2:
+			return toolCall("save_file", `{"file_name":"note.txt","contents":"hi"}`), nil
+		default:
+			return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
+		}
+	})
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+			got = append(got, req)
+			return agent.Decision{ID: req.ID, Allow: true}, nil
+		}),
+		ToolSpecs: []ToolSpec{{
+			Tool: functionToolNamed("custom_cmd"),
+			Kind: "command",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{
+		UserID: "u", SessionID: "argv", Workspace: dir, Message: "go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collect(t, h)
+	if len(got) < 2 {
+		t.Fatalf("requests %#v", got)
+	}
+	if got[0].Kind != "command" || got[0].Detail != "echo hi" || got[0].Path != "" {
+		t.Fatalf("command request %#v", got[0])
+	}
+	if got[1].Kind != "write" || got[1].Detail != "note.txt" || got[1].Path != "note.txt" {
+		t.Fatalf("write request %#v", got[1])
+	}
+}
+
+func TestToolSpecKindSurvives(t *testing.T) {
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionReadOnly
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	mdl := mockmodel.New("kind", mockmodel.ToolThenText("custom_cmd", `{"argv":["true"]}`, "done"))
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		ToolSpecs: []ToolSpec{{Tool: functionToolNamed("custom_cmd"), Kind: "command"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "kind", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := eventBlob(collect(t, h))
+	if !strings.Contains(blob, `"kind":"command"`) || !strings.Contains(blob, `"detail":"true"`) {
+		t.Fatalf("kind was dropped: %s", blob)
+	}
+	if !strings.Contains(blob, "read_only") {
+		t.Fatalf("command was not denied: %s", blob)
+	}
+}
+
+func TestTrustedWrapperIsStableUnderConcurrency(t *testing.T) {
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	rt, err := New(Options{
+		Config:  &cfg,
+		Model:   mockmodel.New("race", mockmodel.ToolThenText("echo", `{"text":"x"}`, "done")),
+		DataDir: t.TempDir(),
+		ToolSpecs: []ToolSpec{{
+			Tool:    echoTool(),
+			Trusted: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	var wg sync.WaitGroup
+	errCh := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			h, err := rt.Start(context.Background(), agent.RunRequest{
+				UserID: "u", SessionID: fmt.Sprintf("race-%d", i), Message: "go",
+			})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			collect(t, h)
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestSliceToolDoesNotPanic(t *testing.T) {
+	cfg := config.Default()
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	cfg.Journal.Enabled = false
+	cfg.Model.Generation.Stream = boolPtr(false)
+	item := sliceTool{parts: []string{"a"}}
+	rt, err := New(Options{
+		Config:  &cfg,
+		Model:   mockmodel.New("slice", mockmodel.ToolThenText("slice", `{}`, "done")),
+		DataDir: t.TempDir(),
+		Tools:   []tool.Tool{item},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "slice", Message: "go"})
+	if err != nil {
+		rt.Close()
+		t.Fatal(err)
+	}
+	_ = collect(t, h)
+	rt.Close()
+
+	rt, err = New(Options{
+		Config:  &cfg,
+		Model:   mockmodel.New("slice-trust", mockmodel.ToolThenText("slice", `{}`, "done")),
+		DataDir: t.TempDir(),
+		ToolSpecs: []ToolSpec{{
+			Tool:    sliceTool{parts: []string{"b", "c"}},
+			Trusted: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	h, err = rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "slice-trust", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collect(t, h)
+}
+
+type sliceTool struct {
+	parts []string
+}
+
+func (s sliceTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{Name: "slice", Description: strings.Join(s.parts, ",")}
+}
+
+func (s sliceTool) Call(context.Context, []byte) (any, error) {
+	return "ok", nil
+}
+
+func functionToolNamed(name string) tool.Tool {
+	return functionTool{name: name}
+}
+
+type functionTool struct{ name string }
+
+func (f functionTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{Name: f.name}
+}
+
+func (f functionTool) Call(context.Context, []byte) (any, error) {
+	return "ok", nil
 }
 
 func writeSkill(t *testing.T, root string) {

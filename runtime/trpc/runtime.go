@@ -41,6 +41,21 @@ import (
 
 const defaultAppName = "grape-core"
 
+// SubagentSpec is a child agent grape constructs. It is not a
+// caller-built tRPC agent. Tools are classified the same way as the
+// root's tools. Nested Subagents are also built by grape and exposed
+// as agent tools, not as transfer_to_agent.
+type SubagentSpec struct {
+	Name            string
+	Instruction     string
+	Model           model.Model
+	Tools           []tool.Tool
+	ToolSpecs       []ToolSpec
+	ToolSets        []tool.ToolSet
+	RefreshToolSets bool
+	Subagents       []SubagentSpec
+}
+
 // Options configures a Runtime. Model, when set, replaces the configured
 // provider. Tests and the offline example inject a mock model here.
 type Options struct {
@@ -63,13 +78,21 @@ type Options struct {
 	// Grape does not promise those internal calls stay inside the policy
 	// or the sandbox.
 	FixedAgent trpcagent.Agent
-	// SubAgents are static child agents. Each one is registered with
-	// tRPC's AgentTool. transfer_to_agent is not registered. Child tool
-	// calls inherit the run policy. This is not a trust bypass.
-	SubAgents []trpcagent.Agent
+	// Subagents are specs grape compiles into llmagent values. Each one
+	// gets the same execution settings as the root: the code-execution
+	// processor is off, skills are knowledge-only or use the executor
+	// grape selected, and tools are classified by grape. A caller-built
+	// agent.Agent is not accepted here.
+	Subagents []SubagentSpec
+	// TrustedAgents are caller-built agents. Grape does not rebuild
+	// them, so their processor, executor, and tool kinds stay theirs.
+	// This is an explicit bypass, not the static subagent entry.
+	TrustedAgents []trpcagent.Agent
 	// ToolSpecs classifies extra tools. An empty Kind is side_effect.
-	// Options.Tools are untrusted side effects. Trusted skips the run
-	// policy. A raw *tool/agent.Tool is rejected unless Trusted.
+	// Kind "read" is the caller's own classification and grants read.
+	// It is not inferred from the tool. Options.Tools are untrusted
+	// side effects. Trusted skips the run policy. A raw
+	// *tool/agent.Tool is rejected unless Trusted.
 	ToolSpecs []ToolSpec
 	// Hooks are shell hooks the embedder has already authorized.
 	// Plugin hooks stay off until config hooks.allow lists their key.
@@ -103,12 +126,12 @@ type Runtime struct {
 	mcpServers     []mcp.Server
 	resolved       plugin.Resolved
 	fixed          trpcagent.Agent
-	subs           []trpcagent.Agent
+	subagents      []SubagentSpec
+	trustedTools   []tool.Tool
 	evolution      evolution.Service
 	mcpSets        []tool.ToolSet
 	mcpStatus      []mcp.Status
 	decider        agent.Decider
-	trusted        map[tool.Tool]struct{}
 	grantedHooks   []hooks.Spec
 	reject         bool
 	boundExec      codeexecutor.CodeExecutor
@@ -139,7 +162,10 @@ func New(opts Options) (*Runtime, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if err := rejectReservedAgents(opts.FixedAgent, opts.SubAgents, opts.Tools, specTools(opts.ToolSpecs)); err != nil {
+	if err := rejectReservedAgents(opts.FixedAgent, opts.TrustedAgents, opts.Tools, specTools(opts.ToolSpecs)); err != nil {
+		return nil, err
+	}
+	if err := rejectSpecNames(opts.Subagents); err != nil {
 		return nil, err
 	}
 	if err := rejectUntrustedAgentTools(opts.Tools, opts.ToolSpecs); err != nil {
@@ -201,7 +227,6 @@ func New(opts Options) (*Runtime, error) {
 		tools:        append([]tool.Tool(nil), opts.Tools...),
 		specs:        append([]ToolSpec(nil), opts.ToolSpecs...),
 		decider:      opts.Decider,
-		trusted:      map[tool.Tool]struct{}{},
 		grantedHooks: append([]hooks.Spec(nil), opts.Hooks...),
 		reject:       opts.RejectConcurrentSession,
 		secrets:      secretValues(cfg),
@@ -210,8 +235,12 @@ func New(opts Options) (*Runtime, error) {
 		locks:        map[string]*sync.Mutex{},
 		holds:        map[string]*sessionHold{},
 		fixed:        opts.FixedAgent,
-		subs:         append([]trpcagent.Agent(nil), opts.SubAgents...),
+		subagents:    cloneSpecs(opts.Subagents),
 		nested:       nestedReadIndex(opts.NestedReads),
+	}
+	if err := rt.prepareSurface(opts.TrustedAgents); err != nil {
+		_ = sessions.Close()
+		return nil, err
 	}
 	if cfg.Evolution.Enabled {
 		if err := os.MkdirAll(cfg.Evolution.Root, 0o755); err != nil {
@@ -282,34 +311,21 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		if spec.Tool == nil {
 			continue
 		}
-		if spec.Trusted {
-			rt.trusted[spec.Tool] = struct{}{}
-			tools = append(tools, spec.Tool)
-			continue
-		}
-		kind := spec.Kind
-		if kind == "" {
-			kind = "side_effect"
-		}
-		tools = append(tools, kindTool(spec.Tool, kind))
+		tools = append(tools, spec.Tool)
 	}
-	for _, item := range rt.tools {
-		tools = append(tools, kindTool(item, "side_effect"))
-	}
+	tools = append(tools, rt.tools...)
 	mode := ""
 	if ro.RuntimeState != nil {
 		mode, _ = ro.RuntimeState["mode"].(string)
 	}
-	if len(rt.subs) > 0 {
-		for _, sub := range rt.subs {
-			if sub == nil {
-				continue
-			}
-			// grape builds the AgentTool. The run policy is inherited
-			// by the child invocation. This is not a trusted bypass.
-			tools = append(tools, agenttool.NewTool(sub))
+	for _, spec := range rt.subagents {
+		child, err := rt.buildSubagent(spec, ws)
+		if err != nil {
+			return nil, err
 		}
+		tools = append(tools, child)
 	}
+	tools = append(tools, rt.trustedTools...)
 	if rt.cfg.Memory.Enabled {
 		tools = append(tools, rt.memoryTool())
 	}
@@ -317,8 +333,47 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	if text, err := rt.ruleTextFor(ws); err == nil && text != "" {
 		instruction += "\n\nRules:\n" + text
 	}
+	opts, err := rt.executionOptions(ws, instruction, rt.model, tools)
+	if err != nil {
+		return nil, err
+	}
+	if len(rt.mcpSets) > 0 {
+		opts = append(opts, llmagent.WithToolSets(rt.mcpSets))
+	}
+	if mode == string(agent.ModeGoal) {
+		retries := rt.cfg.Goal.MaxIterations
+		if retries <= 0 {
+			retries = 1
+		}
+		opts = append(opts, llmagent.WithExtensions(goal.New(goal.WithMaxRetries(retries))))
+	}
+	// Spec subagents are tRPC AgentTools. WithSubAgents would also
+	// register transfer_to_agent, which this runtime does not expose.
+	ag := llmagent.New("grape", opts...)
+	rt.mu.Lock()
+	rt.boundExec = ag.CodeExecutor()
+	rt.boundIsolation = rt.recordedIsolation(ws)
+	rt.mu.Unlock()
+	return ag, nil
+}
+
+func (rt *Runtime) recordedIsolation(ws string) string {
+	if rt == nil || rt.exec == nil || rt.cfg.KnowledgeOnly() {
+		return ""
+	}
+	_, isolation, err := rt.exec.skillCodeExecutor(ws)
+	if err != nil {
+		return ""
+	}
+	return isolation
+}
+
+func (rt *Runtime) executionOptions(ws, instruction string, mdl model.Model, tools []tool.Tool) ([]llmagent.Option, error) {
+	if mdl == nil {
+		mdl = rt.model
+	}
 	opts := []llmagent.Option{
-		llmagent.WithModel(rt.model),
+		llmagent.WithModel(mdl),
 		llmagent.WithInstruction(instruction),
 		llmagent.WithGenerationConfig(generationConfig(rt.cfg)),
 		// The framework default executes fenced code blocks without the
@@ -329,45 +384,149 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 		llmagent.WithMaxToolIterations(positiveLimit(rt.cfg.Context.MaxToolIterations)),
 		llmagent.WithTools(trackTools(tools)),
 	}
-	if len(rt.mcpSets) > 0 {
-		opts = append(opts, llmagent.WithToolSets(rt.mcpSets))
-	}
-	if repo, err := rt.skillRepository(); err != nil {
+	repo, err := rt.skillRepository()
+	if err != nil {
 		return nil, err
-	} else if repo != nil {
-		opts = append(opts, llmagent.WithSkills(repo))
-		if rt.cfg.KnowledgeOnly() {
-			// Explicit knowledge-only also disables the local-executor fallback.
-			opts = append(opts, llmagent.WithSkillToolProfile(llmagent.SkillToolProfileKnowledgeOnly))
-		} else {
-			exec, isolation, err := rt.exec.skillCodeExecutor(ws)
-			if err != nil {
-				return nil, err
+	}
+	if repo == nil {
+		return opts, nil
+	}
+	opts = append(opts, llmagent.WithSkills(repo))
+	if rt.cfg.KnowledgeOnly() {
+		opts = append(opts, llmagent.WithSkillToolProfile(llmagent.SkillToolProfileKnowledgeOnly))
+		return opts, nil
+	}
+	exec, _, err := rt.exec.skillCodeExecutor(ws)
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts,
+		llmagent.WithCodeExecutor(exec),
+		llmagent.WithSkillToolProfile(llmagent.SkillToolProfileFull),
+	)
+	return opts, nil
+}
+
+func (rt *Runtime) buildSubagent(spec SubagentSpec, ws string) (tool.Tool, error) {
+	var tools []tool.Tool
+	tools = append(tools, spec.Tools...)
+	for _, item := range spec.ToolSpecs {
+		if item.Tool != nil {
+			tools = append(tools, item.Tool)
+		}
+	}
+	for _, child := range spec.Subagents {
+		nested, err := rt.buildSubagent(child, ws)
+		if err != nil {
+			return nil, err
+		}
+		tools = append(tools, nested)
+	}
+	opts, err := rt.executionOptions(ws, spec.Instruction, spec.Model, tools)
+	if err != nil {
+		return nil, err
+	}
+	if len(spec.ToolSets) > 0 {
+		opts = append(opts, llmagent.WithToolSets(spec.ToolSets))
+	}
+	if spec.RefreshToolSets {
+		opts = append(opts, llmagent.WithRefreshToolSetsOnRun(true))
+	}
+	ag := llmagent.New(spec.Name, opts...)
+	return agenttool.NewTool(ag), nil
+}
+
+func (rt *Runtime) prepareSurface(trusted []trpcagent.Agent) error {
+	tools := make([]tool.Tool, 0, len(rt.tools))
+	for _, item := range rt.tools {
+		tools = append(tools, kindTool(item, "side_effect"))
+	}
+	rt.tools = tools
+	specs := make([]ToolSpec, 0, len(rt.specs))
+	for _, spec := range rt.specs {
+		if spec.Tool == nil {
+			continue
+		}
+		if spec.Trusted {
+			specs = append(specs, ToolSpec{Tool: wrapTrusted(spec.Tool), Trusted: true})
+			continue
+		}
+		kind := spec.Kind
+		if kind == "" {
+			kind = "side_effect"
+		}
+		specs = append(specs, ToolSpec{Tool: kindTool(spec.Tool, kind), Kind: kind})
+	}
+	rt.specs = specs
+	if err := rt.prepareSpecs(rt.subagents); err != nil {
+		return err
+	}
+	wrapped := make([]tool.Tool, 0, len(trusted))
+	for _, ag := range trusted {
+		if ag == nil {
+			continue
+		}
+		wrapped = append(wrapped, wrapTrusted(agenttool.NewTool(ag)))
+	}
+	rt.trustedTools = wrapped
+	return nil
+}
+
+func (rt *Runtime) prepareSpecs(specs []SubagentSpec) error {
+	for i := range specs {
+		if strings.TrimSpace(specs[i].Name) == "" {
+			return agent.Invalid("subagent", fmt.Errorf("name is required"))
+		}
+		if specs[i].Name == rootAgentName {
+			return agent.Wrap(agent.ErrInvalidConfig, "agent", fmt.Errorf("non-root agent named %q is reserved", rootAgentName))
+		}
+		tools := make([]tool.Tool, 0, len(specs[i].Tools))
+		for _, item := range specs[i].Tools {
+			if err := rejectRawAgentTool(item); err != nil {
+				return err
 			}
-			opts = append(opts,
-				llmagent.WithCodeExecutor(exec),
-				llmagent.WithSkillToolProfile(llmagent.SkillToolProfileFull),
-			)
-			rt.mu.Lock()
-			rt.boundExec = exec
-			rt.boundIsolation = isolation
-			rt.mu.Unlock()
+			tools = append(tools, kindTool(item, "side_effect"))
+		}
+		specs[i].Tools = tools
+		tspecs := make([]ToolSpec, 0, len(specs[i].ToolSpecs))
+		for _, spec := range specs[i].ToolSpecs {
+			if spec.Tool == nil {
+				continue
+			}
+			if spec.Trusted {
+				tspecs = append(tspecs, ToolSpec{Tool: wrapTrusted(spec.Tool), Trusted: true})
+				continue
+			}
+			if err := rejectRawAgentTool(spec.Tool); err != nil {
+				return err
+			}
+			kind := spec.Kind
+			if kind == "" {
+				kind = "side_effect"
+			}
+			tspecs = append(tspecs, ToolSpec{Tool: kindTool(spec.Tool, kind), Kind: kind})
+		}
+		specs[i].ToolSpecs = tspecs
+		if err := rt.prepareSpecs(specs[i].Subagents); err != nil {
+			return err
 		}
 	}
-	if mode == string(agent.ModeGoal) {
-		retries := rt.cfg.Goal.MaxIterations
-		if retries <= 0 {
-			retries = 1
-		}
-		opts = append(opts, llmagent.WithExtensions(goal.New(goal.WithMaxRetries(retries))))
+	return nil
+}
+
+func cloneSpecs(in []SubagentSpec) []SubagentSpec {
+	if len(in) == 0 {
+		return nil
 	}
-	// Subagents are AgentTools registered above. WithSubAgents would also
-	// register transfer_to_agent, which this runtime does not expose.
-	ag := llmagent.New("grape", opts...)
-	rt.mu.Lock()
-	rt.boundExec = ag.CodeExecutor()
-	rt.mu.Unlock()
-	return ag, nil
+	out := make([]SubagentSpec, len(in))
+	for i, spec := range in {
+		spec.Tools = append([]tool.Tool(nil), spec.Tools...)
+		spec.ToolSpecs = append([]ToolSpec(nil), spec.ToolSpecs...)
+		spec.ToolSets = append([]tool.ToolSet(nil), spec.ToolSets...)
+		spec.Subagents = cloneSpecs(spec.Subagents)
+		out[i] = spec
+	}
+	return out
 }
 
 func (rt *Runtime) memoryTool() tool.Tool {

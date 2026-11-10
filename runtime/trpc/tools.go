@@ -438,9 +438,46 @@ func kindTool(item tool.Tool, kind string) tool.Tool {
 		kind = "side_effect"
 	}
 	if kind == "read" {
+		if isGrapeRead(item) {
+			return item
+		}
 		return &builtinReadTool{inner: callable}
 	}
+	if kind == "side_effect" && isGrapeRead(item) {
+		return item
+	}
 	return kindedTool{inner: callable, kind: kind}
+}
+
+// trustedTool is applied once at New. The policy allows it by type.
+// The wrapper does not use the tool value as a map key.
+type trustedTool struct {
+	inner tool.Tool
+}
+
+func (t trustedTool) Declaration() *tool.Declaration {
+	if t.inner == nil {
+		return nil
+	}
+	return t.inner.Declaration()
+}
+
+func (t trustedTool) Call(ctx context.Context, args []byte) (any, error) {
+	callable, ok := t.inner.(tool.CallableTool)
+	if !ok {
+		return nil, fmt.Errorf("tool is not callable")
+	}
+	return callable.Call(ctx, args)
+}
+
+func wrapTrusted(item tool.Tool) tool.Tool {
+	if item == nil {
+		return nil
+	}
+	if _, ok := item.(trustedTool); ok {
+		return item
+	}
+	return trustedTool{inner: item}
 }
 
 type trackingTool struct{ inner tool.CallableTool }

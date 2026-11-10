@@ -43,7 +43,7 @@ Windows has no managed native backend. `commandExecutor` returns `agent.ErrSandb
 
 `run_command` takes an argv, not a shell string. The tool result includes `isolation`: `managed`, `none`, or `external`. The tool permission policy decides whether the command may start. The executor enforces the sandbox again and does not ask for a second approval.
 
-Skill execution uses the same choice when `skills.knowledge_only` is false. `workspace_write` with `managed` uses the tRPC OS sandbox. `danger_full_access`, either as `workspace.permission` or `sandbox.mode`, runs on the host and is reported as isolation `none`, not as managed. Windows `managed` returns unavailable and does not run on the host. External skill execution is refused rather than falling back to the host. Fenced code blocks are not an execution path.
+Skill execution uses `skill_run` when `skills.knowledge_only` is false. `workspace_write` with `managed` uses tRPC's sandbox code executor. `danger_full_access`, either as `workspace.permission` or `sandbox.mode`, passes tRPC's local code executor explicitly and is reported as isolation `none`, not as managed. Grape does not supply its own host executor. An implicit local fallback is still refused: external mode and Windows `managed` return unavailable instead of switching to the host. Fenced code blocks are not an execution path on agents grape builds.
 
 Workspace file tools use `os.Root`. A symlink whose target is outside the workspace is rejected. An absolute symlink is also rejected, even when the target is inside the workspace. That is an `os.Root` limit, not a separate policy.
 

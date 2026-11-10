@@ -13,7 +13,6 @@ import (
 	"github.com/lookerjin/grape-core/agent"
 	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/internal/mockmodel"
-	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
@@ -149,16 +148,12 @@ func TestNestedHelpersStayInsideDefaultBudget(t *testing.T) {
 	}) (string, error) {
 		return "step", nil
 	}, function.WithName("child_step"), function.WithDescription("one step"))
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("child-agent"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-		llmagent.WithTools([]tool.Tool{step}),
-	)
 	rt, err := New(Options{
 		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
-		SubAgents: []trpcagent.Agent{child},
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "child-agent", Model: mdl,
+			Tools: []tool.Tool{step},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -311,22 +306,23 @@ func TestToolStartEndPairs(t *testing.T) {
 			if hasToolMessage(req) {
 				return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("done")}}}, nil
 			}
-			return toolCallID("transfer_to_agent", `{"agent_name":"helper","message":"go"}`, "xfer-1"), nil
+			return toolCallID("helper", `{"request":"go"}`, "help-1"), nil
 		})
-		child := llmagent.New("helper",
-			llmagent.WithModel(mdl),
-			llmagent.WithInstruction("child-agent"),
-			llmagent.WithEnableCodeExecutionResponseProcessor(false),
-			llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-			llmagent.WithTools([]tool.Tool{work}),
-		)
-		root := llmagent.New("grape",
-			llmagent.WithModel(mdl),
-			llmagent.WithEnableCodeExecutionResponseProcessor(false),
-			llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-			llmagent.WithSubAgents([]trpcagent.Agent{child}),
-		)
-		rt, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir(), FixedAgent: root})
+		cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+		cfg.Approvals.Required = true
+		rt, err := New(Options{
+			Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+			Decider: agent.DeciderFunc(func(ctx context.Context, req agent.ApprovalRequest) (agent.Decision, error) {
+				if req.Detail == "helper" {
+					return agent.Decision{ID: req.ID, Allow: true}, nil
+				}
+				return agent.Decision{ID: req.ID, Allow: false, Reason: "no"}, nil
+			}),
+			Subagents: []SubagentSpec{{
+				Name: "helper", Instruction: "child-agent", Model: mdl,
+				Tools: []tool.Tool{work},
+			}},
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -336,10 +332,14 @@ func TestToolStartEndPairs(t *testing.T) {
 			t.Fatal(err)
 		}
 		events := collect(t, h)
+		blob := eventBlob(events)
 		if ran.Load() != 0 {
-			t.Fatalf("nested tool ran %s", eventBlob(events))
+			t.Fatalf("nested tool ran %s", blob)
 		}
-		assertToolPairs(t, events, []string{"xfer-1", "nest-1"})
+		if !strings.Contains(blob, `"detail":"child_work"`) || !strings.Contains(blob, `"allowed":false`) {
+			t.Fatalf("child tool was not denied: %s", blob)
+		}
+		assertToolPairs(t, events, []string{"help-1"})
 	})
 }
 

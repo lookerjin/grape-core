@@ -14,8 +14,6 @@ import (
 	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/internal/mockmodel"
 	"github.com/lookerjin/grape-core/memory"
-	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
-	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/evolution"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
@@ -135,13 +133,12 @@ func TestSubagentToolUsesIsolatedReply(t *testing.T) {
 			},
 		}}}, nil
 	})
-	child := llmagent.New("helper",
-		llmagent.WithModel(mdl),
-		llmagent.WithInstruction("answer the request"),
-		llmagent.WithEnableCodeExecutionResponseProcessor(false),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-	)
-	rt, err := New(Options{Config: &cfg, Model: mdl, DataDir: t.TempDir(), SubAgents: []trpcagent.Agent{child}})
+	rt, err := New(Options{
+		Config: &cfg, Model: mdl, DataDir: t.TempDir(),
+		Subagents: []SubagentSpec{{
+			Name: "helper", Instruction: "answer the request", Model: mdl,
+		}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

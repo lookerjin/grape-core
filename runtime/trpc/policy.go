@@ -2,15 +2,16 @@ package trpcruntime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/lookerjin/grape-core/agent"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
 	skilltool "trpc.group/trpc-go/trpc-agent-go/tool/skill"
-	transfertool "trpc.group/trpc-go/trpc-agent-go/tool/transfer"
 )
 
 // toolPermission is the only tool authorization decision. tRPC calls it
@@ -20,8 +21,8 @@ func (rt *Runtime) toolPermission(ctx context.Context, req *tool.PermissionReque
 	if rt == nil || req == nil {
 		return tool.DenyPermission("missing permission request"), nil
 	}
-	item := visibleTool(req.Tool)
-	if rt.isTrusted(req.Tool) || rt.isTrusted(item) {
+	item := unwrapTracking(frameworkNamed(req.Tool))
+	if _, ok := item.(trustedTool); ok {
 		return tool.AllowPermission(), nil
 	}
 	name := req.ToolName
@@ -33,20 +34,44 @@ func (rt *Runtime) toolPermission(ctx context.Context, req *tool.PermissionReque
 		return tool.DenyPermission("tool is not callable"), nil
 	}
 	kind := rt.toolKind(ctx, item, name)
-	if err := rt.authorize(ctx, kind, name, ""); err != nil {
+	detail, path := approvalTarget(name, req.Arguments)
+	if err := rt.authorize(ctx, kind, detail, path); err != nil {
 		return tool.DenyPermission(err.Error()), nil
 	}
 	return tool.AllowPermission(), nil
 }
 
+// approvalTarget recovers the argv or file path the decider used to see.
+// The tool name remains the detail when the arguments do not carry either.
+func approvalTarget(name string, args []byte) (detail, path string) {
+	detail = name
+	if len(args) == 0 {
+		return detail, ""
+	}
+	var body struct {
+		Argv     []string `json:"argv"`
+		FileName string   `json:"file_name"`
+	}
+	if err := json.Unmarshal(args, &body); err != nil {
+		return detail, ""
+	}
+	if len(body.Argv) > 0 {
+		return strings.Join(body.Argv, " "), ""
+	}
+	if body.FileName != "" {
+		return body.FileName, body.FileName
+	}
+	return detail, ""
+}
+
 // isGrapeRead reports grape's own read types. A same-sized foreign tool
 // does not qualify, and neither does a caller Original wrapper.
 func isGrapeRead(item tool.Tool) bool {
-	switch visibleTool(item).(type) {
+	switch unwrapGrape(frameworkNamed(item)).(type) {
 	case *builtinReadTool, *grapeReadTool:
 		return true
 	case *hostMCPTool:
-		mcpTool := visibleTool(item).(*hostMCPTool)
+		mcpTool := unwrapGrape(frameworkNamed(item)).(*hostMCPTool)
 		return mcpTool != nil && mcpTool.kind == "read"
 	case *skilltool.LoadTool, *skilltool.ListDocsTool, *skilltool.SelectDocsTool:
 		return true
@@ -64,6 +89,13 @@ func (rt *Runtime) toolKind(ctx context.Context, item tool.Tool, name string) st
 	if rt.allowNestedRead(agentName, name) {
 		return "read"
 	}
+	switch t := item.(type) {
+	case kindedTool:
+		if t.kind == "" {
+			return "side_effect"
+		}
+		return t.kind
+	}
 	if isGrapeRead(item) {
 		return "read"
 	}
@@ -72,30 +104,22 @@ func (rt *Runtime) toolKind(ctx context.Context, item tool.Tool, name string) st
 		return "write"
 	case *agenttool.Tool:
 		return "side_effect"
-	case *transfertool.Tool:
-		// Delegation only. The child agent's tool calls are checked
-		// on their own invocations. The type is the signal, not the name.
-		return "delegate"
-	case kindedTool:
-		return item.(kindedTool).kind
 	default:
 		return "side_effect"
 	}
 }
 
-func (rt *Runtime) isTrusted(item tool.Tool) bool {
-	if rt == nil || item == nil {
-		return false
+// unwrapTracking removes only the in-flight counter wrapper.
+// Kind tags stay visible so the policy can read them.
+func unwrapTracking(item tool.Tool) tool.Tool {
+	for i := 0; item != nil && i < 8; i++ {
+		inner, ok := item.(trackingTool)
+		if !ok || inner.inner == nil {
+			return item
+		}
+		item = inner.inner
 	}
-	_, ok := rt.trusted[item]
-	return ok
-}
-
-// visibleTool unwraps wrappers this package and tRPC's toolset naming
-// wrapper add. It does not follow a caller-defined Original method.
-func visibleTool(item tool.Tool) tool.Tool {
-	item = frameworkNamed(item)
-	return unwrapGrape(item)
+	return item
 }
 
 func frameworkNamed(item tool.Tool) tool.Tool {
@@ -144,7 +168,7 @@ func rejectRawAgentTool(item tool.Tool) error {
 		return nil
 	}
 	if _, ok := item.(*agenttool.Tool); ok {
-		return agent.Invalid("tool", fmt.Errorf("a raw agent tool requires ToolSpec.Trusted; register child agents through Options.SubAgents"))
+		return agent.Invalid("tool", fmt.Errorf("a raw agent tool requires ToolSpec.Trusted; register child agents through Options.Subagents"))
 	}
 	return nil
 }

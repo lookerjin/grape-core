@@ -15,6 +15,7 @@ import (
 	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/sandbox"
 	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
+	localexec "trpc.group/trpc-go/trpc-agent-go/codeexecutor/local"
 	trpcsandbox "trpc.group/trpc-go/trpc-agent-go/codeexecutor/sandbox"
 )
 
@@ -282,7 +283,7 @@ func (e *commandExecutor) skillCodeExecutor(workspace string) (codeexecutor.Code
 	if workspace == "" {
 		workspace = e.cfg.Workspace.Root
 	}
-	isolation, host := e.skillTarget()
+	isolation, explicitLocal := e.skillTarget()
 	e.skillMu.Lock()
 	defer e.skillMu.Unlock()
 	if e.skillByWS == nil {
@@ -293,8 +294,10 @@ func (e *commandExecutor) skillCodeExecutor(workspace string) (codeexecutor.Code
 		return hit.exec, hit.isolation, nil
 	}
 	var exec codeexecutor.CodeExecutor
-	if host {
-		exec = &hostCodeExecutor{workspace: workspace}
+	if explicitLocal {
+		// The user chose danger_full_access. This is the tRPC local
+		// engine, not an implicit fallback.
+		exec = localexec.New()
 	} else if e.cfg.Sandbox.Mode == sandbox.ModeExternal {
 		return nil, "", agent.Wrap(agent.ErrSandboxUnavailable, "skill", fmt.Errorf("external skill execution is not wired and will not fall back to the host"))
 	} else if e.platform == "windows" {
@@ -314,9 +317,10 @@ func (e *commandExecutor) skillCodeExecutor(workspace string) (codeexecutor.Code
 	return exec, isolation, nil
 }
 
-// skillTarget reports the isolation actually used for skill execution.
-// danger_full_access is the host. It is never reported as managed.
-func (e *commandExecutor) skillTarget() (isolation string, host bool) {
+// skillTarget reports the executor actually used for skill_run.
+// danger_full_access selects tRPC's local executor and isolation none.
+// It is never reported as managed.
+func (e *commandExecutor) skillTarget() (isolation string, explicitLocal bool) {
 	if e.cfg.Workspace.Permission == agent.PermissionDangerFullAccess || e.cfg.Sandbox.Mode == sandbox.ModeDangerFullAccess {
 		return sandbox.IsolationNone, true
 	}
@@ -341,47 +345,6 @@ func (e *commandExecutor) closeSkillExecutors() error {
 	}
 	e.skillByWS = nil
 	return err
-}
-
-// hostCodeExecutor runs skill code on the host. Isolation is none.
-// It is not the tRPC local executor and it is not a managed sandbox.
-type hostCodeExecutor struct {
-	workspace string
-}
-
-func (e *hostCodeExecutor) CodeBlockDelimiter() codeexecutor.CodeBlockDelimiter {
-	return codeexecutor.CodeBlockDelimiter{Start: "```", End: "```"}
-}
-
-func (e *hostCodeExecutor) ExecuteCode(ctx context.Context, in codeexecutor.CodeExecutionInput) (codeexecutor.CodeExecutionResult, error) {
-	if e == nil {
-		return codeexecutor.CodeExecutionResult{}, fmt.Errorf("host executor is nil")
-	}
-	var out strings.Builder
-	for i, block := range in.CodeBlocks {
-		fn, mode, cmd, args, err := codeexecutor.BuildBlockSpec(i, block)
-		if err != nil {
-			return codeexecutor.CodeExecutionResult{}, err
-		}
-		dir := e.workspace
-		if dir == "" {
-			dir = os.TempDir()
-		}
-		path := filepath.Join(dir, fn)
-		if err := os.WriteFile(path, []byte(block.Code), os.FileMode(mode)); err != nil {
-			return codeexecutor.CodeExecutionResult{}, err
-		}
-		argv := append(append([]string{}, args...), path)
-		stdout, stderr, _, _, runErr := runHost(ctx, dir, append([]string{cmd}, argv...), nil, 60*time.Second)
-		out.WriteString(stdout)
-		if stderr != "" {
-			out.WriteString(stderr)
-		}
-		if runErr != nil {
-			return codeexecutor.CodeExecutionResult{Output: out.String()}, runErr
-		}
-	}
-	return codeexecutor.CodeExecutionResult{Output: out.String()}, nil
 }
 
 func (e *commandExecutor) envPolicy() trpcsandbox.ShellEnvironmentPolicy {

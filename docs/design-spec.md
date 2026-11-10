@@ -495,7 +495,7 @@ Commands→ 解析为可复用指令模板, 由调用方决定何时触发
 - 默认不向模型完整注入全部 Skills
 - Skill 资源包与 Skill 执行权限分离; 文档文件可读, 脚本执行遵守 CodeExecutor/Sandbox 策略
 - **强制显式配置 CodeExecutor**, 禁止 `WithSkills` 自动回退到未隔离本地 Executor; 对不执行脚本的产品可选择 KnowledgeOnly
-- `skills.knowledge_only: false` 使用受管沙箱执行器; `danger_full_access` 使用宿主执行并报告 isolation `none`, 不称为 managed。Windows `managed` 失败关闭, 不回退宿主
+- `skills.knowledge_only: false` 使用 tRPC 受管沙箱执行器。用户显式选择 `danger_full_access` 时显式传入 tRPC local executor, 并报告 isolation `none`, 不称为 managed。禁止隐式回落到 local。Windows `managed` 与 external 失败关闭
 - 明确禁用自动执行响应 Markdown 代码块 (`WithEnableCodeExecutionResponseProcessor(false)`), 统一通过 Tool Call 启动受控执行
 
 ### 12.3 Hooks Package

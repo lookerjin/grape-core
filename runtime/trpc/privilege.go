@@ -208,6 +208,18 @@ func (rt *Runtime) noteBudget(ctx context.Context, err error) error {
 	return err
 }
 
+func rejectSpecNames(specs []SubagentSpec) error {
+	for _, spec := range specs {
+		if spec.Name == rootAgentName {
+			return agent.Wrap(agent.ErrInvalidConfig, "agent", fmt.Errorf("non-root agent named %q is reserved", rootAgentName))
+		}
+		if err := rejectSpecNames(spec.Subagents); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func rejectReservedAgents(root trpcagent.Agent, subs []trpcagent.Agent, tools []tool.Tool, extra []tool.Tool) error {
 	seen := map[trpcagent.Agent]struct{}{}
 	var walk func(trpcagent.Agent, bool) error
