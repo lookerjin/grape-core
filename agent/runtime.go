@@ -36,15 +36,14 @@ type RunRequest struct {
 //
 // A consumer that reads Events until it closes sees exactly one terminal
 // event. Close, or the hold and idle deadlines, may close Events without
-// that event. Status then reports cancelled with cause delivery. Cancel
+// that event. Status reports execution and stream delivery separately. Cancel
 // aborts the run. The context passed to Runtime.Start bounds the run.
 // Implementations must not detach the run onto context.Background.
 type RunHandle interface {
 	ID() string
 	Events() <-chan Event
 	// Status reports the run result. It is pending until the run stops.
-	// A caller cancel has cause user. Close, hold, or idle mark delivery
-	// abandoned and, if no result exists yet, cancel the run.
+	// Close can leave status pending with delivery abandoned until the runner stops.
 	Status() RunStatus
 	Cancel() error
 	// Close releases the event pump. It is safe to call more than once.

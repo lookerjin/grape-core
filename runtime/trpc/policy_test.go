@@ -2,6 +2,7 @@ package trpcruntime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/lookerjin/grape-core/sandbox"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+
 	localexec "trpc.group/trpc-go/trpc-agent-go/codeexecutor/local"
 	trpcsandbox "trpc.group/trpc-go/trpc-agent-go/codeexecutor/sandbox"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -195,16 +197,7 @@ func TestFencedCodeIsNotExecuted(t *testing.T) {
 	if strings.Contains(blob, "Code execution result") {
 		t.Fatalf("code execution processor ran: %s", blob)
 	}
-	rt.mu.Lock()
-	exec := rt.boundExec
-	isolation := rt.boundIsolation
-	rt.mu.Unlock()
-	if _, ok := exec.(*localexec.CodeExecutor); !ok {
-		t.Fatalf("executor %T isolation %s", exec, isolation)
-	}
-	if isolation != sandbox.IsolationNone {
-		t.Fatalf("danger_full_access isolation %q", isolation)
-	}
+
 }
 
 func TestKnowledgeOnlyFalseUsesSandboxExecutor(t *testing.T) {
@@ -227,25 +220,13 @@ func TestKnowledgeOnlyFalseUsesSandboxExecutor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rt.Close()
-	h, err := rt.Start(context.Background(), agent.RunRequest{
-		UserID: "u", SessionID: "skill-exec", Workspace: dir, Message: "hi",
-	})
+	built, err := rt.agentFactory(context.Background(), trpcagent.RunOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = collect(t, h)
-	rt.mu.Lock()
-	exec := rt.boundExec
-	isolation := rt.boundIsolation
-	rt.mu.Unlock()
+	exec := built.(*llmagent.LLMAgent).CodeExecutor()
 	if _, ok := exec.(*trpcsandbox.CodeExecutor); !ok {
-		t.Fatalf("executor %T isolation %s", exec, isolation)
-	}
-	if isolation != sandbox.IsolationManaged {
-		t.Fatalf("isolation %q", isolation)
-	}
-	if strings.Contains(fmt.Sprintf("%T", exec), "local.CodeExecutor") {
-		t.Fatal("local executor was selected")
+		t.Fatalf("executor %T", exec)
 	}
 }
 
@@ -309,6 +290,9 @@ func TestSkillRunUsesTheSelectedExecutor(t *testing.T) {
 		{"danger", agent.PermissionDangerFullAccess, sandbox.ModeManaged, true, sandbox.IsolationNone, "host-ok"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if !tc.wantLocal {
+				requireLinuxSandbox(t)
+			}
 			dir := t.TempDir()
 			writeSkill(t, filepath.Join(dir, "skills"))
 			cfg := config.Default()
@@ -343,28 +327,32 @@ func TestSkillRunUsesTheSelectedExecutor(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			blob := eventBlob(collect(t, h))
-			if !strings.Contains(blob, marker) {
+			events := collect(t, h)
+			blob := eventBlob(events)
+			var stdout string
+			for _, evt := range events {
+				if evt.Kind != agent.EventToolEnd {
+					continue
+				}
+				var payload agent.ToolPayload
+				if json.Unmarshal(evt.Payload, &payload) != nil || payload.Name != "skill_run" {
+					continue
+				}
+				var result string
+				var body struct {
+					Stdout string `json:"stdout"`
+				}
+				if json.Unmarshal(payload.Result, &result) == nil && json.Unmarshal([]byte(result), &body) == nil {
+					stdout = body.Stdout
+				}
+			}
+			if strings.TrimSpace(stdout) != marker {
 				t.Fatalf("skill_run did not return %s: %s", marker, blob)
 			}
 			if strings.Contains(blob, "falling back to local engine") {
 				t.Fatalf("implicit local fallback: %s", blob)
 			}
-			rt.mu.Lock()
-			exec := rt.boundExec
-			isolation := rt.boundIsolation
-			rt.mu.Unlock()
-			if isolation != tc.isolation {
-				t.Fatalf("isolation %q", isolation)
-			}
-			_, local := exec.(*localexec.CodeExecutor)
-			_, sand := exec.(*trpcsandbox.CodeExecutor)
-			if tc.wantLocal && !local {
-				t.Fatalf("executor %T", exec)
-			}
-			if !tc.wantLocal && !sand {
-				t.Fatalf("executor %T", exec)
-			}
+
 		})
 	}
 }

@@ -25,7 +25,6 @@ func (p *hookPlugin) Register(reg *trpcplugin.Registry) {
 		return
 	}
 	reg.BeforeAgent(p.beforeAgent)
-	reg.AfterAgent(p.afterAgent)
 	reg.BeforeModel(p.beforeModel)
 	reg.AfterModel(p.afterModel)
 	reg.BeforeTool(p.beforeTool)
@@ -43,11 +42,6 @@ func (p *hookPlugin) beforeAgent(ctx context.Context, args *trpcagent.BeforeAgen
 	if err := p.dispatch(ctx, hooks.BeforeRun, `{"event":"BeforeRun"}`); err != nil {
 		return nil, err
 	}
-	return nil, nil
-}
-
-func (p *hookPlugin) afterAgent(ctx context.Context, args *trpcagent.AfterAgentArgs) (*trpcagent.AfterAgentResult, error) {
-	// AfterRun is emitted from the runner hook so a run does not fire it twice.
 	return nil, nil
 }
 

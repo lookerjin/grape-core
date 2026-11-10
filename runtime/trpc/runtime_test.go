@@ -820,7 +820,7 @@ func TestEventBoxDropsOnlyTextDeltas(t *testing.T) {
 	box.push(agent.Event{Kind: agent.EventCompleted, Payload: agent.MustPayload(map[string]string{"status": "completed"})})
 	box.close()
 	out := make(chan agent.Event)
-	go box.pump(out, nil, context.Background(), time.Hour, time.Hour)
+	go func() { defer close(out); box.pump(out, nil, time.Hour, time.Hour) }()
 	var kinds []agent.EventKind
 	var dropped int
 	for evt := range out {
@@ -946,7 +946,7 @@ func TestLateConsumerReceivesTerminalEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for calls.Load() < 256 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}

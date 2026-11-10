@@ -2,7 +2,8 @@ package mockmodel
 
 import (
 	"context"
-	"strings"
+	"encoding/json"
+	"fmt"
 
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
@@ -13,24 +14,40 @@ func CodingFix(ctx context.Context, req *model.Request) (*model.Response, error)
 	tools := toolResultCount(req)
 	switch tools {
 	case 0:
-		return toolCall("search_content", `{"path":".","file_pattern":"*.go","content_pattern":"func Add"}`), nil
+		return ToolCall("search_content", `{"path":".","file_pattern":"*.go","content_pattern":"func Add"}`), nil
 	case 1:
-		return toolCall("read_file", `{"file_name":"math.go"}`), nil
+		return ToolCall("read_file", `{"file_name":"math.go"}`), nil
 	case 2:
-		return toolCall("replace_content", `{"file_name":"math.go","old_string":"return a - b","new_string":"return a + b","num_replacements":1}`), nil
+		return ToolCall("replace_content", `{"file_name":"math.go","old_string":"return a - b","new_string":"return a + b","num_replacements":1}`), nil
 	case 3:
-		return toolCall("run_command", `{"argv":["go","test","./..."],"timeout_sec":120}`), nil
+		return ToolCall("run_command", `{"argv":["go","test","./..."],"timeout_sec":120}`), nil
 	default:
-		text := allText(req)
-		msg := "updated math.go and reran go test"
-		if strings.Contains(text, "ok") || strings.Contains(text, "PASS") {
-			msg = "fixed Add and go test passed"
+		var command string
+		for _, msg := range req.Messages {
+			if msg.Role == model.RoleTool && msg.ToolName == "run_command" {
+				command = msg.Content
+			}
+		}
+		var result struct {
+			ExitCode *int   `json:"exit_code"`
+			Stdout   string `json:"stdout"`
+		}
+		msg := "fixture test did not pass: " + command
+		if json.Unmarshal([]byte(command), &result) == nil && result.ExitCode != nil && *result.ExitCode == 0 {
+			msg = "fixture test passed: " + result.Stdout
+		}
+		if _, ok := req.Tools["reviewer"]; ok && tools == 4 {
+			args, err := json.Marshal(map[string]string{"request": fmt.Sprintf("Review this fixture test result: %s", msg)})
+			if err != nil {
+				return nil, err
+			}
+			return ToolCall("reviewer", string(args)), nil
 		}
 		return &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage(msg)}}}, nil
 	}
 }
 
-func toolCall(name, args string) *model.Response {
+func ToolCall(name, args string) *model.Response {
 	return &model.Response{
 		Choices: []model.Choice{{
 			Message: model.Message{
@@ -59,16 +76,4 @@ func toolResultCount(req *model.Request) int {
 		}
 	}
 	return n
-}
-
-func allText(req *model.Request) string {
-	if req == nil {
-		return ""
-	}
-	var b strings.Builder
-	for _, msg := range req.Messages {
-		b.WriteString(msg.Content)
-		b.WriteByte('\n')
-	}
-	return b.String()
 }

@@ -208,7 +208,7 @@ func TestTrustedAgentToolStreamsChildEvents(t *testing.T) {
 	long := function.NewFunctionTool(func(ctx context.Context, in struct{}) (string, error) {
 		return "ok", nil
 	}, function.WithName("long"), function.WithDescription("long"), function.WithLongRunning(true))
-	wrapped := trackTool(kindTool(long, "side_effect"))
+	wrapped := kindTool(long, "side_effect")
 	if !longRunning(wrapped) {
 		t.Fatal("long-running flag was dropped")
 	}

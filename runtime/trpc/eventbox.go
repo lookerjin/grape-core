@@ -1,7 +1,6 @@
 package trpcruntime
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -17,19 +16,20 @@ import (
 // event is always kept. Each burst of dropped deltas is reported with
 // one "dropped N events" marker.
 type eventBox struct {
-	mu      sync.Mutex
-	wake    chan struct{}
-	items   []agent.Event
-	closed  bool
-	max     int
-	dropped int
+	mu       sync.Mutex
+	wake     chan struct{}
+	finished chan struct{}
+	items    []agent.Event
+	closed   bool
+	max      int
+	dropped  int
 }
 
 func newEventBox(max int) *eventBox {
 	if max < 2 {
 		max = 2
 	}
-	return &eventBox{max: max, wake: make(chan struct{}, 1)}
+	return &eventBox{max: max, wake: make(chan struct{}, 1), finished: make(chan struct{})}
 }
 
 func (b *eventBox) signal() {
@@ -90,7 +90,10 @@ func droppedMarker(n int) agent.Event {
 
 func (b *eventBox) close() {
 	b.mu.Lock()
-	b.closed = true
+	if !b.closed {
+		b.closed = true
+		close(b.finished)
+	}
 	b.mu.Unlock()
 	b.signal()
 }
@@ -99,241 +102,90 @@ func (b *eventBox) close() {
 // this so a finished handle does not keep filling the queue.
 func (b *eventBox) abandon() {
 	b.mu.Lock()
-	b.closed = true
+	if !b.closed {
+		b.closed = true
+		close(b.finished)
+	}
 	b.items = nil
 	b.dropped = 0
 	b.mu.Unlock()
 	b.signal()
 }
 
-// pump sends queued events until the box is drained, stop is closed, or
-// the caller context ends. hold is how long a finished run waits for a
-// consumer who has not taken an event. idle is how long it waits after
-// the last take. Either expiry closes the stream. It reports whether a
-// terminal event was delivered. It does not invent one.
-func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx context.Context, hold, idle time.Duration) (sentTerminal bool) {
-	defer close(out)
-	if hold <= 0 {
-		hold = 30 * time.Second
-	}
-	if idle <= 0 {
-		idle = 5 * time.Minute
-	}
-	done := ctxDone(ctx)
+// pump delivers in order. The output buffer can absorb a short completed run
+// without a reader. Once execution finishes, a blocked send has a deadline.
+func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, hold, idle time.Duration) bool {
+	defer b.abandon()
+	finished := b.finished
 	var timer *time.Timer
-	var timed <-chan time.Time
-	stopTimer := func() {
-		if timer == nil {
-			return
+	defer func() {
+		if timer != nil {
+			timer.Stop()
 		}
-		if !timer.Stop() {
-			select {
-			case <-timed:
-			default:
-			}
-		}
-		timed = nil
-	}
-	defer stopTimer()
-	sent := false
-	var lastTake time.Time
-	pulse := time.NewTicker(10 * time.Millisecond)
-	defer pulse.Stop()
-	finish := func(held *agent.Event, bound <-chan time.Time) {
-		if b.deliverFinal(out, held, stop, bound) {
-			sentTerminal = true
-		}
-	}
-	boundOr := func(fallback time.Duration) <-chan time.Time {
-		if timed != nil {
-			return timed
-		}
-		if fallback <= 0 {
-			fallback = hold
-		}
-		timer = time.NewTimer(fallback)
-		return timer.C
-	}
+	}()
+	sent := 0
 	for {
-		evt, ok := b.pop(stop, done)
+		evt, ok := b.pop()
 		if !ok {
-			if ctx != nil && ctx.Err() != nil {
-				finish(nil, boundOr(hold))
-			}
-			return
-		}
-		for len(out) > 0 {
-			if b.isClosed() && timed == nil {
-				wait := hold
-				if !lastTake.IsZero() {
-					wait = idle - time.Since(lastTake)
-				}
-				if wait <= 0 {
-					finish(&evt, alreadyDue())
-					return
-				}
-				timer = time.NewTimer(wait)
-				timed = timer.C
-			}
-			select {
-			case <-timed:
-				finish(&evt, alreadyDue())
-				return
-			case <-done:
-				if b.isClosed() {
-					wait := hold
-					if !lastTake.IsZero() {
-						wait = idle - time.Since(lastTake)
-					}
-					finish(&evt, boundOr(wait))
-					return
-				}
-			case <-stop:
-				return
-			case <-pulse.C:
-			}
-		}
-		if sent {
-			lastTake = time.Now()
-			stopTimer()
-		}
-		select {
-		case out <- evt:
-			sent = true
-			if evt.Terminal() {
-				sentTerminal = true
-			}
-		case <-stop:
-			return
-		}
-	}
-}
-
-func ctxDone(ctx context.Context) <-chan struct{} {
-	if ctx == nil {
-		return nil
-	}
-	return ctx.Done()
-}
-
-func (b *eventBox) isClosed() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.closed
-}
-
-func keepOnCancel(evt agent.Event) bool {
-	return evt.Terminal() || evt.Kind == agent.EventToolEnd
-}
-
-func alreadyDue() <-chan time.Time {
-	ch := make(chan time.Time)
-	close(ch)
-	return ch
-}
-
-// deliverFinal drops ordinary events when out is full. The terminal and
-// tool_end are sent blocking. stop and the hold or idle timer bound that
-// wait. The run context does not.
-func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event, stop <-chan struct{}, bound <-chan time.Time) bool {
-	n, kept := b.compact()
-	if held != nil && keepOnCancel(*held) {
-		kept = append([]agent.Event{*held}, kept...)
-	} else if held != nil {
-		n++
-	}
-	if n > 0 {
-		select {
-		case out <- droppedMarker(n):
-		default:
-		}
-	}
-	sentTerminal := false
-	for _, evt := range kept {
-		if !keepOnCancel(evt) {
-			select {
-			case out <- evt:
-			default:
-			}
-			continue
-		}
-		select {
-		case out <- evt:
-			if evt.Terminal() {
-				sentTerminal = true
-			}
-			continue
-		default:
-		}
-		// out is full. Wait for space, Close, or the hold/idle bound.
-		// A non-blocking attempt comes first so an already-closed bound
-		// cannot win the race while the buffer still has room.
-		select {
-		case out <- evt:
-			if evt.Terminal() {
-				sentTerminal = true
-			}
-		case <-stop:
-			return sentTerminal
-		case <-bound:
-			return sentTerminal
-		}
-	}
-	return sentTerminal
-}
-
-func (b *eventBox) compact() (int, []agent.Event) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	var kept []agent.Event
-	extra := 0
-	for i := range b.items {
-		if keepOnCancel(b.items[i]) {
-			kept = append(kept, b.items[i])
-			continue
-		}
-		extra++
-	}
-	b.items = nil
-	b.dropped += extra
-	n := b.dropped
-	b.dropped = 0
-	b.closed = true
-	return n, kept
-}
-
-func (b *eventBox) pop(stop <-chan struct{}, done <-chan struct{}) (agent.Event, bool) {
-	for {
-		b.mu.Lock()
-		if marker, ok := b.takeDroppedLocked(); ok && (len(b.items) > 0 || b.closed) {
-			b.mu.Unlock()
-			return marker, true
-		}
-		if len(b.items) > 0 {
-			evt := b.items[0]
-			b.items = b.items[1:]
-			b.mu.Unlock()
-			return evt, true
-		}
-		if b.closed {
-			b.mu.Unlock()
-			return agent.Event{}, false
-		}
-		b.mu.Unlock()
-		select {
-		case <-b.wake:
-		case <-stop:
-			return agent.Event{}, false
-		case <-done:
-			if b.isClosed() {
-				return agent.Event{}, false
-			}
-			// The run has not closed the box yet. Wait for its final events.
 			select {
 			case <-b.wake:
+				continue
+			case <-b.finished:
+				// close follows the final push. Recheck the queue after observing it.
+				evt, ok = b.pop()
+				if !ok {
+					return false
+				}
 			case <-stop:
-				return agent.Event{}, false
+				return false
 			}
 		}
+		var timeout <-chan time.Time
+		for {
+			if finished == nil {
+				wait := hold
+				if sent > len(out) {
+					wait = idle
+				}
+				if timer == nil {
+					timer = time.NewTimer(wait)
+				} else {
+					timer.Reset(wait)
+				}
+				timeout = timer.C
+			}
+			select {
+			case out <- evt:
+				sent++
+			case <-stop:
+				return false
+			case <-finished:
+				finished = nil
+				continue
+			case <-timeout:
+				return false
+			}
+			break
+		}
+		if evt.Terminal() {
+			return true
+		}
 	}
+}
+
+func (b *eventBox) pop() (agent.Event, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.items) > 0 || b.closed {
+		if marker, ok := b.takeDroppedLocked(); ok {
+			return marker, true
+		}
+	}
+	if len(b.items) == 0 {
+		return agent.Event{}, false
+	}
+	evt := b.items[0]
+	b.items[0] = agent.Event{}
+	b.items = b.items[1:]
+	return evt, true
 }

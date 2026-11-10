@@ -25,7 +25,7 @@ import (
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/extension/goal"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
+
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/evolution"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -112,39 +112,37 @@ type Options struct {
 // It owns the SQLite session service it opens. Close releases that database
 // and the runner. A caller-supplied model is not closed.
 type Runtime struct {
-	cfg            config.Config
-	appName        string
-	runner         runner.Runner
-	sessions       *sqlitesession.Service
-	counter        *countingModel
-	model          model.Model
-	exec           *commandExecutor
-	tools          []tool.Tool
-	specs          []ToolSpec
-	skillRoots     []string
-	ruleText       string
-	ruleSources    []rules.Source
-	globalRules    string
-	hookRunner     *hooks.Runner
-	pluginHooks    []hooks.Spec
-	mcpServers     []mcp.Server
-	resolved       plugin.Resolved
-	fixed          trpcagent.Agent
-	subagents      []SubagentSpec
-	trustedTools   []tool.Tool
-	evolution      evolution.Service
-	mcpSets        []tool.ToolSet
-	mcpStatus      []mcp.Status
-	decider        agent.Decider
-	grantedHooks   []hooks.Spec
-	reject         bool
-	boundExec      codeexecutor.CodeExecutor
-	boundIsolation string
-	journal        *journal.Writer
-	secrets        []string
-	maxField       int
-	instruction    string
-	nested         map[string]map[string]struct{}
+	cfg          config.Config
+	appName      string
+	runner       runner.Runner
+	sessions     *sqlitesession.Service
+	counter      *countingModel
+	model        model.Model
+	exec         *commandExecutor
+	tools        []tool.Tool
+	specs        []ToolSpec
+	skillRoots   []string
+	ruleText     string
+	ruleSources  []rules.Source
+	globalRules  string
+	hookRunner   *hooks.Runner
+	pluginHooks  []hooks.Spec
+	mcpServers   []mcp.Server
+	resolved     plugin.Resolved
+	fixed        trpcagent.Agent
+	subagents    []SubagentSpec
+	trustedTools []tool.Tool
+	evolution    evolution.Service
+	mcpSets      []tool.ToolSet
+	mcpStatus    []mcp.Status
+	decider      agent.Decider
+	grantedHooks []hooks.Spec
+	reject       bool
+	journal      *journal.Writer
+	secrets      []string
+	maxField     int
+	instruction  string
+	nested       map[string]map[string]struct{}
 
 	mu    sync.Mutex
 	locks map[sessionKey]*countedLock
@@ -170,13 +168,7 @@ func New(opts Options) (*Runtime, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if err := rejectReservedAgents(opts.FixedAgent, opts.TrustedAgents, opts.Tools, specTools(opts.ToolSpecs)); err != nil {
-		return nil, err
-	}
-	if err := rejectSpecNames(opts.Subagents); err != nil {
-		return nil, err
-	}
-	if err := rejectUntrustedAgentTools(opts.Tools, opts.ToolSpecs); err != nil {
+	if err := rejectReservedAgents(opts.FixedAgent, opts.TrustedAgents); err != nil {
 		return nil, err
 	}
 	dataDir := opts.DataDir
@@ -356,23 +348,7 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	}
 	// Spec subagents are tRPC AgentTools. WithSubAgents would also
 	// register transfer_to_agent, which this runtime does not expose.
-	ag := llmagent.New("grape", opts...)
-	rt.mu.Lock()
-	rt.boundExec = ag.CodeExecutor()
-	rt.boundIsolation = rt.recordedIsolation(ws)
-	rt.mu.Unlock()
-	return ag, nil
-}
-
-func (rt *Runtime) recordedIsolation(ws string) string {
-	if rt == nil || rt.exec == nil || rt.cfg.KnowledgeOnly() {
-		return ""
-	}
-	_, isolation, err := rt.exec.skillCodeExecutor(ws)
-	if err != nil {
-		return ""
-	}
-	return isolation
+	return llmagent.New(rootAgentName, opts...), nil
 }
 
 func (rt *Runtime) executionOptions(ws, instruction string, mdl model.Model, tools []tool.Tool) ([]llmagent.Option, error) {
@@ -389,7 +365,7 @@ func (rt *Runtime) executionOptions(ws, instruction string, mdl model.Model, too
 		llmagent.WithWorkspaceExecSurfaceEnabled(false),
 		llmagent.WithMaxLLMCalls(positiveLimit(rt.cfg.Context.MaxLLMCalls)),
 		llmagent.WithMaxToolIterations(positiveLimit(rt.cfg.Context.MaxToolIterations)),
-		llmagent.WithTools(trackTools(tools)),
+		llmagent.WithTools(tools),
 	}
 	repo, err := rt.skillRepository()
 	if err != nil {
@@ -440,32 +416,14 @@ func (rt *Runtime) buildSubagent(spec SubagentSpec, ws string) (tool.Tool, error
 		opts = append(opts, llmagent.WithRefreshToolSetsOnRun(true))
 	}
 	ag := llmagent.New(spec.Name, opts...)
-	return agenttool.NewTool(ag), nil
+	return kindTool(agenttool.NewTool(ag), "side_effect"), nil
 }
 
 func (rt *Runtime) prepareSurface(trusted []trpcagent.Agent) error {
-	tools := make([]tool.Tool, 0, len(rt.tools))
-	for _, item := range rt.tools {
-		tools = append(tools, kindTool(item, "side_effect"))
+	if err := prepareTools(rt.tools, rt.specs); err != nil {
+		return err
 	}
-	rt.tools = tools
-	specs := make([]ToolSpec, 0, len(rt.specs))
-	for _, spec := range rt.specs {
-		if spec.Tool == nil {
-			continue
-		}
-		if spec.Trusted {
-			specs = append(specs, ToolSpec{Tool: wrapTrusted(spec.Tool), Trusted: true})
-			continue
-		}
-		kind := spec.Kind
-		if kind == "" {
-			kind = "side_effect"
-		}
-		specs = append(specs, ToolSpec{Tool: kindTool(spec.Tool, kind), Kind: kind})
-	}
-	rt.specs = specs
-	if err := rt.prepareSpecs(rt.subagents); err != nil {
+	if err := prepareSpecs(rt.subagents); err != nil {
 		return err
 	}
 	wrapped := make([]tool.Tool, 0, len(trusted))
@@ -479,7 +437,7 @@ func (rt *Runtime) prepareSurface(trusted []trpcagent.Agent) error {
 	return nil
 }
 
-func (rt *Runtime) prepareSpecs(specs []SubagentSpec) error {
+func prepareSpecs(specs []SubagentSpec) error {
 	for i := range specs {
 		if len(specs[i].ToolSets) > 0 && !specs[i].TrustToolSets {
 			return agent.Invalid("subagent.tool_sets", fmt.Errorf("provider code requires TrustToolSets"))
@@ -490,36 +448,48 @@ func (rt *Runtime) prepareSpecs(specs []SubagentSpec) error {
 		if specs[i].Name == rootAgentName {
 			return agent.Wrap(agent.ErrInvalidConfig, "agent", fmt.Errorf("non-root agent named %q is reserved", rootAgentName))
 		}
-		tools := make([]tool.Tool, 0, len(specs[i].Tools))
-		for _, item := range specs[i].Tools {
-			if err := rejectRawAgentTool(item); err != nil {
-				return err
-			}
-			tools = append(tools, kindTool(item, "side_effect"))
-		}
-		specs[i].Tools = tools
-		tspecs := make([]ToolSpec, 0, len(specs[i].ToolSpecs))
-		for _, spec := range specs[i].ToolSpecs {
-			if spec.Tool == nil {
-				continue
-			}
-			if spec.Trusted {
-				tspecs = append(tspecs, ToolSpec{Tool: wrapTrusted(spec.Tool), Trusted: true})
-				continue
-			}
-			if err := rejectRawAgentTool(spec.Tool); err != nil {
-				return err
-			}
-			kind := spec.Kind
-			if kind == "" {
-				kind = "side_effect"
-			}
-			tspecs = append(tspecs, ToolSpec{Tool: kindTool(spec.Tool, kind), Kind: kind})
-		}
-		specs[i].ToolSpecs = tspecs
-		if err := rt.prepareSpecs(specs[i].Subagents); err != nil {
+		if err := prepareTools(specs[i].Tools, specs[i].ToolSpecs); err != nil {
 			return err
 		}
+		if err := prepareSpecs(specs[i].Subagents); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// New owns these slices via cloneSpecs and the copies in Runtime.
+func prepareTools(raw []tool.Tool, specs []ToolSpec) error {
+	for i, item := range raw {
+		if err := rejectRawAgentTool(item); err != nil {
+			return err
+		}
+		raw[i] = kindTool(item, "side_effect")
+	}
+	for i, spec := range specs {
+		if spec.Tool == nil {
+			continue
+		}
+		if spec.Trusted {
+			if err := rejectReservedTools([]tool.Tool{spec.Tool}); err != nil {
+				return err
+			}
+			specs[i].Tool = wrapTrusted(spec.Tool)
+			continue
+		}
+		if err := rejectRawAgentTool(spec.Tool); err != nil {
+			return err
+		}
+		switch spec.Kind {
+		case "", "read", "write", "command", "side_effect":
+		default:
+			return agent.Invalid("tool.kind", fmt.Errorf("unknown kind %q", spec.Kind))
+		}
+		kind := spec.Kind
+		if kind == "" {
+			kind = "side_effect"
+		}
+		specs[i].Tool = kindTool(spec.Tool, kind)
 	}
 	return nil
 }
@@ -716,14 +686,15 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	}
 	rt.track(h)
 	go func() {
-		if box.pump(ch, h.stop, runCtx, rt.eventHoldTimeout(), rt.eventIdleTimeout()) {
+		if box.pump(ch, h.stop, rt.eventHoldTimeout(), rt.eventIdleTimeout()) {
 			h.noteStreamDelivered()
 		} else {
 			h.noteDeliveryClosed()
 		}
+		close(ch)
 		rt.untrack(h)
 	}()
-	go rt.forward(runCtx, req, runID, st, events, box, h, unlock)
+	go func() { defer cancel(); rt.forward(runCtx, req, runID, st, events, box, h, unlock) }()
 	return h, nil
 }
 
@@ -1200,12 +1171,10 @@ type runHandle struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 
-	mu           sync.Mutex
-	result       agent.RunStatus
-	resultDone   chan struct{}
-	hasResult    bool
-	userCancel   bool
-	terminalSent bool
+	mu         sync.Mutex
+	result     agent.RunStatus
+	resultDone chan struct{}
+	userCancel bool
 }
 
 func (h *runHandle) noteResult(evt agent.Event, startCanceled bool) {
@@ -1216,10 +1185,9 @@ func (h *runHandle) noteResult(evt agent.Event, startCanceled bool) {
 	_ = json.Unmarshal(evt.Payload, &body)
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.hasResult {
+	if h.result.Status != "" {
 		return
 	}
-	h.hasResult = true
 	delivery := h.result.Delivery
 	if h.resultDone != nil {
 		defer close(h.resultDone)
@@ -1242,8 +1210,7 @@ func (h *runHandle) noteResult(evt agent.Event, startCanceled bool) {
 		if evt.Kind == agent.EventCancelled && !h.userCancel {
 			h.result.Cause = agent.CauseDelivery
 		}
-	} else if h.terminalSent {
-		h.result.Delivery = agent.DeliveryDelivered
+
 	} else {
 		h.result.Delivery = agent.DeliveryOpen
 	}
@@ -1255,10 +1222,6 @@ func (h *runHandle) noteStreamDelivered() {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.terminalSent = true
-	if h.result.Delivery == agent.DeliveryAbandoned {
-		return
-	}
 	h.result.Delivery = agent.DeliveryDelivered
 }
 
@@ -1279,7 +1242,7 @@ func (h *runHandle) Status() agent.RunStatus {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !h.hasResult {
+	if h.result.Status == "" {
 		delivery := h.result.Delivery
 		if delivery == "" {
 			delivery = agent.DeliveryOpen
@@ -1299,19 +1262,13 @@ func (h *runHandle) Close() error {
 	}
 	h.stopOnce.Do(func() {
 		h.mu.Lock()
-		has := h.hasResult
-		if has && h.result.Delivery != agent.DeliveryDelivered {
+		pending := h.result.Status == ""
+		if h.result.Delivery != agent.DeliveryDelivered {
 			h.result.Delivery = agent.DeliveryAbandoned
 		}
 		h.mu.Unlock()
-		if !has {
-			// The stream is closing before a result exists. Cancel the run
-			// so that state is true, and record delivery rather than a
-			// result the run has not produced.
-			h.noteDeliveryClosed()
-			if h.cancel != nil {
-				_ = h.cancel()
-			}
+		if pending && h.cancel != nil {
+			_ = h.cancel()
 		}
 		if h.box != nil {
 			h.box.abandon()

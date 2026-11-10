@@ -14,8 +14,10 @@ import (
 	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/internal/mockmodel"
 	"github.com/lookerjin/grape-core/memory"
+	"trpc.group/trpc-go/trpc-agent-go/agent/extension/goal"
 	"trpc.group/trpc-go/trpc-agent-go/evolution"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 )
 
 func TestPlanModeDenialSkipsCommand(t *testing.T) {
@@ -75,7 +77,17 @@ func TestGoalModeRegistersExtensionAndDefaultDoesNot(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Goal.MaxIterations = 1
 	cfg.Journal.Enabled = false
-	goalModel := mockmodel.New("goal", mockmodel.Echo)
+	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
+	goalModel := mockmodel.New("goal", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		switch toolMessages(req) {
+		case 0:
+			return toolCall("create_goal", `{"objective":"ship it"}`), nil
+		case 1:
+			return toolCall("update_goal", `{"status":"complete"}`), nil
+		default:
+			return mockmodel.Echo(ctx, req)
+		}
+	})
 	rt, err := New(Options{Config: &cfg, Model: goalModel, DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
@@ -88,8 +100,16 @@ func TestGoalModeRegistersExtensionAndDefaultDoesNot(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := collect(t, h)
-	if events[len(events)-1].Kind != agent.EventCompleted && events[len(events)-1].Kind != agent.EventFailed {
+	if events[len(events)-1].Kind != agent.EventCompleted {
 		t.Fatalf("last %s", events[len(events)-1].Kind)
+	}
+	sess, err := rt.sessions.GetSession(context.Background(), session.Key{AppName: rt.appName, UserID: "u", SessionID: "goal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objective, ok, err := goal.GetGoal(sess)
+	if err != nil || !ok || objective.Status != goal.GoalStatusComplete {
+		t.Fatalf("persisted goal: %+v, err=%v", objective, err)
 	}
 	if !requestHasTool(goalModel, "create_goal") {
 		t.Fatal("goal mode did not register create_goal")

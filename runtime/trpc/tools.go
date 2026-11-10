@@ -409,7 +409,7 @@ func bindTool(item tool.Tool, kind string, trusted bool) tool.Tool {
 
 func kindTool(item tool.Tool, kind string) tool.Tool {
 	if kind == "side_effect" && isGrapeRead(item) {
-		return item
+		kind = "read"
 	}
 	return bindTool(item, kind, false)
 }
@@ -506,29 +506,7 @@ func streamInner(item tool.Tool) bool {
 	return pref.StreamInner()
 }
 
-func trackTool(item tool.Tool) tool.Tool {
-	if _, ok := adapted(item); ok {
-		return item
-	}
-	return bindTool(item, "side_effect", false)
-}
-
-func trackTools(tools []tool.Tool) []tool.Tool {
-	out := make([]tool.Tool, len(tools))
-	for i, item := range tools {
-		out[i] = trackTool(item)
-	}
-	return out
-}
-
-func mutatingKind(kind string) bool {
-	switch kind {
-	case "read":
-		return false
-	default:
-		return true
-	}
-}
+func mutatingKind(kind string) bool { return kind != "read" }
 
 func (rt *Runtime) authorize(ctx context.Context, kind, detail, path string) error {
 	if rt.cfg.Workspace.Permission == agent.PermissionReadOnly && mutatingKind(kind) {

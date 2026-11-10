@@ -138,23 +138,6 @@ func frameworkNamed(item tool.Tool) tool.Tool {
 	return item
 }
 
-func rejectUntrustedAgentTools(tools []tool.Tool, specs []ToolSpec) error {
-	for _, item := range tools {
-		if err := rejectRawAgentTool(item); err != nil {
-			return err
-		}
-	}
-	for _, spec := range specs {
-		if spec.Trusted {
-			continue
-		}
-		if err := rejectRawAgentTool(spec.Tool); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func rejectRawAgentTool(item tool.Tool) error {
 	if item == nil {
 		return nil

@@ -15,15 +15,16 @@ import (
 // converter turns one tRPC event stream into grape-core events.
 // Sequence numbers belong to this run only.
 type converter struct {
-	runID       string
-	sessionID   string
-	seenTool    map[string]struct{}
-	openTool    map[string]string
-	closeStatus string
-	panicMsg    string
-	maxField    int
-	secrets     []string
-	seq         uint64
+	runID        string
+	sessionID    string
+	seenTool     map[string]struct{}
+	openTool     map[string]string
+	closeStatus  string
+	failedToolID string
+	toolError    string
+	maxField     int
+	secrets      []string
+	seq          uint64
 }
 
 func newConverter(runID, sessionID string, maxField int, secrets []string) *converter {
@@ -49,8 +50,13 @@ func (c *converter) convert(evt *event.Event) []agent.Event {
 		out = append(out, c.terminal(evt))
 		return out
 	}
-	if evt.Error != nil {
-		c.notePanic(evt.Error.Message)
+	if evt.Error != nil && evt.Done && len(c.openTool) == 1 {
+		// The runner can terminate before a tool response is emitted. Attribute
+		// that failure only when the outstanding call is unambiguous.
+		for id := range c.openTool {
+			c.failedToolID = id
+		}
+		c.toolError = c.clean(evt.Error.Message)
 	}
 	var out []agent.Event
 	if evt.Object == model.ObjectTypeToolResponse {
@@ -196,18 +202,14 @@ func (c *converter) toolEndOne(evt *event.Event, name, id, content string) agent
 		delete(c.openTool, id)
 	}
 	errField := ""
-	if strings.Contains(strings.ToLower(content), "panic") {
-		errField = c.clean(content)
-	}
-	if content == "" && c.panicMsg != "" {
-		content = c.panicMsg
-		errField = c.panicMsg
-		c.panicMsg = ""
+	if id != "" && id == c.failedToolID {
+		errField = c.toolError
+		if content == "" {
+			content = errField
+		}
+		c.failedToolID, c.toolError = "", ""
 	}
 	cleaned, truncated := c.clip(content)
-	if errField != "" {
-		errField = c.clean(errField)
-	}
 	result := json.RawMessage(strconvQuote(cleaned))
 	ev := c.base(evt, agent.EventToolEnd, agent.MustPayload(agent.ToolPayload{
 		Name:      name,
@@ -218,13 +220,6 @@ func (c *converter) toolEndOne(evt *event.Event, name, id, content string) agent
 	}))
 	ev.ToolCallID = id
 	return ev
-}
-
-func (c *converter) notePanic(msg string) {
-	msg = c.clean(msg)
-	if strings.Contains(strings.ToLower(msg), "panic") {
-		c.panicMsg = msg
-	}
 }
 
 func (c *converter) closeOpenTools(evt *event.Event, status string) []agent.Event {

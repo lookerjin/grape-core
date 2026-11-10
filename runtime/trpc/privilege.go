@@ -50,19 +50,7 @@ func (rt *Runtime) allowNestedRead(agentName, toolName string) bool {
 	return ok
 }
 
-func rejectSpecNames(specs []SubagentSpec) error {
-	for _, spec := range specs {
-		if spec.Name == rootAgentName {
-			return agent.Wrap(agent.ErrInvalidConfig, "agent", fmt.Errorf("non-root agent named %q is reserved", rootAgentName))
-		}
-		if err := rejectSpecNames(spec.Subagents); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func rejectReservedAgents(root trpcagent.Agent, subs []trpcagent.Agent, tools []tool.Tool, extra []tool.Tool) error {
+func rejectReservedAgents(root trpcagent.Agent, subs []trpcagent.Agent) error {
 	seen := map[trpcagent.Agent]struct{}{}
 	var walk func(trpcagent.Agent, bool) error
 	walk = func(a trpcagent.Agent, isRoot bool) error {
@@ -94,20 +82,7 @@ func rejectReservedAgents(root trpcagent.Agent, subs []trpcagent.Agent, tools []
 			return err
 		}
 	}
-	if err := rejectReservedTools(tools); err != nil {
-		return err
-	}
-	return rejectReservedTools(extra)
-}
-
-func specTools(specs []ToolSpec) []tool.Tool {
-	out := make([]tool.Tool, 0, len(specs))
-	for _, spec := range specs {
-		if spec.Tool != nil {
-			out = append(out, spec.Tool)
-		}
-	}
-	return out
+	return nil
 }
 
 func rejectReservedTools(tools []tool.Tool) error {

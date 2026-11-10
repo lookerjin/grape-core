@@ -21,10 +21,13 @@ go test ./...
 ```bash
 go run ./examples/basic
 go run ./examples/coding
+go run ./examples/research
 go run ./examples/extensions ./path/to/plugin
 ```
 
-Examples use a mock model unless `GRAPE_REAL_MODEL=1`. A real call also needs `MODEL_API_KEY` and, for a non-default endpoint, `MODEL_BASE_URL`. Keys stay in the environment named by `model.api_key_env`.
+Research reads two local latency reports through a custom tool, loads a comparison skill and prints the measured change. It always uses an offline model. Coding edits a disposable fixture, runs its Go test and delegates the result to a reviewer. Its default command uses the managed sandbox. For the scripted fixture only, explicitly set `GRAPE_FIXTURE_HOST_TEST=1` to run that test on the host with isolation `none`. The example exits nonzero if verification fails.
+
+Basic and Coding use a mock model unless `GRAPE_REAL_MODEL=1`. A real call also needs `MODEL_API_KEY` and, for a non-default endpoint, `MODEL_BASE_URL`. Keys stay in the environment named by `model.api_key_env`.
 
 ## Data directory
 

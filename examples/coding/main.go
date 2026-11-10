@@ -1,18 +1,18 @@
 // Command coding runs the offline fixture task from testdata/fixture.
 //
 // It copies the fixture into a temporary directory, asks the mock model to
-// fix the failing test, and prints git status. Set GRAPE_REAL_MODEL=1 to use
+// fix the failing test, and checks the command result. Set GRAPE_REAL_MODEL=1 to use
 // the configured model instead of the mock. Real model calls are not part of
 // the default path.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/lookerjin/grape-core/agent"
@@ -34,6 +34,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(ws)
+	data, err := os.MkdirTemp("", "grape-coding-session-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(data)
 	fmt.Println("workspace", ws)
 	cfg := config.Default()
 	cfg.Workspace.Root = ws
@@ -42,9 +48,14 @@ func run() error {
 	cfg.Model.APIKeyEnv = "MODEL_API_KEY"
 	cfg.Model.Name = envOr(os.Getenv("MODEL_NAME"), "example-model")
 	cfg.Model.BaseURL = os.Getenv("MODEL_BASE_URL")
-	opts := trpcruntime.Options{Config: &cfg}
+	cfg.Context.TotalMaxLLMCalls = config.Int(12)
+	opts := trpcruntime.Options{Config: &cfg, DataDir: data, Subagents: []trpcruntime.SubagentSpec{{Name: "reviewer", Instruction: "Review the supplied test output."}}}
 	if os.Getenv("GRAPE_REAL_MODEL") != "1" {
 		opts.Model = mockmodel.New("coding", mockmodel.CodingFix)
+		opts.Subagents[0].Model = mockmodel.New("reviewer", mockmodel.Echo)
+		if os.Getenv("GRAPE_FIXTURE_HOST_TEST") == "1" {
+			cfg.Sandbox.Mode = sandbox.ModeDangerFullAccess
+		}
 	}
 	rt, err := trpcruntime.New(opts)
 	if err != nil {
@@ -57,25 +68,43 @@ func run() error {
 		UserID:    "local-user",
 		SessionID: "coding-demo",
 		Workspace: ws,
-		Message:   "fix the failing test",
+		Message:   "Fix the failing test, run go test ./..., and ask reviewer to inspect the test result.",
 	})
 	if err != nil {
 		return err
 	}
+	var verified, reviewed bool
 	for evt := range handle.Events() {
 		fmt.Printf("%d %s %s\n", evt.Sequence, evt.Kind, evt.Payload)
+		if evt.Kind != agent.EventToolEnd {
+			continue
+		}
+		var tool agent.ToolPayload
+		if err := json.Unmarshal(evt.Payload, &tool); err != nil {
+			return err
+		}
+		var content string
+		if err := json.Unmarshal(tool.Result, &content); err != nil {
+			return err
+		}
+		switch tool.Name {
+		case "run_command":
+			var result struct {
+				ExitCode *int   `json:"exit_code"`
+				Stdout   string `json:"stdout"`
+			}
+			verified = json.Unmarshal([]byte(content), &result) == nil && result.ExitCode != nil && *result.ExitCode == 0 && strings.Contains(result.Stdout, "example.com/fixture")
+		case "reviewer":
+			reviewed = tool.Error == "" && strings.Contains(content, "fixture test")
+		}
 	}
 	body, err := os.ReadFile(filepath.Join(ws, "math.go"))
 	if err != nil {
 		return err
 	}
 	fmt.Printf("math.go:\n%s", body)
-	if _, err := os.Stat(filepath.Join(ws, ".git")); err == nil {
-		diff, err := exec.Command("git", "-C", ws, "diff", "--", "math.go").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("git diff: %w\n%s", err, diff)
-		}
-		fmt.Printf("diff:\n%s", diff)
+	if handle.Status().Status != string(agent.EventCompleted) || !strings.Contains(string(body), "return a + b") || !verified || (!reviewed && os.Getenv("GRAPE_REAL_MODEL") != "1") {
+		return fmt.Errorf("fixture verification incomplete (go test passed=%t, reviewer=%t)", verified, reviewed)
 	}
 	return nil
 }
@@ -89,28 +118,21 @@ func copyFixture() (string, error) {
 	if _, err := os.Stat(src); err != nil {
 		src = filepath.Join(wd, "..", "..", "testdata", "fixture")
 	}
-	dst, err := os.MkdirTemp("", "grape-coding-")
-	if err != nil {
-		return "", err
-	}
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		return "", err
 	}
+	dst, err := os.MkdirTemp("", "grape-coding-")
+	if err != nil {
+		return "", err
+	}
 	for _, entry := range entries {
-		in, err := os.Open(filepath.Join(src, entry.Name()))
-		if err != nil {
-			return "", err
+		body, err := os.ReadFile(filepath.Join(src, entry.Name()))
+		if err == nil {
+			err = os.WriteFile(filepath.Join(dst, entry.Name()), body, 0600)
 		}
-		out, err := os.Create(filepath.Join(dst, entry.Name()))
 		if err != nil {
-			in.Close()
-			return "", err
-		}
-		_, err = io.Copy(out, in)
-		in.Close()
-		out.Close()
-		if err != nil {
+			os.RemoveAll(dst)
 			return "", err
 		}
 	}

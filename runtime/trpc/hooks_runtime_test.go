@@ -159,7 +159,7 @@ func TestHookEventsTimeoutAndReadOnly(t *testing.T) {
 }
 
 func TestHooksFireOncePerLogicalEvent(t *testing.T) {
-	requireLinuxSandbox(t)
+
 	root := t.TempDir()
 	ws := filepath.Join(root, "ws")
 	if err := os.MkdirAll(ws, 0o755); err != nil {
@@ -174,7 +174,7 @@ func TestHooksFireOncePerLogicalEvent(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Workspace.Root = ws
-	cfg.Sandbox.Mode = "managed"
+	cfg.Sandbox.Mode = "danger_full_access"
 	cfg.Model.Generation.Stream = boolPtr(true)
 	cfg.Journal.Enabled = false
 	cfg.Hooks.MaxConcurrent = 1
@@ -216,7 +216,7 @@ func TestHooksFireOncePerLogicalEvent(t *testing.T) {
 }
 
 func TestHooksRunAgainAcrossSessions(t *testing.T) {
-	requireLinuxSandbox(t)
+
 	root := t.TempDir()
 	ws := filepath.Join(root, "ws")
 	if err := os.MkdirAll(ws, 0o755); err != nil {
@@ -226,7 +226,7 @@ func TestHooksRunAgainAcrossSessions(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace.Permission = agent.PermissionWorkspaceWrite
 	cfg.Workspace.Root = ws
-	cfg.Sandbox.Mode = "managed"
+	cfg.Sandbox.Mode = "danger_full_access"
 	cfg.Model.Generation.Stream = boolPtr(false)
 	cfg.Journal.Enabled = false
 	cfg.Hooks.MaxConcurrent = 1

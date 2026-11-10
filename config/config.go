@@ -178,8 +178,9 @@ type JournalConfig struct {
 
 // GoalConfig bounds goal mode. Zero MaxIterations means the default.
 type GoalConfig struct {
-	MaxIterations int    `yaml:"max_iterations"`
-	Promise       string `yaml:"promise"`
+	MaxIterations int `yaml:"max_iterations"`
+	// Deprecated: the native goal uses persisted status. Only the legacy default is accepted.
+	Promise string `yaml:"promise"`
 }
 
 // PlanConfig controls whether plan mode requires an approval before writes.
