@@ -262,6 +262,17 @@ func (b *eventBox) deliverFinal(out chan<- agent.Event, held *agent.Event, stop 
 			if evt.Terminal() {
 				sentTerminal = true
 			}
+			continue
+		default:
+		}
+		// out is full. Wait for space, Close, or the hold/idle bound.
+		// A non-blocking attempt comes first so an already-closed bound
+		// cannot win the race while the buffer still has room.
+		select {
+		case out <- evt:
+			if evt.Terminal() {
+				sentTerminal = true
+			}
 		case <-stop:
 			return sentTerminal
 		case <-bound:

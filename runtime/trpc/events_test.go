@@ -425,6 +425,33 @@ func TestCloseMidRunStopsTheRun(t *testing.T) {
 	}
 }
 
+func TestStartContextCancelReportsCauseUser(t *testing.T) {
+	cfg := quietConfig(t)
+	started := make(chan struct{})
+	mdl := mockmodel.New("start-cancel", func(ctx context.Context, req *model.Request) (*model.Response, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	rt := newTestRuntime(t, mdl, cfg)
+	defer rt.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	h, err := rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "start-cancel", Message: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	cancel()
+	events := collect(t, h)
+	last := events[len(events)-1]
+	if last.Kind != agent.EventCancelled {
+		t.Fatalf("terminal %s %s", last.Kind, eventBlob(events))
+	}
+	if h.Status().Cause != agent.CauseUser {
+		t.Fatalf("status %#v", h.Status())
+	}
+}
+
 func configInt(n int) *int {
 	v := n
 	return &v

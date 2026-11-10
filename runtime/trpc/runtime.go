@@ -731,7 +731,7 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 		}
 		if evt.Terminal() {
 			if h != nil {
-				h.noteResult(evt)
+				h.noteResult(evt, ctx.Err() == context.Canceled)
 			}
 			rt.finishSession(req.SessionID, runID, st, unlock)
 		}
@@ -1118,7 +1118,7 @@ type runHandle struct {
 	terminalSent bool
 }
 
-func (h *runHandle) noteResult(evt agent.Event) {
+func (h *runHandle) noteResult(evt agent.Event, startCanceled bool) {
 	if h == nil || !evt.Terminal() {
 		return
 	}
@@ -1140,7 +1140,7 @@ func (h *runHandle) noteResult(evt agent.Event) {
 	if h.result.Status == "" {
 		h.result.Status = string(evt.Kind)
 	}
-	if evt.Kind == agent.EventCancelled && h.userCancel && h.result.Cause == "" {
+	if evt.Kind == agent.EventCancelled && h.result.Cause == "" && (h.userCancel || startCanceled) {
 		h.result.Cause = agent.CauseUser
 	}
 	if h.terminalSent {

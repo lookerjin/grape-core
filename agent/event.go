@@ -93,7 +93,8 @@ const (
 	CauseDelivery = "delivery"
 	// DeliveryOpen means the stream has not closed.
 	DeliveryOpen = "open"
-	// DeliveryDelivered means the consumer was sent the terminal event.
+	// DeliveryDelivered means the terminal event entered the output buffer.
+	// It does not mean the consumer has read it.
 	DeliveryDelivered = "delivered"
 	// DeliveryAbandoned means Close, hold, or idle closed the stream
 	// without delivering the terminal event.
@@ -102,9 +103,11 @@ const (
 
 // RunStatus is the run result, separate from whether the stream delivered it.
 // Before the run stops, Status is StatusPending and Delivery is DeliveryOpen.
-// Cause is CauseUser for a caller cancel and CauseDelivery when the stream
-// was closed before a result existed. Delivery records open, delivered, or
-// abandoned. A result that already exists is kept when the stream is abandoned.
+// Cause is CauseUser when Cancel or the Start context stops the run, and
+// CauseDelivery when the stream was closed before a result existed.
+// DeliveryDelivered means the terminal entered the output buffer, not that
+// the consumer has read it. A result that already exists is kept when the
+// stream is abandoned.
 type RunStatus struct {
 	Status   string `json:"status,omitempty"`
 	Error    string `json:"error,omitempty"`
