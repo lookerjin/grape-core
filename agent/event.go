@@ -81,9 +81,25 @@ type ToolPayload struct {
 const (
 	ReasonBudgetExceeded = "budget_exceeded"
 	ReasonAgentStopped   = "agent_stopped"
+	ReasonError          = "error"
 	ScopeRun             = "run"
 	ScopeAgent           = "agent"
+	// CauseDelivery means the stream closed because of Close, hold, or idle
+	// before a terminal event was delivered. It is not the run's own result.
+	CauseDelivery = "delivery"
 )
+
+// RunStatus is the run result, separate from whether the stream delivered it.
+// Cause is CauseDelivery when Close, hold, or idle closed the stream before
+// a terminal event was delivered.
+type RunStatus struct {
+	Status  string `json:"status,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Scope   string `json:"scope,omitempty"`
+	AgentID string `json:"agent_id,omitempty"`
+	Cause   string `json:"cause,omitempty"`
+}
 
 type TerminalPayload struct {
 	Status  string `json:"status"`

@@ -3,6 +3,7 @@ package trpcruntime
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/evolution"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	toolcallid "trpc.group/trpc-go/trpc-agent-go/plugin/toolcallid"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sqlitesession "trpc.group/trpc-go/trpc-agent-go/session/sqlite"
@@ -262,7 +264,9 @@ func New(opts Options) (*Runtime, error) {
 	}
 	runnerOpts := []runner.Option{
 		runner.WithSessionService(sessions),
-		runner.WithPlugins(&hookPlugin{rt: rt}),
+		// The hook runs first so an empty response id is filled before
+		// toolcallid canonicalizes tool call ids.
+		runner.WithPlugins(&hookPlugin{rt: rt}, toolcallid.New()),
 	}
 	if rt.evolution != nil {
 		runnerOpts = append(runnerOpts, runner.WithEvolutionService(rt.evolution))
@@ -687,10 +691,12 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	}
 	rt.track(h)
 	go func() {
-		box.pump(ch, h.stop, runCtx, rt.eventHoldTimeout(), rt.eventIdleTimeout())
+		if !box.pump(ch, h.stop, runCtx, rt.eventHoldTimeout(), rt.eventIdleTimeout()) {
+			h.noteDeliveryClosed()
+		}
 		rt.untrack(h)
 	}()
-	go rt.forward(runCtx, req, runID, st, events, box, unlock)
+	go rt.forward(runCtx, req, runID, st, events, box, h, unlock)
 	return h, nil
 }
 
@@ -701,7 +707,7 @@ func classifyRunError(err error) error {
 	return agent.Wrap(agent.ErrModel, "run", err)
 }
 
-func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID string, st *runState, in <-chan *event.Event, out *eventBox, unlock func()) {
+func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID string, st *runState, in <-chan *event.Event, out *eventBox, h *runHandle, unlock func()) {
 	defer rt.finishSession(req.SessionID, runID, st, unlock)
 	defer out.close()
 	conv := newConverter(runID, req.SessionID, rt.maxField, rt.secrets)
@@ -713,11 +719,18 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 		if evt.SessionID == "" {
 			evt.SessionID = req.SessionID
 		}
-		if ctx.Err() != nil && !evt.Terminal() && evt.Kind != agent.EventToolEnd {
-			return
-		}
 		evt = applyStop(st, evt)
+		if evt.Kind == agent.EventCompleted && ctx.Err() != nil {
+			evt.Kind = agent.EventCancelled
+			evt.Payload = agent.MustPayload(agent.TerminalPayload{
+				Status: string(agent.EventCancelled),
+				Error:  ctx.Err().Error(),
+			})
+		}
 		if evt.Terminal() {
+			if h != nil {
+				h.noteResult(evt)
+			}
 			rt.finishSession(req.SessionID, runID, st, unlock)
 		}
 		if rt.journal != nil {
@@ -750,50 +763,25 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 			if !ok {
 				goto drained
 			}
-			if ctx.Err() != nil {
-				continue
-			}
 			flush()
 			if terminal {
 				continue
 			}
 			rt.observeLimit(st, evt)
+			if ctx.Err() != nil {
+				conv.closeStatus = "cancelled"
+			}
 			for _, next := range conv.convert(evt) {
-				if next.Kind == agent.EventCompleted && ctx.Err() != nil {
-					next.Kind = agent.EventCancelled
-					next.Payload = agent.MustPayload(agent.TerminalPayload{
-						Status: string(agent.EventCancelled),
-						Error:  ctx.Err().Error(),
-					})
-				}
 				emit(next)
 				if terminal {
 					break
 				}
 			}
 		case <-cancelled:
+			// Keep reading until the runner closes the channel. Its
+			// completion is the terminal. A dropped completion is mapped
+			// once, after the channel closes.
 			cancelled = nil
-			if !terminal {
-				pending := conv.closeOpenTools(nil, "cancelled")
-				for _, next := range pending {
-					emit(next)
-				}
-				emit(conv.stamp(agent.Event{
-					RunID:     runID,
-					SessionID: req.SessionID,
-					Kind:      agent.EventCancelled,
-					Time:      time.Now().UTC(),
-					Payload: agent.MustPayload(agent.TerminalPayload{
-						Status: string(agent.EventCancelled),
-						Error:  ctx.Err().Error(),
-					}),
-				}))
-			}
-			go func() {
-				for range in {
-				}
-			}()
-			return
 		}
 	}
 drained:
@@ -806,21 +794,18 @@ drained:
 		}
 		emit(conv.stamp(evt))
 	}
-	if !terminal {
-		status := agent.EventFailed
-		msg := "run ended without a terminal event"
-		if ctx.Err() != nil {
-			status = agent.EventCancelled
-			msg = ctx.Err().Error()
+	if !terminal && ctx.Err() != nil {
+		for _, next := range conv.closeOpenTools(nil, "cancelled") {
+			emit(next)
 		}
 		emit(conv.stamp(agent.Event{
 			RunID:     runID,
 			SessionID: req.SessionID,
-			Kind:      status,
+			Kind:      agent.EventCancelled,
 			Time:      time.Now().UTC(),
 			Payload: agent.MustPayload(agent.TerminalPayload{
-				Status: string(status),
-				Error:  msg,
+				Status: string(agent.EventCancelled),
+				Error:  ctx.Err().Error(),
 			}),
 		}))
 	}
@@ -1110,6 +1095,55 @@ type runHandle struct {
 	box      *eventBox
 	stop     chan struct{}
 	stopOnce sync.Once
+
+	mu       sync.Mutex
+	result   agent.RunStatus
+	delivery bool
+}
+
+func (h *runHandle) noteResult(evt agent.Event) {
+	if h == nil || !evt.Terminal() {
+		return
+	}
+	var body agent.TerminalPayload
+	_ = json.Unmarshal(evt.Payload, &body)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.delivery {
+		return
+	}
+	h.result = agent.RunStatus{
+		Status:  body.Status,
+		Error:   body.Error,
+		Reason:  body.Reason,
+		Scope:   body.Scope,
+		AgentID: body.AgentID,
+	}
+	if h.result.Status == "" {
+		h.result.Status = string(evt.Kind)
+	}
+}
+
+func (h *runHandle) noteDeliveryClosed() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.delivery = true
+	h.result = agent.RunStatus{
+		Status: string(agent.EventCancelled),
+		Cause:  agent.CauseDelivery,
+	}
+}
+
+func (h *runHandle) Status() agent.RunStatus {
+	if h == nil {
+		return agent.RunStatus{}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.result
 }
 
 // Close unblocks the event pump and drops events still buffered.

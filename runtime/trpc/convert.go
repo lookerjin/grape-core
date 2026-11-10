@@ -2,7 +2,6 @@ package trpcruntime
 
 import (
 	"encoding/json"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -20,8 +19,7 @@ type converter struct {
 	sessionID   string
 	seenTool    map[string]struct{}
 	openTool    map[string]string
-	emptyByName map[string][]string
-	emptySeq    int
+	closeStatus string
 	panicMsg    string
 	maxField    int
 	secrets     []string
@@ -47,7 +45,7 @@ func (c *converter) convert(evt *event.Event) []agent.Event {
 		return nil
 	}
 	if evt.IsRunnerCompletion() {
-		out := c.closeOpenTools(evt, "")
+		out := c.closeOpenTools(evt, c.closeStatus)
 		out = append(out, c.terminal(evt))
 		return out
 	}
@@ -139,14 +137,13 @@ func (c *converter) toolStarts(evt *event.Event) []agent.Event {
 	}
 	var out []agent.Event
 	for _, call := range calls {
-		id := c.stableID(call.Function.Name, call.ID)
-		if id == "" {
-			continue
+		id := call.ID
+		if id != "" {
+			if _, ok := c.seenTool[id]; ok {
+				continue
+			}
+			c.seenTool[id] = struct{}{}
 		}
-		if _, ok := c.seenTool[id]; ok {
-			continue
-		}
-		c.seenTool[id] = struct{}{}
 		if c.openTool == nil {
 			c.openTool = map[string]string{}
 		}
@@ -161,37 +158,6 @@ func (c *converter) toolStarts(evt *event.Event) []agent.Event {
 		out = append(out, ev)
 	}
 	return out
-}
-
-// stableID keeps a non-empty upstream id and assigns a grape id when the
-// model left the call id empty. Ends with an empty id are paired in order.
-func (c *converter) stableID(name, upstream string) string {
-	if upstream != "" {
-		return upstream
-	}
-	c.emptySeq++
-	id := fmt.Sprintf("grape-%d", c.emptySeq)
-	if c.emptyByName == nil {
-		c.emptyByName = map[string][]string{}
-	}
-	c.emptyByName[name] = append(c.emptyByName[name], id)
-	return id
-}
-
-func (c *converter) matchEmpty(name string) string {
-	if ids := c.emptyByName[name]; len(ids) > 0 {
-		c.emptyByName[name] = ids[1:]
-		return ids[0]
-	}
-	for toolName, ids := range c.emptyByName {
-		if len(ids) == 0 {
-			continue
-		}
-		c.emptyByName[toolName] = ids[1:]
-		return ids[0]
-	}
-	c.emptySeq++
-	return fmt.Sprintf("grape-%d", c.emptySeq)
 }
 
 func (c *converter) toolEnds(evt *event.Event) []agent.Event {
@@ -212,9 +178,6 @@ func (c *converter) toolEnds(evt *event.Event) []agent.Event {
 		}
 		if content == "" {
 			content = choice.Delta.Content
-		}
-		if id == "" {
-			id = c.matchEmpty(name)
 		}
 		key := id
 		if key != "" {

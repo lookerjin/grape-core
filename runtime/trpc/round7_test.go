@@ -488,10 +488,34 @@ func assertToolPairs(t *testing.T, events []agent.Event, ids []string) {
 		}
 	}
 	for _, id := range ids {
-		if starts[id] != 1 || ends[id] != 1 {
-			t.Fatalf("id %s start=%d end=%d %s", id, starts[id], ends[id], eventBlob(events))
+		start, end := pairCount(starts, id), pairCount(ends, id)
+		if start != 1 || end != 1 {
+			t.Fatalf("id %s start=%d end=%d %s", id, start, end, eventBlob(events))
 		}
 	}
+}
+
+func pairCount(counts map[string]int, id string) int {
+	if n := counts[id]; n != 0 {
+		return n
+	}
+	total := 0
+	for key, n := range counts {
+		if rawToolCallID(key) == id {
+			total += n
+		}
+	}
+	return total
+}
+
+// rawToolCallID returns the raw id inside a toolcallid canonical id.
+// The plugin format is prefix:invocation:response:raw:cN:tN.
+func rawToolCallID(id string) string {
+	parts := strings.Split(id, ":")
+	if len(parts) < 6 || !strings.HasPrefix(id, "trpc-agent-go-toolcall:") {
+		return ""
+	}
+	return parts[len(parts)-3]
 }
 
 func waitGoroutines(t *testing.T, limit int, d time.Duration) {

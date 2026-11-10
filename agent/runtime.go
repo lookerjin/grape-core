@@ -34,19 +34,17 @@ type RunRequest struct {
 
 // RunHandle is the handle for an in-flight run.
 //
-// Events is closed after exactly one terminal event. Cancel aborts the run.
-// Close drops any events still buffered and releases the pump. Call it when
-// the consumer will not read Events. After a run finishes,
-// context.event_hold_timeout (default 30s) bounds the wait for the first
-// take, and context.event_idle_timeout (default 5m) bounds the gap after
-// the last take. Either deadline discards non-terminal events, leaves the
-// terminal event, and exits. Cancelling the Start context does the same.
-// Runtime.Close releases every pump immediately. The context
-// passed to Runtime.Start bounds the run; Cancel is an additional explicit
-// abort. Implementations must not detach the run onto context.Background.
+// A consumer that reads Events until it closes sees exactly one terminal
+// event. Close, or the hold and idle deadlines, may close Events without
+// that event. Status then reports cancelled with cause delivery. Cancel
+// aborts the run. The context passed to Runtime.Start bounds the run.
+// Implementations must not detach the run onto context.Background.
 type RunHandle interface {
 	ID() string
 	Events() <-chan Event
+	// Status reports the run result. It is cancelled with CauseDelivery when
+	// the stream closed before a terminal event was delivered.
+	Status() RunStatus
 	Cancel() error
 	// Close releases the event pump. It is safe to call more than once.
 	Close() error

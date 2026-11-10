@@ -109,9 +109,9 @@ func (b *eventBox) abandon() {
 // pump sends queued events until the box is drained, stop is closed, or
 // the caller context ends. hold is how long a finished run waits for a
 // consumer who has not taken an event. idle is how long it waits after
-// the last take. Either expiry keeps the terminal event and exits.
-// Cancel drops the non-terminal backlog the same way.
-func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx context.Context, hold, idle time.Duration) {
+// the last take. Either expiry closes the stream. It reports whether a
+// terminal event was delivered. It does not invent one.
+func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx context.Context, hold, idle time.Duration) (sentTerminal bool) {
 	defer close(out)
 	if hold <= 0 {
 		hold = 30 * time.Second
@@ -140,11 +140,8 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx contex
 	pulse := time.NewTicker(10 * time.Millisecond)
 	defer pulse.Stop()
 	finish := func(held *agent.Event) {
-		if !b.deliverFinal(out, held) {
-			select {
-			case out <- cancelledTerminal(ctx):
-			default:
-			}
+		if b.deliverFinal(out, held) {
+			sentTerminal = true
 		}
 	}
 	for {
@@ -189,6 +186,9 @@ func (b *eventBox) pump(out chan<- agent.Event, stop <-chan struct{}, ctx contex
 		select {
 		case out <- evt:
 			sent = true
+			if evt.Terminal() {
+				sentTerminal = true
+			}
 		case <-stop:
 			return
 		}
@@ -200,21 +200,6 @@ func ctxDone(ctx context.Context) <-chan struct{} {
 		return nil
 	}
 	return ctx.Done()
-}
-
-func cancelledTerminal(ctx context.Context) agent.Event {
-	msg := "context canceled"
-	if ctx != nil && ctx.Err() != nil {
-		msg = ctx.Err().Error()
-	}
-	return agent.Event{
-		Kind: agent.EventCancelled,
-		Time: time.Now().UTC(),
-		Payload: agent.MustPayload(agent.TerminalPayload{
-			Status: string(agent.EventCancelled),
-			Error:  msg,
-		}),
-	}
 }
 
 func (b *eventBox) isClosed() bool {

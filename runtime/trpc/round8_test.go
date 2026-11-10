@@ -169,7 +169,7 @@ func TestCancelClosesOpenTool(t *testing.T) {
 			continue
 		}
 		_ = json.Unmarshal(evt.Payload, &end)
-		if end.CallID == "block-1" {
+		if end.CallID == "block-1" || strings.Contains(end.CallID, ":block-1:") {
 			break
 		}
 	}
@@ -274,7 +274,7 @@ func TestPanicIsReportedOnToolEnd(t *testing.T) {
 			continue
 		}
 		_ = json.Unmarshal(evt.Payload, &end)
-		if end.CallID == "boom-1" {
+		if end.CallID == "boom-1" || strings.Contains(end.CallID, ":boom-1:") {
 			found = true
 			break
 		}

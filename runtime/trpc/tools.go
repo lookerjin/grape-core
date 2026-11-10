@@ -384,6 +384,27 @@ func (t kindedTool) Call(ctx context.Context, args []byte) (any, error) {
 	return t.inner.Call(ctx, args)
 }
 
+func (t kindedTool) LongRunning() bool { return longRunning(t.inner) }
+
+func labeledKind(item tool.Tool) (string, bool) {
+	switch t := item.(type) {
+	case kindedTool:
+		return t.kind, true
+	case streamKinded:
+		return t.kind, true
+	default:
+		return "", false
+	}
+}
+
+type streamKinded struct{ kindedTool }
+
+func (t streamKinded) StreamableCall(ctx context.Context, args []byte) (*tool.StreamReader, error) {
+	return t.inner.(tool.StreamableTool).StreamableCall(ctx, args)
+}
+
+func (t streamKinded) StreamInner() bool { return streamInner(t.inner) }
+
 func kindTool(item tool.Tool, kind string) tool.Tool {
 	callable, ok := item.(tool.CallableTool)
 	if !ok {
@@ -401,7 +422,11 @@ func kindTool(item tool.Tool, kind string) tool.Tool {
 	if kind == "side_effect" && isGrapeRead(item) {
 		return item
 	}
-	return kindedTool{inner: callable, kind: kind}
+	base := kindedTool{inner: callable, kind: kind}
+	if _, ok := item.(tool.StreamableTool); ok {
+		return streamKinded{kindedTool: base}
+	}
+	return base
 }
 
 // trustedTool is applied once at New. The policy allows it by type.
@@ -425,6 +450,18 @@ func (t trustedTool) Call(ctx context.Context, args []byte) (any, error) {
 	return callable.Call(ctx, args)
 }
 
+func (t trustedTool) grapeTrusted() {}
+
+func (t trustedTool) LongRunning() bool { return longRunning(t.inner) }
+
+type streamTrusted struct{ trustedTool }
+
+func (t streamTrusted) StreamableCall(ctx context.Context, args []byte) (*tool.StreamReader, error) {
+	return t.inner.(tool.StreamableTool).StreamableCall(ctx, args)
+}
+
+func (t streamTrusted) StreamInner() bool { return streamInner(t.inner) }
+
 func wrapTrusted(item tool.Tool) tool.Tool {
 	if item == nil {
 		return nil
@@ -432,7 +469,14 @@ func wrapTrusted(item tool.Tool) tool.Tool {
 	if _, ok := item.(trustedTool); ok {
 		return item
 	}
-	return trustedTool{inner: item}
+	if _, ok := item.(streamTrusted); ok {
+		return item
+	}
+	base := trustedTool{inner: item}
+	if _, ok := item.(tool.StreamableTool); ok {
+		return streamTrusted{trustedTool: base}
+	}
+	return base
 }
 
 type trackingTool struct{ inner tool.CallableTool }
@@ -448,12 +492,55 @@ func (t trackingTool) Call(ctx context.Context, args []byte) (any, error) {
 	return t.inner.Call(ctx, args)
 }
 
+func (t trackingTool) LongRunning() bool { return longRunning(t.inner) }
+
+type streamTracking struct {
+	trackingTool
+	stream tool.StreamableTool
+}
+
+func (t streamTracking) StreamableCall(ctx context.Context, args []byte) (*tool.StreamReader, error) {
+	st := stateFrom(ctx)
+	if st != nil {
+		st.enterTool()
+		defer st.leaveTool()
+	}
+	return t.stream.StreamableCall(ctx, args)
+}
+
+func (t streamTracking) StreamInner() bool { return streamInner(t.stream) }
+
+func longRunning(item tool.Tool) bool {
+	type longRunner interface{ LongRunning() bool }
+	if item == nil {
+		return false
+	}
+	runner, ok := item.(longRunner)
+	return ok && runner.LongRunning()
+}
+
+func streamInner(item tool.Tool) bool {
+	type preference interface{ StreamInner() bool }
+	if item == nil {
+		return false
+	}
+	pref, ok := item.(preference)
+	if !ok {
+		return true
+	}
+	return pref.StreamInner()
+}
+
 func trackTool(item tool.Tool) tool.Tool {
 	callable, ok := item.(tool.CallableTool)
 	if !ok {
 		return item
 	}
-	return trackingTool{inner: callable}
+	base := trackingTool{inner: callable}
+	if stream, ok := item.(tool.StreamableTool); ok {
+		return streamTracking{trackingTool: base, stream: stream}
+	}
+	return base
 }
 
 func trackTools(tools []tool.Tool) []tool.Tool {

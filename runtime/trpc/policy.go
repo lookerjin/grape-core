@@ -22,7 +22,7 @@ func (rt *Runtime) toolPermission(ctx context.Context, req *tool.PermissionReque
 		return tool.DenyPermission("missing permission request"), nil
 	}
 	item := unwrapTracking(frameworkNamed(req.Tool))
-	if _, ok := item.(trustedTool); ok {
+	if _, ok := item.(interface{ grapeTrusted() }); ok {
 		return tool.AllowPermission(), nil
 	}
 	name := req.ToolName
@@ -97,12 +97,11 @@ func (rt *Runtime) toolKind(ctx context.Context, item tool.Tool, name string) st
 	if rt.allowNestedRead(agentName, name) {
 		return "read"
 	}
-	switch t := item.(type) {
-	case kindedTool:
-		if t.kind == "" {
+	if kind, ok := labeledKind(item); ok {
+		if kind == "" {
 			return "side_effect"
 		}
-		return t.kind
+		return kind
 	}
 	if isGrapeRead(item) {
 		return "read"
@@ -121,11 +120,20 @@ func (rt *Runtime) toolKind(ctx context.Context, item tool.Tool, name string) st
 // Kind tags stay visible so the policy can read them.
 func unwrapTracking(item tool.Tool) tool.Tool {
 	for i := 0; item != nil && i < 8; i++ {
-		inner, ok := item.(trackingTool)
-		if !ok || inner.inner == nil {
+		switch current := item.(type) {
+		case streamTracking:
+			if current.inner == nil {
+				return item
+			}
+			item = current.inner
+		case trackingTool:
+			if current.inner == nil {
+				return item
+			}
+			item = current.inner
+		default:
 			return item
 		}
-		item = inner.inner
 	}
 	return item
 }

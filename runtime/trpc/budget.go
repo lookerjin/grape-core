@@ -192,6 +192,11 @@ func (rt *Runtime) observeLimit(st *runState, evt *event.Event) {
 	if rt == nil || st == nil || evt == nil || evt.Response == nil || evt.Error == nil {
 		return
 	}
+	// A tool or model error that does not end the run is recoverable.
+	// Only an explicit error object can decide the result.
+	if evt.Object != model.ObjectTypeError {
+		return
+	}
 	root := st.rootInvocation()
 	if root == "" || evt.InvocationID != root {
 		return
@@ -213,9 +218,9 @@ func (rt *Runtime) observeLimit(st *runState, evt *event.Event) {
 			return
 		}
 		if evt.Done {
-			// The error event already carries the redacted message.
-			// The terminal records the failure without copying that text.
-			st.setStop("", "", evt.Author)
+			// The completion event does not carry this error. The reason is
+			// generic; the message text is not the classifier.
+			st.setStop(agent.ReasonError, "", evt.Author)
 		}
 	}
 }

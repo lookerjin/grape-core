@@ -308,7 +308,8 @@ func stopEvent(invocation, author, message string) *event.Event {
 		InvocationID: invocation,
 		Author:       author,
 		Response: &model.Response{
-			Done: true,
+			Object: model.ObjectTypeError,
+			Done:   true,
 			Error: &model.ResponseError{
 				Type:    trpcagent.ErrorTypeStopAgentError,
 				Message: message,
