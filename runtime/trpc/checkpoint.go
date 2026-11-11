@@ -119,13 +119,14 @@ func (rt *Runtime) ForkSession(ctx context.Context, user, id, run string) (strin
 		return "", err
 	}
 	state.ID = dest
-	state.CreatedAt = now
+	// Native event windows filter on the session creation epoch. Preserve
+	// that epoch together with the original event timestamps and IDs.
 	state.UpdatedAt = now
 	raw, err := json.Marshal(state)
 	if err != nil {
 		return "", err
 	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO session_states(app_name,user_id,session_id,state,created_at,updated_at) VALUES(?,?,?,?,?,?)`, rt.appName, user, dest, raw, now.UnixNano(), now.UnixNano())
+	res, err := tx.ExecContext(ctx, `INSERT INTO session_states(app_name,user_id,session_id,state,created_at,updated_at) VALUES(?,?,?,?,?,?)`, rt.appName, user, dest, raw, state.CreatedAt.UnixNano(), now.UnixNano())
 	if err != nil {
 		return "", err
 	}

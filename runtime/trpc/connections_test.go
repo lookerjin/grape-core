@@ -69,7 +69,7 @@ func TestConnectionsAndScopedAttachments(t *testing.T) {
 	cfg.Model.Generation.Stream = &stream
 	cfg.Journal.Enabled = false
 	open := func() *grape.Runtime {
-		rt, e := grape.New(grape.Options{AppName: "p", Config: &cfg, ModelRegistry: reg, DataDir: dir})
+		rt, e := grape.New(grape.Options{AppName: "p", TurnCheckpoints: true, Config: &cfg, ModelRegistry: reg, DataDir: dir})
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -121,19 +121,47 @@ func TestConnectionsAndScopedAttachments(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	var fileRef agent.AttachmentRef
 	found := false
 	for _, m := range history {
 		for _, a := range m.Attachments {
-			found = found || a.FileID == "file-123" && a.ConnectionID == ar.ConnectionID
+			if a.FileID == "file-123" && a.ConnectionID == ar.ConnectionID {
+				fileRef = a.Ref
+				found = true
+			}
 		}
 	}
 	if !found {
 		t.Fatal("attachment ownership lost after restart")
 	}
+	marks, err := rt.Checkpoints(ctx, "u", "s")
+	if err != nil || len(marks) != 3 {
+		t.Fatal(marks, err)
+	}
+	child, err := rt.ForkSession(ctx, "u", "s", marks[2].RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := rt.ReadAttachment(ctx, "u", child, fileRef)
+	if err != nil || file.ConnectionID != ar.ConnectionID || file.FileID != "file-123" {
+		t.Fatal(file, err)
+	}
+	q.SessionID = child
+	turn(br, false)
+	q.SessionID = "s"
 	turn(br, false)
 	turn(ar, true)
 	if aCalls.Load() != 3 || bCalls.Load() != 1 {
 		t.Fatalf("wire calls %d %d", aCalls.Load(), bCalls.Load())
+	}
+	if e := rt.RewindSession(ctx, "u", "s", marks[1].RunID); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := rt.ReadAttachment(ctx, "u", "s", fileRef); e == nil {
+		t.Fatal("discarded attachment remained on the source")
+	}
+	if _, e := rt.ReadAttachment(ctx, "u", child, fileRef); e != nil {
+		t.Fatal("attachment was lost on the fork", e)
 	}
 	q.SessionID = "failure"
 	q.Message = "reject-this-request"
