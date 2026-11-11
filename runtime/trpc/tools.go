@@ -18,6 +18,7 @@ import (
 )
 
 type runState struct {
+	user                      string
 	httpClass                 atomic.Pointer[string]
 	attachmentMismatch        atomic.Bool
 	connectionID              string
@@ -77,13 +78,14 @@ func (st *runState) add(evt agent.Event) {
 	st.mu.Unlock()
 }
 
-func (st *runState) enterTool() {
-	if st == nil {
-		return
-	}
+func (st *runState) enterTool() bool {
 	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.stopping {
+		return false
+	}
 	st.tools++
-	st.mu.Unlock()
+	return true
 }
 
 func (st *runState) toolBusy() bool {
@@ -122,19 +124,6 @@ func (st *runState) waitTools() {
 	for st.tools > 0 {
 		st.cond.Wait()
 	}
-}
-
-// captureBusy marks the run as finishing and reports whether a tool is
-// still inside Call. The flag and the counter move together, so a tool
-// that enters before this returns is included.
-func (st *runState) captureBusy() bool {
-	if st == nil {
-		return false
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.stopping = true
-	return st.tools > 0
 }
 
 func (st *runState) noteRoot(id string) {
@@ -344,7 +333,7 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 				return nil, err
 			}
 			defer closeDir()
-			if err := dir.Save(in.FileName, in.Contents, in.Overwrite); err != nil {
+			if err := rt.saveTracked(ctx, dir, in); err != nil {
 				return nil, err
 			}
 			return map[string]any{"file_name": in.FileName, "message": "saved"}, nil
@@ -355,7 +344,7 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 				return nil, err
 			}
 			defer closeDir()
-			if err := dir.Replace(in.FileName, in.OldString, in.NewString, in.NumReplacements); err != nil {
+			if err := rt.replaceTracked(ctx, dir, in); err != nil {
 				return nil, err
 			}
 			return map[string]any{"file_name": in.FileName, "message": "replaced"}, nil
@@ -478,7 +467,9 @@ func (t trackingTool) Declaration() *tool.Declaration { return t.inner.Declarati
 func (t trackingTool) Call(ctx context.Context, args []byte) (any, error) {
 	st := stateFrom(ctx)
 	if st != nil {
-		st.enterTool()
+		if !st.enterTool() {
+			return nil, context.Canceled
+		}
 		defer st.leaveTool()
 	}
 	callable, ok := t.inner.(tool.CallableTool)
@@ -502,7 +493,9 @@ const streamForwardBuffer = 8
 func (t streamTracking) StreamableCall(ctx context.Context, args []byte) (*tool.StreamReader, error) {
 	st := stateFrom(ctx)
 	if st != nil {
-		st.enterTool()
+		if !st.enterTool() {
+			return nil, context.Canceled
+		}
 	}
 	inner, err := t.stream.StreamableCall(ctx, args)
 	if err != nil || inner == nil {

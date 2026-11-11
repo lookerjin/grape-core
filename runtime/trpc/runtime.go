@@ -68,6 +68,8 @@ type SubagentSpec struct {
 // Options configures a Runtime. Model, when set, replaces the configured
 // provider. Tests and the offline example inject a mock model here.
 type Options struct {
+	// TurnCheckpoints records completed conversation boundaries for fork, rewind and side questions.
+	TurnCheckpoints         bool
 	ModelRegistry           *infra.Registry
 	ArtifactService         artifact.Service
 	Config                  *config.Config
@@ -121,45 +123,52 @@ type Options struct {
 // It owns the SQLite session service it opens. Close releases that database
 // and the runner. A caller-supplied model is not closed.
 type Runtime struct {
-	registry      *infra.Registry
-	extraRoots    map[string]*coding.Directory
-	builtinGrants map[string][]string
-	namedModels   map[string]bool
-	profileUnsafe bool
-	artifacts     artifact.Service
-	cfg           config.Config
-	appName       string
-	runner        runner.Runner
-	sessions      *sqlitesession.Service
-	injectedModel bool
-	model         *countingModel
-	exec          *commandExecutor
-	tools         []tool.Tool
-	specs         []ToolSpec
-	skillRoots    []string
-	ruleText      string
-	ruleSources   []rules.Source
-	globalRules   string
-	hookRunner    *hooks.Runner
-	pluginHooks   []hooks.Spec
-	mcpServers    []mcp.Server
-	resolved      plugin.Resolved
-	definitions   []plugin.Definition
-	pluginTools   map[string][]tool.Tool
-	fixed         trpcagent.Agent
-	subagents     []SubagentSpec
-	trustedTools  []tool.Tool
-	evolution     evolution.Service
-	mcpSets       []tool.ToolSet
-	mcpStatus     []mcp.Status
-	decider       agent.Decider
-	grantedHooks  []hooks.Spec
-	reject        bool
-	journal       *journal.Writer
-	secrets       []string
-	maxField      int
-	instruction   string
-	nested        map[string]map[string]struct{}
+	mcpOp          sync.Mutex
+	mcpMu          sync.RWMutex
+	secretMu       sync.RWMutex
+	mcpVersion     uint64
+	lifetime       context.Context
+	cancelLifetime context.CancelFunc
+	turnDB         *sql.DB
+	registry       *infra.Registry
+	extraRoots     map[string]*coding.Directory
+	builtinGrants  map[string][]string
+	namedModels    map[string]bool
+	profileUnsafe  bool
+	artifacts      artifact.Service
+	cfg            config.Config
+	appName        string
+	runner         runner.Runner
+	sessions       *sqlitesession.Service
+	injectedModel  bool
+	model          *countingModel
+	exec           *commandExecutor
+	tools          []tool.Tool
+	specs          []ToolSpec
+	skillRoots     []string
+	ruleText       string
+	ruleSources    []rules.Source
+	globalRules    string
+	hookRunner     *hooks.Runner
+	pluginHooks    []hooks.Spec
+	mcpServers     []mcp.Server
+	resolved       plugin.Resolved
+	definitions    []plugin.Definition
+	pluginTools    map[string][]tool.Tool
+	fixed          trpcagent.Agent
+	subagents      []SubagentSpec
+	trustedTools   []tool.Tool
+	evolution      evolution.Service
+	mcpSets        []tool.ToolSet
+	mcpStatus      []mcp.Status
+	decider        agent.Decider
+	grantedHooks   []hooks.Spec
+	reject         bool
+	journal        *journal.Writer
+	secrets        []string
+	maxField       int
+	instruction    string
+	nested         map[string]map[string]struct{}
 
 	mu    sync.Mutex
 	locks map[sessionKey]*countedLock
@@ -209,6 +218,20 @@ func New(opts Options) (*Runtime, error) {
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Session.Path), 0o755); err != nil {
 		return nil, agent.Wrap(agent.ErrSession, "mkdir", err)
+	}
+	if opts.TurnCheckpoints {
+		f, e := os.OpenFile(cfg.Session.Path, os.O_CREATE|os.O_RDWR, 0600)
+		if e != nil {
+			return nil, e
+		}
+		e = f.Chmod(0600)
+		ce := f.Close()
+		if e != nil {
+			return nil, e
+		}
+		if ce != nil {
+			return nil, ce
+		}
 	}
 	db, err := sql.Open("sqlite3", cfg.Session.Path+"?_busy_timeout=5000&_foreign_keys=on")
 	if err != nil {
@@ -265,6 +288,14 @@ func New(opts Options) (*Runtime, error) {
 		fixed:         opts.FixedAgent,
 		subagents:     cloneSpecs(opts.Subagents),
 		nested:        nestedReadIndex(opts.NestedReads),
+	}
+	rt.lifetime, rt.cancelLifetime = context.WithCancel(context.Background())
+	if opts.TurnCheckpoints {
+		if _, err := db.Exec(initTurns + ";" + initRecovery); err != nil {
+			sessions.Close()
+			return nil, err
+		}
+		rt.turnDB = db
 	}
 	rt.profileUnsafe = opts.FixedAgent != nil || len(opts.TrustedAgents) > 0 || opaqueTools(opts.Subagents, opts.ToolSpecs) || !cfg.KnowledgeOnly()
 	if err := rt.prepareModels(opts.Model != nil); err != nil {
@@ -403,8 +434,8 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	if err != nil {
 		return nil, err
 	}
-	if len(rt.mcpSets) > 0 {
-		opts = append(opts, llmagent.WithToolSets(rt.mcpSets))
+	if sets, _ := ro.RuntimeState["grape_mcp_sets"].([]tool.ToolSet); len(sets) > 0 {
+		opts = append(opts, llmagent.WithToolSets(sets))
 	}
 	if mode == string(agent.ModeGoal) {
 		retries := rt.cfg.Goal.MaxIterations
@@ -769,10 +800,11 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	runID := uuid.NewString()
 	runCtx, cancel := context.WithCancel(ctx)
 	st := newRunState(runID, req.SessionID, req.Mode)
+	st.user = req.UserID
 	st.connectionID = owner
-	st.secrets = rt.secrets
+	st.secrets = rt.secretSnapshot()
 	if key != "" {
-		st.secrets = append(append([]string(nil), rt.secrets...), key)
+		st.secrets = append(append([]string(nil), st.secrets...), key)
 	}
 	st.permission = req.Permission
 	st.requireApproval = req.RequireApproval
@@ -796,8 +828,9 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		trpcagent.WithRequestID(runID),
 		trpcagent.WithToolPermissionPolicyFunc(rt.toolPermission),
 		trpcagent.WithRuntimeState(map[string]any{
-			"workspace":  workspace,
-			"permission": req.Permission,
+			"grape_mcp_sets": rt.snapshotMCP(),
+			"workspace":      workspace,
+			"permission":     req.Permission,
 
 			"mode": string(req.Mode),
 		}),
@@ -903,6 +936,12 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 			evt.Kind = agent.EventFailed
 			evt.Payload = agent.MustPayload(agent.TerminalPayload{Status: string(evt.Kind), Reason: agent.ReasonError, Error: "missing, schema-invalid or redacted structured output"})
 		}
+		if evt.Kind == agent.EventCompleted && rt.turnDB != nil {
+			if e := rt.commitTurn(ctx, req.UserID, req.SessionID, runID); e != nil {
+				evt.Kind = agent.EventFailed
+				evt.Payload = agent.MustPayload(agent.TerminalPayload{Status: string(evt.Kind), Reason: agent.ReasonError, Error: "cannot persist completed turn checkpoint"})
+			}
+		}
 		if evt.Terminal() {
 			if req.ModelRef != nil && rt.registry != nil {
 				class := ""
@@ -925,10 +964,10 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 					_ = rt.registry.RecordResult(ctx, modelaccess.Native{}, *req.ModelRef, evt.Kind == agent.EventCompleted)
 				}
 			}
+			rt.finishSession(req.UserID, req.SessionID, runID, st, unlock)
 			if h != nil {
 				h.noteResult(evt, ctx.Err() == context.Canceled)
 			}
-			rt.finishSession(req.UserID, req.SessionID, runID, st, unlock)
 		}
 		if rt.journal != nil {
 			_ = rt.journal.Append(evt)
@@ -1179,14 +1218,14 @@ func (rt *Runtime) ForceReleaseSession(sessionID string, rel agent.SessionReleas
 	}
 	rt.mu.Unlock()
 	busy := st != nil && st.toolBusy()
-	if runID == "" {
-		return fmt.Errorf("session %s is not held", sessionID)
+	if runID == "" || (rel.RunID != "" && rel.RunID != runID) {
+		return agent.Wrap(agent.ErrSession, "force_release", fmt.Errorf("session %s has no matching drain", sessionID))
 	}
 	if busy && !rel.AcceptConcurrentTools {
 		return agent.Wrap(agent.ErrSession, "session", fmt.Errorf("session %s has a tool still running; ForceRelease is not safe recovery", sessionID))
 	}
 	if !rt.releaseHold(key, runID) {
-		return fmt.Errorf("session %s is not held", sessionID)
+		return agent.Wrap(agent.ErrSession, "force_release", fmt.Errorf("session %s has no matching drain", sessionID))
 	}
 	return nil
 }
@@ -1323,8 +1362,13 @@ func (rt *Runtime) MCPStatus() []mcp.Status {
 	if rt == nil {
 		return nil
 	}
+	rt.mcpMu.RLock()
+	defer rt.mcpMu.RUnlock()
 	out := make([]mcp.Status, len(rt.mcpStatus))
 	copy(out, rt.mcpStatus)
+	for i := range out {
+		out[i].Tools = slices.Clone(out[i].Tools)
+	}
 	return out
 }
 
@@ -1336,6 +1380,9 @@ func (rt *Runtime) Close() error {
 	rt.closeOnce.Do(func() {
 		rt.mu.Lock()
 		rt.closed = true
+		if rt.cancelLifetime != nil {
+			rt.cancelLifetime()
+		}
 		host := rt.taskHost
 		rt.mu.Unlock()
 		rt.starting.Wait()

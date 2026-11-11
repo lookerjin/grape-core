@@ -10,6 +10,7 @@ import (
 	goruntime "runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -407,12 +408,16 @@ func TestStaleDrainDoesNotReleaseNextRun(t *testing.T) {
 	cfg.Context.ToolDrainTimeout = "5s"
 	release1 := make(chan struct{})
 	release2 := make(chan struct{})
-	defer close(release2)
+	releaseFirst := sync.OnceFunc(func() { close(release1) })
+	releaseSecond := sync.OnceFunc(func() { close(release2) })
+	entered := make(chan struct{}, 2)
+	left := make(chan struct{}, 2)
 	var phase atomic.Int32
 	var running atomic.Int32
 	blocker := function.NewFunctionTool(func(ctx context.Context, in echoIn) (echoOut, error) {
 		running.Add(1)
-		defer running.Add(-1)
+		defer func() { running.Add(-1); left <- struct{}{} }()
+		entered <- struct{}{}
 		if phase.Load() == 0 {
 			<-release1
 		} else {
@@ -443,6 +448,8 @@ func TestStaleDrainDoesNotReleaseNextRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rt.Close()
+	defer releaseFirst()
+	defer releaseSecond()
 	start := func(msg string) agent.RunHandle {
 		t.Helper()
 		h, err := rt.Start(context.Background(), agent.RunRequest{UserID: "u", SessionID: "same", Message: msg})
@@ -451,34 +458,48 @@ func TestStaleDrainDoesNotReleaseNextRun(t *testing.T) {
 		}
 		return h
 	}
-	waitRunning := func(n int32) {
+	wait := func(ch <-chan struct{}) {
 		t.Helper()
-		deadline := time.Now().Add(2 * time.Second)
-		for running.Load() < n && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
-		if running.Load() < n {
-			t.Fatalf("running %d want %d", running.Load(), n)
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("blocked tool did not reach expected boundary")
 		}
 	}
 	h1 := start("one")
-	waitRunning(1)
+	wait(entered)
+	if e := rt.ForceReleaseSession("same", agent.SessionRelease{UserID: "u", RunID: h1.ID(), AcceptConcurrentTools: true}); !errors.Is(e, agent.ErrSession) {
+		t.Fatalf("released active run: %v", e)
+	}
 	if err := h1.Cancel(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(20 * time.Millisecond)
-	if err := rt.ForceReleaseSession("same", agent.SessionRelease{UserID: "u", AcceptConcurrentTools: true}); err != nil {
+	if err := h1.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	collect(t, h1)
+	if err := rt.ForceReleaseSession("same", agent.SessionRelease{UserID: "u", RunID: h1.ID(), AcceptConcurrentTools: true}); err != nil {
 		t.Fatal(err)
 	}
 	phase.Store(1)
 	h2 := start("two")
-	waitRunning(2)
+	wait(entered)
 	if err := h2.Cancel(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(20 * time.Millisecond)
-	close(release1)
-	time.Sleep(300 * time.Millisecond)
+	collect(t, h2)
+	releaseFirst()
+	wait(left)
+	h1.(*runHandle).state.waitTools()
+	if rt.releaseHold(rt.sessionOf("u", "same"), h1.ID()) {
+		t.Fatal("old drain released the new run")
+	}
+	if h1.(*runHandle).state.enterTool() {
+		t.Fatal("finished run admitted a late tool")
+	}
+	if e := rt.ForceReleaseSession("same", agent.SessionRelease{UserID: "u", RunID: h1.ID(), AcceptConcurrentTools: true}); !errors.Is(e, agent.ErrSession) {
+		t.Fatalf("released newer run: %v", e)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	_, err = rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "same", Message: "four"})

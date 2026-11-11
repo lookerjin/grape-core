@@ -2,6 +2,8 @@ package trpcruntime
 
 import (
 	"context"
+	"errors"
+	"github.com/lookerjin/grape-core/mcp"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +94,36 @@ func TestMCPStdioToolCallAndDeniedServerNotStarted(t *testing.T) {
 		t.Fatalf("status missing isolation none: %+v", rt.MCPStatus())
 	}
 
+	ctx := context.Background()
+	old := rt.snapshotMCP()[0].Tools(ctx)[0].(*hostMCPTool)
+	if err := rt.RestartMCP(ctx, "echo"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Call(ctx, []byte("{}")); err == nil {
+		t.Fatal("retired tool executed")
+	}
+	if err := rt.RemoveMCP(ctx, "echo"); err != nil || len(rt.MCPStatus()) != 0 {
+		t.Fatal(err)
+	}
+	spec := mcp.Server{Name: "echo", Transport: "stdio", Command: bin, Enabled: true}
+	if err := rt.SetMCP(ctx, spec); !errors.Is(err, agent.ErrPermissionDenied) {
+		t.Fatal(err)
+	}
+	spec.Trust = "host"
+	if err := rt.SetMCP(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	status := rt.MCPStatus()
+	if len(status) != 1 || status[0].Version < 3 || len(status[0].Tools) == 0 {
+		t.Fatal(status)
+	}
+	h, err = rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "reloaded", Message: "call echo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(eventBlob(collect(t, h)), "echo:ping") {
+		t.Fatal("reloaded MCP tool failed")
+	}
 	marker := filepath.Join(t.TempDir(), "started")
 	enabled := false
 	disabled := config.Default()

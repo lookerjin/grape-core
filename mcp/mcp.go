@@ -36,10 +36,12 @@ type Server struct {
 
 // Status is a connection snapshot. It does not include header values.
 type Status struct {
-	Name      string `json:"name"`
-	Transport string `json:"transport"`
-	State     string `json:"state"`
-	Detail    string `json:"detail,omitempty"`
+	Version   uint64   `json:"version,omitempty"`
+	Tools     []string `json:"tools,omitempty"`
+	Name      string   `json:"name"`
+	Transport string   `json:"transport"`
+	State     string   `json:"state"`
+	Detail    string   `json:"detail,omitempty"`
 	// Isolation is "none" for a stdio server, which runs on the host.
 	Isolation string `json:"isolation,omitempty"`
 }

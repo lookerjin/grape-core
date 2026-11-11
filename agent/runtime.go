@@ -86,6 +86,8 @@ type SessionInfo struct {
 // be running. AcceptConcurrentTools is not safe recovery: the next run can
 // overlap a tool or child that has not finished.
 type SessionRelease struct {
+	// RunID, when supplied, must match the owner of the draining session.
+	RunID                 string
 	UserID                string
 	AcceptConcurrentTools bool
 }
@@ -145,4 +147,34 @@ type ModelInfo struct {
 type ModelRef struct {
 	ConnectionID string `json:"connection_id"`
 	ModelID      string `json:"model_id"`
+}
+
+// TurnCheckpoint identifies a completed conversation prefix. Forks carry their source.
+type TurnCheckpoint struct {
+	RunID         string `json:"run_id"`
+	ParentSession string `json:"parent_session,omitempty"`
+	ParentRun     string `json:"parent_run,omitempty"`
+}
+
+// SideAnswer is independent of the main Run and its accounting.
+type SideAnswer struct {
+	Checkpoint string
+	Text       string
+	Usage      *Usage
+}
+
+// FileRestorePlan is bound to the session, checkpoint, change history and observed file versions.
+type FileRestorePlan struct {
+	Digest string
+	Files  []FileRestoreItem
+}
+type FileRestoreItem struct{ Root, Path, Expected, Actual, Target, Conflict, Action string }
+
+// BackupInfo identifies a durably prepared backup and its last confirmed state.
+type BackupInfo struct{ Root, Path, Status string }
+
+// RecoveryRecord stores the independent result of a context or workspace recovery attempt.
+type RecoveryRecord struct {
+	ID, RunID, Kind, Status, Detail string
+	CreatedAt                       time.Time
 }

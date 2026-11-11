@@ -217,9 +217,12 @@ func (rt *Runtime) Plugins() plugin.Resolved { return rt.resolved }
 
 // MCPServers returns the redacted MCP servers captured for this runtime.
 func (rt *Runtime) MCPServers() []mcp.Server {
+	rt.mcpMu.RLock()
+	defer rt.mcpMu.RUnlock()
 	out := make([]mcp.Server, len(rt.mcpServers))
 	copy(out, rt.mcpServers)
 	for i := range out {
+		out[i].Args = slices.Clone(out[i].Args)
 		if len(out[i].Headers) == 0 {
 			continue
 		}

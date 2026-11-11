@@ -26,7 +26,8 @@ func (rt *Runtime) SessionHistory(ctx context.Context, userID, sessionID string,
 		return nil, agent.Wrap(agent.ErrSession, "history", fmt.Errorf("session not found"))
 	}
 	out := []agent.HistoryMessage{}
-	clean := func(s string) string { return redact.Text(s, rt.secrets) }
+	secrets := rt.secretSnapshot()
+	clean := func(s string) string { return redact.Text(s, secrets) }
 	for _, evt := range sess.GetEvents() {
 		if evt.Response == nil || evt.IsPartial || evt.IsRunnerCompletion() {
 			continue

@@ -110,6 +110,6 @@ Set `artifacts.enabled: true` to use tRPC's in-memory artifact service without i
 
 `workspace.extra_roots` grants the Runtime's built-in file tools access to additional directories. Use clean absolute paths in trusted configuration. File tools accept an optional `root` matching one of these grants and relative paths inside it. The Runtime holds the directory open until Close. These grants apply across sessions served by the Runtime. Git and command tools keep their existing workspace and sandbox settings.
 
-### Turn diff and rewind
+### Turn control, fork and recovery
 
-The SDK exposes current Git status/diff and persisted conversation history separately. It cannot attribute all filesystem changes to one turn in a shared workspace. The native SQLite session service also lacks a coordinated history truncation and workspace restore operation. A graph checkpoint does not capture shell, MCP or external editor writes. Per-turn workspace diff and atomic session/workspace rewind remain unsupported.
+See [turn controls and recovery](turns.md) for per-run reasoning, usage, session fork, side questions, confirmed file restoration and live MCP. Remote event replay is covered by the [coordination RFC](remote-run-rfc.md).

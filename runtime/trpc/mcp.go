@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lookerjin/grape-core/config"
@@ -77,12 +79,14 @@ func (rt *Runtime) openMCP(ctx context.Context) error {
 			}
 			continue
 		}
-		sets = append(sets, hostMCPSet{inner: set, rt: rt, kind: mcpKind(server)})
+		live, names := newLiveMCP(ctx, set, rt, mcpKind(server))
+		sets = append(sets, live)
 		rt.mcpStatus = append(rt.mcpStatus, mcp.Status{
 			Name: server.Name, Transport: transportOf(server), State: "connected",
-			Isolation: isolationOf(server),
+			Isolation: isolationOf(server), Tools: names, Version: 1,
 		})
 	}
+	rt.mcpVersion = 1
 	rt.mcpSets = sets
 	return nil
 }
@@ -164,7 +168,9 @@ func (rt *Runtime) dialMCP(ctx context.Context, server mcp.Server) (tool.ToolSet
 			secrets = append(secrets, value)
 		}
 	}
-	rt.secrets = append(rt.secrets, secrets...)
+	rt.secretMu.Lock()
+	rt.secrets = append(slices.Clone(rt.secrets), secrets...)
+	rt.secretMu.Unlock()
 	cfg := trpcmcp.ConnectionConfig{
 		Transport: transportOf(server),
 		Command:   server.Command,
@@ -226,29 +232,60 @@ func mcpKind(server mcp.Server) string {
 }
 
 type hostMCPSet struct {
-	inner tool.ToolSet
-	rt    *Runtime
-	kind  string
+	mu      sync.Mutex
+	retired bool
+	calls   int
+	tools   []tool.Tool
+	inner   tool.ToolSet
+	rt      *Runtime
+	kind    string
 }
 
-func (s hostMCPSet) Tools(ctx context.Context) []tool.Tool {
-	inner := s.inner.Tools(ctx)
+func newLiveMCP(ctx context.Context, set tool.ToolSet, rt *Runtime, kind string) (*hostMCPSet, []string) {
+	s := &hostMCPSet{inner: set, rt: rt, kind: kind}
+	var names []string
+	inner := set.Tools(ctx)
 	out := make([]tool.Tool, 0, len(inner))
 	for _, item := range inner {
 		if callable, ok := item.(tool.CallableTool); ok {
-			out = append(out, &hostMCPTool{inner: callable, rt: s.rt, kind: s.kind})
+			names = append(names, callable.Declaration().Name)
+			out = append(out, &hostMCPTool{inner: callable, rt: s.rt, kind: s.kind, set: s})
 			continue
 		}
-		out = append(out, item)
 	}
-	return out
+	s.tools = out
+	return s, names
 }
 
-func (s hostMCPSet) Close() error { return s.inner.Close() }
+func (s *hostMCPSet) Tools(context.Context) []tool.Tool { return slices.Clone(s.tools) }
+func (s *hostMCPSet) Close() error {
+	s.mu.Lock()
+	if s.retired {
+		s.mu.Unlock()
+		return nil
+	}
+	s.retired = true
+	idle := s.calls == 0
+	s.mu.Unlock()
+	if idle {
+		return s.inner.Close()
+	}
+	return nil
+}
+func (s *hostMCPSet) leave() {
+	s.mu.Lock()
+	s.calls--
+	closeNow := s.calls == 0 && s.retired
+	s.mu.Unlock()
+	if closeNow {
+		_ = s.inner.Close()
+	}
+}
 
-func (s hostMCPSet) Name() string { return s.inner.Name() }
+func (s *hostMCPSet) Name() string { return s.inner.Name() }
 
 type hostMCPTool struct {
+	set   *hostMCPSet
 	inner tool.CallableTool
 	rt    *Runtime
 	kind  string
@@ -257,8 +294,18 @@ type hostMCPTool struct {
 func (t hostMCPTool) Declaration() *tool.Declaration { return t.inner.Declaration() }
 
 func (t hostMCPTool) Call(ctx context.Context, args []byte) (any, error) {
+	t.set.mu.Lock()
+	if t.set.retired {
+		t.set.mu.Unlock()
+		return nil, fmt.Errorf("MCP server retired")
+	}
+	t.set.calls++
+	t.set.mu.Unlock()
+	defer t.set.leave()
 	if st := stateFrom(ctx); st != nil {
-		st.enterTool()
+		if !st.enterTool() {
+			return nil, context.Canceled
+		}
 		defer st.leaveTool()
 	}
 	res, err := t.inner.Call(ctx, args)
