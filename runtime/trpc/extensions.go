@@ -153,6 +153,26 @@ func (rt *Runtime) preparePluginAgent(d plugin.Definition, grants map[string][]T
 				selected = append(selected, spec)
 			}
 		}
+		if slices.Contains(rt.cfg.Plugins.AllowBuiltinTools[d.Plugin+"/"+d.Name], name) {
+			if len(selected) > 0 || rt.cfg.Workspace.DisableCodingTools {
+				return fmt.Errorf("%w: ambiguous or disabled builtin %q", agent.ErrPlugin, name)
+			}
+			found := false
+			for _, item := range rt.workspaceTools(rt.cfg.Workspace.Root, true) {
+				if item.Declaration().Name == name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: unknown builtin %q", agent.ErrPlugin, name)
+			}
+			if rt.builtinGrants == nil {
+				rt.builtinGrants = map[string][]string{}
+			}
+			rt.builtinGrants[d.Name] = append(rt.builtinGrants[d.Name], name)
+			continue
+		}
 		if len(selected) != 1 {
 			return fmt.Errorf("%w: agent %s requires a unique grant for %s", agent.ErrPlugin, d.Name, name)
 		}

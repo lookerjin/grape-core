@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 
@@ -30,7 +31,7 @@ func (rt *Runtime) toolPermission(ctx context.Context, req *tool.PermissionReque
 		name = item.Declaration().Name
 	}
 	if _, ok := item.(tool.CallableTool); !ok {
-		rt.recordDecision(ctx, "side_effect", name, "", false, "tool is not callable")
+		rt.recordDecision(ctx, "side_effect", name, "", false, "tool is not callable", "")
 		return tool.DenyPermission("tool is not callable"), nil
 	}
 	kind := rt.toolKind(ctx, item, name)
@@ -51,6 +52,7 @@ func approvalTarget(name string, args []byte) (detail, path string) {
 	var body struct {
 		Argv     []string `json:"argv"`
 		FileName string   `json:"file_name"`
+		Root     string   `json:"root"`
 		Skill    string   `json:"skill"`
 		Command  string   `json:"command"`
 	}
@@ -67,6 +69,9 @@ func approvalTarget(name string, args []byte) (detail, path string) {
 		return body.Command, ""
 	}
 	if body.FileName != "" {
+		if body.Root != "" {
+			return name, filepath.Join(body.Root, body.FileName)
+		}
 		return body.FileName, body.FileName
 	}
 	return detail, ""

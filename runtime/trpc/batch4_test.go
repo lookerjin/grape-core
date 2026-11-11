@@ -232,6 +232,10 @@ func TestTaskReloadAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	listed, err := again.List()
+	if err != nil || len(listed) != 2 || listed[0].ID != "done" || listed[1].Error != agent.TaskInterrupted {
+		t.Fatalf("reloaded task list: %+v %v", listed, err)
+	}
 	if done, ok = again.Get("done"); !ok || done.Status != "completed" {
 		t.Fatalf("second reload finished %#v ok=%v", done, ok)
 	}

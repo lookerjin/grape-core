@@ -93,3 +93,23 @@ handle, err := rt.Start(ctx, req)
 | Memory and Evolution | Implemented, opt-in | Markdown recall and tRPC Evolution with a human gate. The embedder can supply a reviewer. |
 | Sandbox | Platform dependent | Managed commands require a successful preflight including exit status. Windows managed execution and external Skill executors are unsupported. See [sandbox boundaries](sandbox.md). |
 | Product interfaces | Outside the SDK | TUI, Desktop, Web and service policies are independent consumers. |
+
+### Per-turn controls for product clients
+
+Configure the Runtime with the maximum workspace permission the product can grant. A caller can set `RunRequest.Permission` to narrow it for one turn. For example, run with `Permission: agent.PermissionReadOnly`, then use the same user and session with `Permission: agent.PermissionWorkspaceWrite, RequireApproval: true`. The latter sends each policy-checked mutation to the configured Decider. Empty fields inherit existing settings. A request cannot turn off mandatory approvals. Explicit profiles are rejected with caller-trusted agents or tools, provider-owned ToolSets, executable Skills, or shell hooks whose side effects the policy cannot govern. An explicit workspace-write profile requires a compatible executor. Built-in file writes and the command tool are omitted in an explicitly read-only run. Third-party tools classified as reads remain an operator trust decision.
+
+`TaskHost.List()` returns durable records for the host's data directory, newest creation first. The operator of a shared host must filter by the authenticated user before exposing records. A restart leaves previously running tasks with status `failed` and error `agent.TaskInterrupted`.
+
+Type-assert a handle to `agent.RunInspector` to query `Subagents()`, request `CancelSubagent(invocationID)`, or inspect `ContextStatus()`. Each Core-built child has its own native invocation ID, parent and tool-call IDs, model, lifecycle state, response-event count and last response object type. A child cancellation is cooperative. The parent can continue. Both the approval request and its decision event carry the initiating agent and invocation IDs and the same decision ID. Inspector snapshots live with the run handle. Opaque agents and remote MCP operations have no independently observable lifecycle here.
+
+`ContextStatus()` becomes available when the root model receives a request. It reports projected messages, callable tool count, message text bytes by role, and whether compaction was enabled. The model context window is zero when the adapter gives no value. Rules and Skills may share a system message. Token billing comes from the provider's usage events. v1.12.0 exposes compaction savings only in internal debug logs. There is no public exact token breakdown, compaction counter or persisted inspector snapshot.
+
+Set `model.alternatives` to model names served by the configured provider, endpoint and credentials. `rt.Models()` returns the default first and the alternatives sorted by name. Select one for a turn with `RunRequest.ModelName`. Native AgentTools inherit the selected model unless their spec pins its own. Capability flags describe the adapter's request format. For injected models `KnownAdapter` is false. Remote catalog discovery, reasoning levels and model-specific guarantees are outside this API.
+
+Set `artifacts.enabled: true` to use tRPC's in-memory artifact service without importing tRPC. Content expires with that service. An injected backend takes precedence.
+
+`workspace.extra_roots` grants the Runtime's built-in file tools access to additional directories. Use clean absolute paths in trusted configuration. File tools accept an optional `root` matching one of these grants and relative paths inside it. The Runtime holds the directory open until Close. These grants apply across sessions served by the Runtime. Git and command tools keep their existing workspace and sandbox settings.
+
+### Turn diff and rewind
+
+The SDK exposes current Git status/diff and persisted conversation history separately. It cannot attribute all filesystem changes to one turn in a shared workspace. The native SQLite session service also lacks a coordinated history truncation and workspace restore operation. A graph checkpoint does not capture shell, MCP or external editor writes. Per-turn workspace diff and atomic session/workspace rewind remain unsupported.

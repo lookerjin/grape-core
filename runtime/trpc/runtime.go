@@ -5,14 +5,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/lookerjin/grape-core/agent"
+	"github.com/lookerjin/grape-core/coding"
 	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/hooks"
 	"github.com/lookerjin/grape-core/internal/journal"
@@ -27,6 +30,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent/extension/goal"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/artifact"
+	"trpc.group/trpc-go/trpc-agent-go/artifact/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/evolution"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -114,6 +118,10 @@ type Options struct {
 // It owns the SQLite session service it opens. Close releases that database
 // and the runner. A caller-supplied model is not closed.
 type Runtime struct {
+	extraRoots    map[string]*coding.Directory
+	builtinGrants map[string][]string
+	namedModels   map[string]*countingModel
+	profileUnsafe bool
 	artifacts     artifact.Service
 	cfg           config.Config
 	appName       string
@@ -223,6 +231,9 @@ func New(opts Options) (*Runtime, error) {
 	if appName == "" {
 		appName = defaultAppName
 	}
+	if opts.ArtifactService == nil && cfg.Artifacts.Enabled {
+		opts.ArtifactService = inmemory.NewService()
+	}
 	rt := &Runtime{
 		cfg:           cfg,
 		artifacts:     opts.ArtifactService,
@@ -245,6 +256,11 @@ func New(opts Options) (*Runtime, error) {
 		fixed:         opts.FixedAgent,
 		subagents:     cloneSpecs(opts.Subagents),
 		nested:        nestedReadIndex(opts.NestedReads),
+	}
+	rt.profileUnsafe = opts.FixedAgent != nil || len(opts.TrustedAgents) > 0 || opaqueTools(opts.Subagents, opts.ToolSpecs) || !cfg.KnowledgeOnly()
+	if err := rt.prepareModels(opts.Model != nil); err != nil {
+		sessions.Close()
+		return nil, err
 	}
 	if err := rt.prepareSurface(opts.TrustedAgents); err != nil {
 		_ = sessions.Close()
@@ -281,7 +297,15 @@ func New(opts Options) (*Runtime, error) {
 		}
 		runnerOpts = append(runnerOpts, runner.WithAgentFactory(d.Name, func(ctx context.Context, ro trpcagent.RunOptions) (trpcagent.Agent, error) {
 			ws, _ := ro.RuntimeState["workspace"].(string)
-			options, err := rt.executionOptions(ws, d.Instruction, rt.model, rt.pluginTools[d.Name], false)
+			tools := append([]tool.Tool(nil), rt.pluginTools[d.Name]...)
+			if names := rt.builtinGrants[d.Name]; len(names) > 0 {
+				for _, item := range rt.runWorkspaceTools(ws, ro) {
+					if slices.Contains(names, item.Declaration().Name) {
+						tools = append(tools, item)
+					}
+				}
+			}
+			options, err := rt.executionOptions(ws, d.Instruction, rt.model, tools, false)
 			if err != nil {
 				return nil, err
 			}
@@ -318,6 +342,10 @@ func New(opts Options) (*Runtime, error) {
 		}
 		rt.journal = jw
 	}
+	if err := rt.openExtraRoots(); err != nil {
+		rt.Close()
+		return nil, err
+	}
 	return rt, nil
 }
 
@@ -328,10 +356,9 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 			ws = v
 		}
 	}
-	allowWrite := rt.cfg.Workspace.Permission != agent.PermissionReadOnly
 	var tools []tool.Tool
 	if !rt.cfg.Workspace.DisableCodingTools {
-		tools = rt.workspaceTools(ws, allowWrite)
+		tools = rt.runWorkspaceTools(ws, ro)
 	}
 	for _, spec := range rt.specs {
 		if spec.Tool == nil {
@@ -378,6 +405,12 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 func (rt *Runtime) executionOptions(ws, instruction string, mdl model.Model, tools []tool.Tool, skillsEnabled bool) ([]llmagent.Option, error) {
 	if mdl == nil {
 		mdl = rt.model
+	}
+	if len(rt.extraRoots) > 0 && slices.ContainsFunc(tools, func(t tool.Tool) bool {
+		return t.Declaration() != nil && slices.Contains([]string{"read_file", "list_file", "search_file", "search_content", "read_multiple_files", "save_file", "replace_content"}, t.Declaration().Name)
+	}) {
+		paths := slices.Sorted(maps.Keys(rt.extraRoots))
+		instruction += fmt.Sprintf("\nWorkspace file tools accept an optional root. Granted extra roots: %q. Paths within each root are relative.", paths)
 	}
 	opts := []llmagent.Option{
 		llmagent.WithModel(mdl),
@@ -445,8 +478,12 @@ func (rt *Runtime) buildSubagent(spec SubagentSpec, ws string) (tool.Tool, error
 	if spec.RefreshToolSets {
 		opts = append(opts, llmagent.WithRefreshToolSetsOnRun(true))
 	}
-	ag := llmagent.New(spec.Name, opts...)
-	return kindTool(agenttool.NewTool(ag), "side_effect"), nil
+	mdl := spec.Model
+	if mdl == nil {
+		mdl = rt.model
+	}
+	ag := observedChild{Agent: llmagent.New(spec.Name, opts...), model: mdl.Info().Name}
+	return kindTool(agenttool.NewTool(ag, agenttool.WithPinModel(spec.Model != nil)), "side_effect"), nil
 }
 
 func (rt *Runtime) prepareSurface(trusted []trpcagent.Agent) error {
@@ -616,7 +653,11 @@ func (rt *Runtime) ModelCalls() int64 {
 	if rt.counter == nil {
 		return 0
 	}
-	return rt.counter.calls.Load()
+	n := rt.counter.calls.Load()
+	for _, m := range rt.namedModels {
+		n += m.calls.Load()
+	}
+	return n
 }
 
 // Start implements agent.Runtime.
@@ -665,6 +706,10 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		unlock()
 		return nil, agent.Invalid("workspace", err)
 	}
+	if err := rt.checkProfile(req); err != nil {
+		unlock()
+		return nil, err
+	}
 	input, err := rt.inputMessage(req)
 	if err != nil {
 		unlock()
@@ -678,6 +723,9 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	runID := uuid.NewString()
 	runCtx, cancel := context.WithCancel(ctx)
 	st := newRunState(runID, req.SessionID, req.Mode)
+	st.permission = req.Permission
+	st.requireApproval = req.RequireApproval
+	st.compaction = rt.cfg.Context.Compaction
 	st.outputSchema = schema
 	if rt.artifacts != nil {
 		store, e := rt.Artifacts(req.UserID, req.SessionID)
@@ -694,10 +742,20 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		trpcagent.WithRequestID(runID),
 		trpcagent.WithToolPermissionPolicyFunc(rt.toolPermission),
 		trpcagent.WithRuntimeState(map[string]any{
-			"workspace": workspace,
+			"workspace":  workspace,
+			"permission": req.Permission,
 
 			"mode": string(req.Mode),
 		}),
+	}
+	if req.ModelName != "" {
+		if m := rt.namedModels[req.ModelName]; m != nil {
+			runOpts = append(runOpts, trpcagent.WithModel(m))
+		} else if req.ModelName != rt.model.Info().Name {
+			cancel()
+			unlock()
+			return nil, agent.Invalid("model_name", fmt.Errorf("unknown configured model %q", req.ModelName))
+		}
 	}
 	if output != nil {
 		runOpts = append(runOpts, output)
@@ -722,6 +780,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	box := newEventBox(256)
 	ch := make(chan agent.Event, 3)
 	h := &runHandle{
+		state:      st,
 		id:         runID,
 		events:     ch,
 		box:        box,
@@ -1221,6 +1280,9 @@ func (rt *Runtime) Close() error {
 				rt.closeErr = err
 			}
 		}
+		for _, dir := range rt.extraRoots {
+			dir.Close()
+		}
 		if rt.sessions != nil {
 			if err := rt.sessions.Close(); err != nil && rt.closeErr == nil {
 				rt.closeErr = err
@@ -1241,6 +1303,7 @@ func (rt *Runtime) Close() error {
 }
 
 type runHandle struct {
+	state    *runState
 	id       string
 	events   <-chan agent.Event
 	cancel   func() error

@@ -77,17 +77,23 @@ func cleanRel(rel string) (string, error) {
 	return cleaned, nil
 }
 
-func openWorkspace(root string) (string, *os.Root, error) {
-	root, err := Resolve(root)
+// Directory holds an open workspace for a sequence of confined file operations.
+type Directory struct{ root *os.Root }
+
+// OpenDirectory resolves and opens a directory. The caller owns Close.
+func OpenDirectory(path string) (*Directory, error) {
+	resolved, err := Resolve(path)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
-	r, err := os.OpenRoot(root)
+	root, err := os.OpenRoot(resolved)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
-	return root, r, nil
+	return &Directory{root: root}, nil
 }
+
+func (r *Directory) Close() error { return r.root.Close() }
 
 // ReadLimit selects a line window and a byte cap. LineOffset is 1-based.
 // LineLimit zero means the rest of the file. MaxBytes caps the returned
@@ -109,23 +115,27 @@ func Read(root, rel string) (string, error) {
 // ReadLimited reads at most lim.MaxBytes and optionally a line window.
 // It does not load the rest of a larger file.
 func ReadLimited(root, rel string, lim ReadLimit) (string, error) {
-	rel, err := cleanRel(rel)
-	if err != nil {
-		return "", err
-	}
-	_, r, err := openWorkspace(root)
+	r, err := OpenDirectory(root)
 	if err != nil {
 		return "", err
 	}
 	defer r.Close()
-	info, err := r.Stat(rel)
+	return r.ReadLimited(rel, lim)
+}
+
+func (r *Directory) ReadLimited(rel string, lim ReadLimit) (string, error) {
+	rel, err := cleanRel(rel)
+	if err != nil {
+		return "", err
+	}
+	info, err := r.root.Stat(rel)
 	if err != nil {
 		return "", err
 	}
 	if info.IsDir() {
 		return "", fmt.Errorf("is a directory")
 	}
-	f, err := r.Open(rel)
+	f, err := r.root.Open(rel)
 	if err != nil {
 		return "", err
 	}
@@ -258,16 +268,20 @@ func discardLine(r *bufio.Reader) (bool, error) {
 
 // List returns names of entries in a workspace directory.
 func List(root, rel string) ([]string, error) {
-	rel, err := cleanRel(rel)
-	if err != nil {
-		return nil, err
-	}
-	_, r, err := openWorkspace(root)
+	r, err := OpenDirectory(root)
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	entries, err := fs.ReadDir(r.FS(), rel)
+	return r.List(rel)
+}
+
+func (r *Directory) List(rel string) ([]string, error) {
+	rel, err := cleanRel(rel)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := fs.ReadDir(r.root.FS(), rel)
 	if err != nil {
 		return nil, err
 	}
@@ -303,6 +317,15 @@ func Search(root, substr string) ([]Hit, error) {
 // SearchLimited searches under rel. rel may be a file or a directory.
 // skipped is how many files were left out because they exceed MaxBytes.
 func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, int, error) {
+	r, err := OpenDirectory(root)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer r.Close()
+	return r.SearchLimited(rel, substr, lim)
+}
+
+func (r *Directory) SearchLimited(rel, substr string, lim SearchLimit) ([]Hit, int, error) {
 	if substr == "" {
 		return nil, 0, fmt.Errorf("empty search")
 	}
@@ -310,14 +333,9 @@ func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, int, error
 	if err != nil {
 		return nil, 0, err
 	}
-	_, r, err := openWorkspace(root)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer r.Close()
 	var hits []Hit
 	var skipped int
-	err = fs.WalkDir(r.FS(), rel, func(path string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(r.root.FS(), rel, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -338,7 +356,7 @@ func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, int, error
 			skipped++
 			return nil
 		}
-		b, err := r.ReadFile(path)
+		b, err := r.root.ReadFile(path)
 		if err != nil || !utf8.Valid(b) {
 			return nil
 		}
@@ -373,6 +391,15 @@ func SearchLimited(root, rel, substr string, lim SearchLimit) ([]Hit, int, error
 // The read and write both go through os.Root, so a symlink cannot retarget
 // the write outside the workspace between the two steps.
 func Replace(root, rel, old, new string, n int) error {
+	r, err := OpenDirectory(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return r.Replace(rel, old, new, n)
+}
+
+func (r *Directory) Replace(rel, old, new string, n int) error {
 	if old == "" {
 		return fmt.Errorf("empty old string")
 	}
@@ -380,19 +407,14 @@ func Replace(root, rel, old, new string, n int) error {
 	if err != nil {
 		return err
 	}
-	_, r, err := openWorkspace(root)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-	info, err := r.Stat(rel)
+	info, err := r.root.Stat(rel)
 	if err != nil {
 		return err
 	}
 	if info.IsDir() {
 		return fmt.Errorf("is a directory")
 	}
-	b, err := r.ReadFile(rel)
+	b, err := r.root.ReadFile(rel)
 	if err != nil {
 		return err
 	}
@@ -408,14 +430,23 @@ func Replace(root, rel, old, new string, n int) error {
 	}
 	updated := strings.Replace(text, old, new, n)
 	mode := info.Mode().Perm()
-	if err := r.WriteFile(rel, []byte(updated), mode); err != nil {
+	if err := r.root.WriteFile(rel, []byte(updated), mode); err != nil {
 		return err
 	}
-	return r.Chmod(rel, mode)
+	return r.root.Chmod(rel, mode)
 }
 
 // Save writes a UTF-8 file inside the workspace.
 func Save(root, rel, contents string, overwrite bool) error {
+	r, err := OpenDirectory(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return r.Save(rel, contents, overwrite)
+}
+
+func (r *Directory) Save(rel, contents string, overwrite bool) error {
 	if !utf8.ValidString(contents) {
 		return fmt.Errorf("refusing to write non-UTF-8 content")
 	}
@@ -423,40 +454,39 @@ func Save(root, rel, contents string, overwrite bool) error {
 	if err != nil {
 		return err
 	}
-	_, r, err := openWorkspace(root)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
 	if dir := filepath.Dir(rel); dir != "." {
-		if err := r.MkdirAll(dir, 0o755); err != nil {
+		if err := r.root.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
 	}
 	if !overwrite {
-		if _, err := r.Lstat(rel); err == nil {
+		if _, err := r.root.Lstat(rel); err == nil {
 			return fmt.Errorf("file exists")
 		}
 	}
-	return r.WriteFile(rel, []byte(contents), 0o644)
+	return r.root.WriteFile(rel, []byte(contents), 0o644)
 }
 
 // Match lists files and directories under rel whose path or base name matches
 // pattern. An empty pattern matches everything. Symlinks are not followed.
 func Match(root, rel, pattern string) (files, dirs []string, err error) {
-	rel, err = cleanRel(rel)
-	if err != nil {
-		return nil, nil, err
-	}
-	_, r, err := openWorkspace(root)
+	r, err := OpenDirectory(root)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer r.Close()
-	if _, err := fs.Stat(r.FS(), rel); err != nil {
+	return r.Match(rel, pattern)
+}
+
+func (r *Directory) Match(rel, pattern string) (files, dirs []string, err error) {
+	rel, err = cleanRel(rel)
+	if err != nil {
 		return nil, nil, err
 	}
-	err = fs.WalkDir(r.FS(), rel, func(path string, d fs.DirEntry, err error) error {
+	if _, err := fs.Stat(r.root.FS(), rel); err != nil {
+		return nil, nil, err
+	}
+	err = fs.WalkDir(r.root.FS(), rel, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}

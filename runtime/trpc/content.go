@@ -54,7 +54,7 @@ func (rt *Runtime) inputMessage(req agent.RunRequest) (model.Message, error) {
 		return msg, fmt.Errorf("at most 16 attachments")
 	}
 	provider := rt.protocol()
-	if !rt.injectedModel && !slices.Contains([]string{"", "openai", "openai_compatible", "anthropic", "gemini"}, provider) {
+	if !rt.injectedModel && !rt.modelInfo(rt.counter).Multipart {
 		return msg, fmt.Errorf("attachment support is not established for provider %q", provider)
 	}
 	if req.Message != "" {
@@ -109,7 +109,7 @@ func (rt *Runtime) outputOption(out *agent.OutputSchema) (*jsonschema.Schema, tr
 	if out == nil {
 		return nil, nil, nil
 	}
-	if !rt.injectedModel && !slices.Contains([]string{"", "openai", "openai_compatible", "gemini"}, rt.protocol()) {
+	if !rt.injectedModel && !rt.modelInfo(rt.counter).JSONSchema {
 		return nil, nil, fmt.Errorf("provider does not expose native schema mode")
 	}
 	var doc map[string]any

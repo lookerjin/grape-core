@@ -24,14 +24,18 @@ const (
 // RunRequest starts one turn. UserID and SessionID identify the session.
 // RunID is assigned by the runtime and is not part of the request.
 type RunRequest struct {
-	Attachments []Attachment  `json:"attachments,omitempty"`
-	Output      *OutputSchema `json:"output,omitempty"`
-	UserID      string        `json:"user_id"`
-	SessionID   string        `json:"session_id"`
-	Workspace   string        `json:"workspace,omitempty"`
-	Message     string        `json:"message"`
-	Mode        Mode          `json:"mode,omitempty"`
-	AgentID     string        `json:"agent_id,omitempty"`
+	// Permission may narrow the runtime ceiling. RequireApproval adds an approval gate.
+	Permission      string        `json:"permission,omitempty"`
+	RequireApproval bool          `json:"require_approval,omitempty"`
+	ModelName       string        `json:"model_name,omitempty"`
+	Attachments     []Attachment  `json:"attachments,omitempty"`
+	Output          *OutputSchema `json:"output,omitempty"`
+	UserID          string        `json:"user_id"`
+	SessionID       string        `json:"session_id"`
+	Workspace       string        `json:"workspace,omitempty"`
+	Message         string        `json:"message"`
+	Mode            Mode          `json:"mode,omitempty"`
+	AgentID         string        `json:"agent_id,omitempty"`
 }
 
 // RunHandle is the handle for an in-flight run.
@@ -119,4 +123,11 @@ type HistoryToolCall struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	Arguments string `json:"arguments,omitempty"`
+}
+
+// ModelInfo describes a configured model and the request features its adapter exposes.
+type ModelInfo struct {
+	Name, Provider                      string
+	ContextWindow                       int
+	KnownAdapter, Multipart, JSONSchema bool
 }

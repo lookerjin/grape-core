@@ -25,6 +25,7 @@ type countingModel struct {
 
 func (m *countingModel) GenerateContent(ctx context.Context, req *model.Request) (<-chan *model.Response, error) {
 	m.calls.Add(1)
+	stateFrom(ctx).noteProjection(ctx, m.Info(), req)
 	return m.inner.GenerateContent(ctx, req)
 }
 

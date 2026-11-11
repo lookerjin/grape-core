@@ -135,12 +135,14 @@ type ErrorPayload struct {
 
 // PermissionPayload is the body of a permission_request event.
 type PermissionPayload struct {
-	ID      string `json:"id"`
-	Kind    string `json:"kind"`
-	Detail  string `json:"detail,omitempty"`
-	Path    string `json:"path,omitempty"`
-	Allowed bool   `json:"allowed"`
-	Reason  string `json:"reason,omitempty"`
+	AgentID      string `json:"agent_id,omitempty"`
+	InvocationID string `json:"invocation_id,omitempty"`
+	ID           string `json:"id"`
+	Kind         string `json:"kind"`
+	Detail       string `json:"detail,omitempty"`
+	Path         string `json:"path,omitempty"`
+	Allowed      bool   `json:"allowed"`
+	Reason       string `json:"reason,omitempty"`
 }
 
 // RawPayload carries an unmatched framework event.

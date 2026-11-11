@@ -119,7 +119,7 @@ func (e *commandExecutor) Execute(ctx context.Context, req sandbox.Request) (san
 	if req.Hook {
 		return e.executeHook(ctx, req)
 	}
-	switch e.cfg.Workspace.Permission {
+	switch effectivePermission(ctx, e.cfg.Workspace.Permission) {
 	case agent.PermissionReadOnly:
 		return sandbox.Result{}, agent.Wrap(agent.ErrPermissionDenied, "command", fmt.Errorf("read_only workspace"))
 	case agent.PermissionDangerFullAccess:

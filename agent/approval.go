@@ -5,12 +5,14 @@ import "context"
 // ApprovalRequest asks a product to allow or deny one side effect.
 // The SDK never reads stdin. The product supplies a Decider.
 type ApprovalRequest struct {
-	ID        string `json:"id"`
-	RunID     string `json:"run_id"`
-	SessionID string `json:"session_id"`
-	Kind      string `json:"kind"`
-	Detail    string `json:"detail,omitempty"`
-	Path      string `json:"path,omitempty"`
+	AgentID      string `json:"agent_id,omitempty"`
+	InvocationID string `json:"invocation_id,omitempty"`
+	ID           string `json:"id"`
+	RunID        string `json:"run_id"`
+	SessionID    string `json:"session_id"`
+	Kind         string `json:"kind"`
+	Detail       string `json:"detail,omitempty"`
+	Path         string `json:"path,omitempty"`
 }
 
 // Decision is the product's answer to an ApprovalRequest.

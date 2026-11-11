@@ -34,7 +34,7 @@ tools: [archive]
 Compare the evidence and save the report using archive.
 ```
 
-Select it with `rt.Start(ctx, agent.RunRequest{AgentID: "analyst", UserID: u, SessionID: s, Message: prompt})`. The native named agent factory uses the runtime model, budgets, callbacks and permission policy. Plugins get no inherited coding tools, skills, executors, MCP or tool sets. Every requested tool needs a matching policy-checked grant in `Options.PluginTools["bundle/analyst"]` for its owning plugin. Even with a grant, the active permission mode and approval policy apply. Caller-built fixed agents and plugin agents cannot be combined. Plugins can omit `model` or select `inherit`.
+Select it with `rt.Start(ctx, agent.RunRequest{AgentID: "analyst", UserID: u, SessionID: s, Message: prompt})`. The native named agent factory uses the runtime model, budgets, callbacks and permission policy. Plugins get no inherited coding tools, skills, executors, MCP or tool sets. Grant custom tools through `Options.PluginTools["bundle/analyst"]`. For built-ins, list the declared names in `plugins.allow_builtin_tools["bundle/analyst"]`, for example `[read_file, search_content]`. Each requested tool needs exactly one grant from its owning plugin. Disabling Coding tools also disables built-in grants. Even with a grant, the active permission mode and approval policy apply. Caller-built fixed agents and plugin agents cannot be combined. Plugins can omit `model` or select `inherit`.
 
 A `commands/compare.md` can contain:
 

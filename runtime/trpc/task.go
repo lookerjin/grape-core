@@ -2,6 +2,7 @@ package trpcruntime
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -52,6 +53,27 @@ func NewTaskHost(rt *Runtime) (*TaskHost, error) {
 	}
 	rt.taskHost = h
 	return h, nil
+}
+
+// List returns a newest-first snapshot of this host's durable task records.
+func (h *TaskHost) List() ([]agent.Task, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	records, err := h.loadLocked()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]agent.Task, 0, len(records))
+	for _, task := range records {
+		out = append(out, task)
+	}
+	slices.SortFunc(out, func(a, b agent.Task) int {
+		if c := b.CreatedAt.Compare(a.CreatedAt); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.ID, b.ID)
+	})
+	return out, nil
 }
 
 // normalize marks tasks left running by a previous process as failed.

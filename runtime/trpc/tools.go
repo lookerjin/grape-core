@@ -17,15 +17,20 @@ import (
 )
 
 type runState struct {
-	outputSchema *jsonschema.Schema
-	mu           sync.Mutex
-	cond         *sync.Cond
-	events       []agent.Event
-	runID        string
-	session      string
-	mode         agent.Mode
-	tools        int
-	stopping     bool
+	children                  map[string]*childCall
+	projection                agent.ContextStatus
+	hasProjection, compaction bool
+	permission                string
+	requireApproval           bool
+	outputSchema              *jsonschema.Schema
+	mu                        sync.Mutex
+	cond                      *sync.Cond
+	events                    []agent.Event
+	runID                     string
+	session                   string
+	mode                      agent.Mode
+	tools                     int
+	stopping                  bool
 	// rootInv is the invocation ID captured for the run's root agent.
 	rootInv       string
 	llmCalls      int
@@ -188,22 +193,26 @@ type cmdOut struct {
 }
 
 type pathIn struct {
+	Root string `json:"root,omitempty"`
 	Path string `json:"path,omitempty"`
 }
 
 type readIn struct {
+	Root     string `json:"root,omitempty"`
 	FileName string `json:"file_name"`
 	Offset   int    `json:"offset,omitempty"`
 	Limit    int    `json:"limit,omitempty"`
 }
 
 type saveIn struct {
+	Root      string `json:"root,omitempty"`
 	FileName  string `json:"file_name"`
 	Contents  string `json:"contents"`
 	Overwrite bool   `json:"overwrite"`
 }
 
 type replaceIn struct {
+	Root            string `json:"root,omitempty"`
 	FileName        string `json:"file_name"`
 	OldString       string `json:"old_string"`
 	NewString       string `json:"new_string"`
@@ -211,6 +220,7 @@ type replaceIn struct {
 }
 
 type searchIn struct {
+	Root           string `json:"root,omitempty"`
 	Path           string `json:"path"`
 	Pattern        string `json:"pattern"`
 	FilePattern    string `json:"file_pattern"`
@@ -218,6 +228,7 @@ type searchIn struct {
 }
 
 type multiIn struct {
+	Root     string   `json:"root,omitempty"`
 	Patterns []string `json:"patterns"`
 }
 
@@ -229,10 +240,15 @@ func (rt *Runtime) workspaceFrom(ctx context.Context, fallback string) string {
 }
 
 func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
-	ws := func(ctx context.Context) string { return rt.workspaceFrom(ctx, fallback) }
+
 	tools := []tool.Tool{
 		rt.asRead(function.NewFunctionTool(func(ctx context.Context, in readIn) (map[string]any, error) {
-			text, err := coding.ReadLimited(ws(ctx), in.FileName, coding.ReadLimit{
+			dir, closeDir, err := rt.fileRoot(ctx, fallback, in.Root)
+			if err != nil {
+				return nil, err
+			}
+			defer closeDir()
+			text, err := dir.ReadLimited(in.FileName, coding.ReadLimit{
 				MaxBytes:   rt.cfg.Workspace.MaxReadBytes,
 				LineOffset: in.Offset,
 				LineLimit:  in.Limit,
@@ -243,29 +259,44 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 			return map[string]any{"file_name": in.FileName, "contents": text}, nil
 		}, function.WithName("read_file"), function.WithDescription("Read a UTF-8 workspace file, with optional 1-based offset and line limit. Symlinks that leave the workspace are rejected."))),
 		rt.asRead(function.NewFunctionTool(func(ctx context.Context, in pathIn) (map[string]any, error) {
-			names, err := coding.List(ws(ctx), in.Path)
+			dir, closeDir, err := rt.fileRoot(ctx, fallback, in.Root)
+			if err != nil {
+				return nil, err
+			}
+			defer closeDir()
+			names, err := dir.List(in.Path)
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"entries": names}, nil
 		}, function.WithName("list_file"), function.WithDescription("List a workspace directory without following escaping symlinks."))),
 		rt.asRead(function.NewFunctionTool(func(ctx context.Context, in searchIn) (map[string]any, error) {
+			dir, closeDir, err := rt.fileRoot(ctx, fallback, in.Root)
+			if err != nil {
+				return nil, err
+			}
+			defer closeDir()
 			pattern := in.Pattern
 			if pattern == "" {
 				pattern = in.FilePattern
 			}
-			files, dirs, err := coding.Match(ws(ctx), in.Path, pattern)
+			files, dirs, err := dir.Match(in.Path, pattern)
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"files": files, "folders": dirs}, nil
 		}, function.WithName("search_file"), function.WithDescription("Find workspace paths by name. Escaping symlinks are not followed."))),
 		rt.asRead(function.NewFunctionTool(func(ctx context.Context, in searchIn) (map[string]any, error) {
+			dir, closeDir, err := rt.fileRoot(ctx, fallback, in.Root)
+			if err != nil {
+				return nil, err
+			}
+			defer closeDir()
 			path := in.Path
 			if path == "" {
 				path = "."
 			}
-			hits, skipped, err := coding.SearchLimited(ws(ctx), path, in.ContentPattern, coding.SearchLimit{
+			hits, skipped, err := dir.SearchLimited(path, in.ContentPattern, coding.SearchLimit{
 				MaxBytes: rt.cfg.Workspace.MaxReadBytes,
 				MaxHits:  rt.cfg.Workspace.MaxSearchHits,
 			})
@@ -275,14 +306,19 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 			return map[string]any{"matches": hits, "skipped": skipped}, nil
 		}, function.WithName("search_content"), function.WithDescription("Search UTF-8 files under path. Escaping symlinks are not followed. Large files and excess matches are skipped."))),
 		rt.asRead(function.NewFunctionTool(func(ctx context.Context, in multiIn) (map[string]any, error) {
+			dir, closeDir, err := rt.fileRoot(ctx, fallback, in.Root)
+			if err != nil {
+				return nil, err
+			}
+			defer closeDir()
 			var files []map[string]string
 			for _, pattern := range in.Patterns {
-				matches, _, err := coding.Match(ws(ctx), ".", pattern)
+				matches, _, err := dir.Match(".", pattern)
 				if err != nil {
 					return nil, err
 				}
 				for _, name := range matches {
-					text, err := coding.ReadLimited(ws(ctx), name, coding.ReadLimit{MaxBytes: rt.cfg.Workspace.MaxReadBytes})
+					text, err := dir.ReadLimited(name, coding.ReadLimit{MaxBytes: rt.cfg.Workspace.MaxReadBytes})
 					if err != nil {
 						files = append(files, map[string]string{"file_name": name, "error": err.Error()})
 						continue
@@ -298,13 +334,23 @@ func (rt *Runtime) fileTools(fallback string, allowWrite bool) []tool.Tool {
 	}
 	tools = append(tools,
 		kindTool(function.NewFunctionTool(func(ctx context.Context, in saveIn) (map[string]any, error) {
-			if err := coding.Save(ws(ctx), in.FileName, in.Contents, in.Overwrite); err != nil {
+			dir, closeDir, err := rt.fileRoot(ctx, fallback, in.Root)
+			if err != nil {
+				return nil, err
+			}
+			defer closeDir()
+			if err := dir.Save(in.FileName, in.Contents, in.Overwrite); err != nil {
 				return nil, err
 			}
 			return map[string]any{"file_name": in.FileName, "message": "saved"}, nil
 		}, function.WithName("save_file"), function.WithDescription("Write a UTF-8 file inside the workspace. Symlinks that leave the workspace are rejected.")), "write"),
 		kindTool(function.NewFunctionTool(func(ctx context.Context, in replaceIn) (map[string]any, error) {
-			if err := coding.Replace(ws(ctx), in.FileName, in.OldString, in.NewString, in.NumReplacements); err != nil {
+			dir, closeDir, err := rt.fileRoot(ctx, fallback, in.Root)
+			if err != nil {
+				return nil, err
+			}
+			defer closeDir()
+			if err := dir.Replace(in.FileName, in.OldString, in.NewString, in.NumReplacements); err != nil {
 				return nil, err
 			}
 			return map[string]any{"file_name": in.FileName, "message": "replaced"}, nil
@@ -322,7 +368,9 @@ func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) []tool.Tool
 			function.WithDescription("Run an argv command in the workspace. argv is not a shell string. The result includes the isolation level that was actually used."),
 		), "command"),
 		rt.asRead(function.NewFunctionTool(
-			func(ctx context.Context, in pathIn) (map[string]string, error) {
+			func(ctx context.Context, in struct {
+				Path string `json:"path,omitempty"`
+			}) (map[string]string, error) {
 				text, err := coding.GitStatus(ctx, workspace)
 				if err != nil {
 					return nil, err
@@ -333,7 +381,9 @@ func (rt *Runtime) workspaceTools(workspace string, allowWrite bool) []tool.Tool
 			function.WithDescription("Read-only git status. Does not add, commit, push, reset, or clean."),
 		)),
 		rt.asRead(function.NewFunctionTool(
-			func(ctx context.Context, in pathIn) (map[string]string, error) {
+			func(ctx context.Context, in struct {
+				Path string `json:"path,omitempty"`
+			}) (map[string]string, error) {
 				text, err := coding.GitDiff(ctx, workspace)
 				if err != nil {
 					return nil, err
@@ -511,8 +561,8 @@ func streamInner(item tool.Tool) bool {
 func mutatingKind(kind string) bool { return kind != "read" }
 
 func (rt *Runtime) authorize(ctx context.Context, kind, detail, path string) error {
-	if rt.cfg.Workspace.Permission == agent.PermissionReadOnly && mutatingKind(kind) {
-		rt.recordDecision(ctx, kind, detail, path, false, "read_only")
+	if effectivePermission(ctx, rt.cfg.Workspace.Permission) == agent.PermissionReadOnly && mutatingKind(kind) {
+		rt.recordDecision(ctx, kind, detail, path, false, "read_only", "")
 		return agent.Wrap(agent.ErrPermissionDenied, kind, fmt.Errorf("read_only workspace"))
 	}
 	if mutatingKind(kind) && rt.needsApproval(ctx) {
@@ -525,7 +575,7 @@ func (rt *Runtime) authorize(ctx context.Context, kind, detail, path string) err
 
 func (rt *Runtime) decide(ctx context.Context, kind, detail, path string) error {
 	if rt.decider == nil {
-		rt.recordDecision(ctx, kind, detail, path, false, "no decider")
+		rt.recordDecision(ctx, kind, detail, path, false, "no decider", "")
 		return agent.Wrap(agent.ErrPermissionDenied, kind, fmt.Errorf("approval required"))
 	}
 	st := stateFrom(ctx)
@@ -539,9 +589,10 @@ func (rt *Runtime) decide(ctx context.Context, kind, detail, path string) error 
 		req.RunID = st.runID
 		req.SessionID = st.session
 	}
+	req.InvocationID, req.AgentID = invocationMeta(ctx)
 	decision, err := rt.decider.Decide(ctx, req)
 	if err != nil {
-		rt.recordDecision(ctx, kind, detail, path, false, err.Error())
+		rt.recordDecision(ctx, kind, detail, path, false, err.Error(), req.ID)
 		return agent.Wrap(agent.ErrPermissionDenied, kind, err)
 	}
 	if !decision.Allow {
@@ -549,10 +600,10 @@ func (rt *Runtime) decide(ctx context.Context, kind, detail, path string) error 
 		if reason == "" {
 			reason = "denied"
 		}
-		rt.recordDecision(ctx, kind, detail, path, false, reason)
+		rt.recordDecision(ctx, kind, detail, path, false, reason, req.ID)
 		return agent.Wrap(agent.ErrPermissionDenied, kind, fmt.Errorf("%s", reason))
 	}
-	rt.recordDecision(ctx, kind, detail, path, true, decision.Reason)
+	rt.recordDecision(ctx, kind, detail, path, true, decision.Reason, req.ID)
 	return nil
 }
 
@@ -561,21 +612,27 @@ func (rt *Runtime) needsApproval(ctx context.Context) bool {
 		return true
 	}
 	st := stateFrom(ctx)
-	return st != nil && st.mode == agent.ModePlan && rt.cfg.PlanRequiresApproval()
+	return st != nil && (st.requireApproval || (st.mode == agent.ModePlan && rt.cfg.PlanRequiresApproval()))
 }
 
-func (rt *Runtime) recordDecision(ctx context.Context, kind, detail, path string, allow bool, reason string) {
+func (rt *Runtime) recordDecision(ctx context.Context, kind, detail, path string, allow bool, reason, id string) {
 	st := stateFrom(ctx)
 	if st == nil {
 		return
 	}
+	if id == "" {
+		id = uuid.NewString()
+	}
+	inv, name := invocationMeta(ctx)
 	st.add(agent.Event{
+		AgentID: name, TraceID: inv,
 		RunID:     st.runID,
 		SessionID: st.session,
 		Kind:      agent.EventPermissionRequest,
 		Time:      time.Now().UTC(),
 		Payload: agent.MustPayload(agent.PermissionPayload{
-			ID:      uuid.NewString(),
+			AgentID: name, InvocationID: inv,
+			ID:      id,
 			Kind:    kind,
 			Detail:  detail,
 			Path:    path,

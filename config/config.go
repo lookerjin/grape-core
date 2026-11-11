@@ -15,6 +15,7 @@ import (
 
 // Config is the effective grape-core configuration.
 type Config struct {
+	Artifacts ArtifactsConfig `yaml:"artifacts"`
 	Runtime   RuntimeConfig   `yaml:"runtime"`
 	Model     ModelConfig     `yaml:"model"`
 	Session   SessionConfig   `yaml:"session"`
@@ -33,6 +34,11 @@ type Config struct {
 	Approvals ApprovalConfig  `yaml:"approvals"`
 }
 
+// ArtifactsConfig enables the native process-local memory backend.
+type ArtifactsConfig struct {
+	Enabled bool `yaml:"enabled"`
+}
+
 // RuntimeConfig selects the agent runtime. Only "trpc" is implemented.
 type RuntimeConfig struct {
 	Provider string `yaml:"provider"`
@@ -41,13 +47,14 @@ type RuntimeConfig struct {
 // ModelConfig points at a model. The API key is the name of an environment
 // variable, never the key itself.
 type ModelConfig struct {
-	Provider    string           `yaml:"provider"`
-	Name        string           `yaml:"name"`
-	BaseURL     string           `yaml:"base_url"`
-	APIKeyEnv   string           `yaml:"api_key_env"`
-	SecretIDEnv string           `yaml:"secret_id_env"`
-	Timeout     string           `yaml:"timeout"`
-	Generation  GenerationConfig `yaml:"generation"`
+	Alternatives []string         `yaml:"alternatives"`
+	Provider     string           `yaml:"provider"`
+	Name         string           `yaml:"name"`
+	BaseURL      string           `yaml:"base_url"`
+	APIKeyEnv    string           `yaml:"api_key_env"`
+	SecretIDEnv  string           `yaml:"secret_id_env"`
+	Timeout      string           `yaml:"timeout"`
+	Generation   GenerationConfig `yaml:"generation"`
 }
 
 // GenerationConfig is a small subset of sampling controls.
@@ -67,6 +74,7 @@ type SessionConfig struct {
 
 // WorkspaceConfig is the project the agent may read or edit.
 type WorkspaceConfig struct {
+	ExtraRoots []string `yaml:"extra_roots"`
 	// DisableCodingTools omits the built-in filesystem, command, and Git tools.
 	DisableCodingTools bool   `yaml:"disable_coding_tools"`
 	Root               string `yaml:"root"`
@@ -105,9 +113,10 @@ type SkillsConfig struct {
 // PluginsConfig lists plugin roots and which installed plugins are enabled.
 // Conflict is "error" (default), "earliest", or "latest".
 type PluginsConfig struct {
-	Dirs     []string `yaml:"dirs"`
-	Enabled  []string `yaml:"enabled"`
-	Conflict string   `yaml:"conflict"`
+	AllowBuiltinTools map[string][]string `yaml:"allow_builtin_tools"`
+	Dirs              []string            `yaml:"dirs"`
+	Enabled           []string            `yaml:"enabled"`
+	Conflict          string              `yaml:"conflict"`
 }
 
 // MCPServerConfig is one MCP server. Header values and credentials are
