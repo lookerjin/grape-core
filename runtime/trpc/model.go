@@ -8,7 +8,10 @@ import (
 
 	"github.com/lookerjin/grape-core/agent"
 	"github.com/lookerjin/grape-core/config"
+	"google.golang.org/genai"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+	"trpc.group/trpc-go/trpc-agent-go/model/gemini"
 	"trpc.group/trpc-go/trpc-agent-go/model/huggingface"
 	"trpc.group/trpc-go/trpc-agent-go/model/hunyuan"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
@@ -28,10 +31,6 @@ func (m *countingModel) GenerateContent(ctx context.Context, req *model.Request)
 func (m *countingModel) Info() model.Info { return m.inner.Info() }
 
 // buildModel returns the injected model or a tRPC provider model.
-//
-// gemini and anthropic are wired through the OpenAI-compatible client.
-// tRPC v1.12.0 does not ship a separate native Gemini or Anthropic package.
-// hunyuan uses secret id plus secret key environment variables.
 func buildModel(cfg config.Config, override model.Model) (model.Model, *countingModel, error) {
 	var inner model.Model
 	if override != nil {
@@ -60,7 +59,17 @@ func newProviderModel(cfg config.Config) (model.Model, error) {
 		return nil, agent.Invalid("model.name", fmt.Errorf("model name is required"))
 	}
 	switch cfg.Model.Provider {
-	case "", "openai", "openai_compatible", "gemini", "anthropic", "deepseek", "qwen", "glm", "kimi", "minimax":
+	case "gemini":
+		return gemini.New(context.Background(), name, gemini.WithGeminiClientConfig(&genai.ClientConfig{
+			Backend: genai.BackendGeminiAPI, APIKey: key, HTTPOptions: genai.HTTPOptions{BaseURL: cfg.Model.BaseURL},
+		}))
+	case "anthropic":
+		opts := []anthropic.Option{anthropic.WithAPIKey(key)}
+		if cfg.Model.BaseURL != "" {
+			opts = append(opts, anthropic.WithBaseURL(cfg.Model.BaseURL))
+		}
+		return anthropic.New(name, opts...), nil
+	case "", "openai", "openai_compatible", "deepseek", "qwen", "glm", "kimi", "minimax":
 		return newOpenAI(cfg, name, key), nil
 	case "hunyuan":
 		if cfg.Model.SecretIDEnv == "" {
