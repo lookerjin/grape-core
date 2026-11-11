@@ -14,6 +14,7 @@ import (
 	"github.com/lookerjin/grape-core/mcp"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	trpcmcp "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
+	mcpclient "trpc.group/trpc-go/trpc-mcp-go"
 )
 
 func serversFromConfig(cfg config.Config) ([]mcp.Server, error) {
@@ -178,7 +179,13 @@ func (rt *Runtime) dialMCP(ctx context.Context, server mcp.Server) (tool.ToolSet
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 20 * time.Second
 	}
-	set := trpcmcp.NewMCPToolSet(cfg, trpcmcp.WithName(server.Name))
+	options := []trpcmcp.ToolSetOption{trpcmcp.WithName(server.Name)}
+	if cfg.Transport == "streamable" {
+		// v0.0.20 races its background GET listener with tool discovery.
+		// Grape consumes tool responses on POST and has no notification listener.
+		options = append(options, trpcmcp.WithMCPOptions(mcpclient.WithClientGetSSEEnabled(false)))
+	}
+	set := trpcmcp.NewMCPToolSet(cfg, options...)
 	if err := set.Init(ctx); err != nil {
 		_ = set.Close()
 		return nil, fmt.Errorf("mcp %s: %w", server.Name, err)

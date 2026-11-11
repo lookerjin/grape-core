@@ -359,6 +359,9 @@ func (rt *Runtime) executionOptions(ws, instruction string, mdl model.Model, too
 		llmagent.WithModel(mdl),
 		llmagent.WithInstruction(instruction),
 		llmagent.WithGenerationConfig(generationConfig(rt.cfg)),
+		llmagent.WithMaxHistoryRuns(rt.cfg.Context.MaxHistoryMessages),
+		llmagent.WithEnableContextCompaction(rt.cfg.Context.Compaction),
+		llmagent.WithContextCompactionOversizedToolResultMaxTokens(rt.cfg.Context.OversizedToolResultTokens),
 		// The framework default executes fenced code blocks without the
 		// tool permission policy. Keep it off on every agent grape builds.
 		llmagent.WithEnableCodeExecutionResponseProcessor(false),

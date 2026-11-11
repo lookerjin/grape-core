@@ -92,3 +92,28 @@ type Task struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+
+// SessionHistoryReader is an optional read-only capability of a Runtime.
+// eventLimit bounds the number of recent persisted events before projection.
+// Zero uses the session service's configured limit.
+type SessionHistoryReader interface {
+	SessionHistory(ctx context.Context, userID, sessionID string, eventLimit int) ([]HistoryMessage, error)
+}
+
+// HistoryMessage is a persisted conversation message in chronological order.
+type HistoryMessage struct {
+	EventID   string            `json:"event_id"`
+	Time      time.Time         `json:"time"`
+	Author    string            `json:"author,omitempty"`
+	Role      string            `json:"role"`
+	Text      string            `json:"text,omitempty"`
+	ToolID    string            `json:"tool_id,omitempty"`
+	ToolName  string            `json:"tool_name,omitempty"`
+	ToolCalls []HistoryToolCall `json:"tool_calls,omitempty"`
+}
+
+type HistoryToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments,omitempty"`
+}

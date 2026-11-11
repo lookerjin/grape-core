@@ -191,6 +191,13 @@ type PlanConfig struct {
 // ContextConfig bounds one run.
 // A nil limit uses the documented default. Zero and negative mean unlimited.
 type ContextConfig struct {
+	// MaxHistoryMessages limits projected model history. Zero uses all available messages.
+	MaxHistoryMessages int `yaml:"max_history_messages"`
+	// Compaction enables native request-side tool-result compaction.
+	Compaction bool `yaml:"compaction"`
+	// OversizedToolResultTokens applies head/tail truncation even to the current result.
+	OversizedToolResultTokens int `yaml:"oversized_tool_result_tokens"`
+
 	// MaxLLMCalls is the per-agent model-call limit passed to tRPC.
 	// Nil uses 128. The framework resets this counter on each invocation.
 	MaxLLMCalls *int `yaml:"max_llm_calls"`

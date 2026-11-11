@@ -127,6 +127,12 @@ func mergeValue(base, overlay any) any {
 
 // Validate checks enumerated fields and duration syntax.
 func (c Config) Validate() error {
+	if c.Context.MaxHistoryMessages < 0 {
+		return agent.Invalid("context.max_history_messages", fmt.Errorf("must be non-negative"))
+	}
+	if c.Context.OversizedToolResultTokens < 0 || (c.Context.OversizedToolResultTokens > 0 && !c.Context.Compaction) {
+		return agent.Invalid("context.oversized_tool_result_tokens", fmt.Errorf("use a non-negative limit and enable compaction for a positive limit"))
+	}
 	if c.Goal.Promise != "" && c.Goal.Promise != "<promise>DONE</promise>" {
 		return agent.Invalid("goal.promise", fmt.Errorf("custom promise markers are unsupported; use the native update_goal tool"))
 	}
