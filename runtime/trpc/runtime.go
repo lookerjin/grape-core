@@ -19,9 +19,11 @@ import (
 	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/hooks"
 	"github.com/lookerjin/grape-core/internal/journal"
+	"github.com/lookerjin/grape-core/internal/modelaccess"
 	"github.com/lookerjin/grape-core/internal/paths"
 	"github.com/lookerjin/grape-core/mcp"
 	"github.com/lookerjin/grape-core/memory"
+	infra "github.com/lookerjin/grape-core/model"
 	"github.com/lookerjin/grape-core/plugin"
 	"github.com/lookerjin/grape-core/rules"
 	"github.com/lookerjin/grape-core/sandbox"
@@ -66,6 +68,7 @@ type SubagentSpec struct {
 // Options configures a Runtime. Model, when set, replaces the configured
 // provider. Tests and the offline example inject a mock model here.
 type Options struct {
+	ModelRegistry           *infra.Registry
 	ArtifactService         artifact.Service
 	Config                  *config.Config
 	Model                   model.Model
@@ -118,9 +121,10 @@ type Options struct {
 // It owns the SQLite session service it opens. Close releases that database
 // and the runner. A caller-supplied model is not closed.
 type Runtime struct {
+	registry      *infra.Registry
 	extraRoots    map[string]*coding.Directory
 	builtinGrants map[string][]string
-	namedModels   map[string]*countingModel
+	namedModels   map[string]bool
 	profileUnsafe bool
 	artifacts     artifact.Service
 	cfg           config.Config
@@ -128,8 +132,7 @@ type Runtime struct {
 	runner        runner.Runner
 	sessions      *sqlitesession.Service
 	injectedModel bool
-	counter       *countingModel
-	model         model.Model
+	model         *countingModel
 	exec          *commandExecutor
 	tools         []tool.Tool
 	specs         []ToolSpec
@@ -175,6 +178,9 @@ type Runtime struct {
 
 // New validates options, opens SQLite, and builds a tRPC runner.
 func New(opts Options) (*Runtime, error) {
+	if opts.ModelRegistry != nil && (opts.Model != nil || opts.FixedAgent != nil || len(opts.TrustedAgents) > 0) {
+		return nil, agent.Invalid("model_registry", fmt.Errorf("account routing requires Core-built agents and models"))
+	}
 	cfg := config.Default()
 	if opts.Config != nil {
 		cfg = config.Normalize(*opts.Config)
@@ -218,11 +224,6 @@ func New(opts Options) (*Runtime, error) {
 		_ = db.Close()
 		return nil, agent.Wrap(agent.ErrSession, "sqlite", err)
 	}
-	mdl, counter, err := buildModel(cfg, opts.Model)
-	if err != nil {
-		_ = sessions.Close()
-		return nil, err
-	}
 	instruction := opts.Instruction
 	if instruction == "" {
 		instruction = "You are grape-core, a local assistant. Use tools only when they are provided. Never claim that a command ran unless a tool result says so. Do not stage, commit, push, reset, or clean git state."
@@ -230,18 +231,26 @@ func New(opts Options) (*Runtime, error) {
 	appName := opts.AppName
 	if appName == "" {
 		appName = defaultAppName
+		if opts.ModelRegistry != nil {
+			appName = opts.ModelRegistry.Scope().App
+		}
+	}
+	if opts.ModelRegistry != nil && opts.ModelRegistry.Scope().App != appName {
+		sessions.Close()
+		return nil, agent.Invalid("app_name", fmt.Errorf("registry application mismatch"))
 	}
 	if opts.ArtifactService == nil && cfg.Artifacts.Enabled {
 		opts.ArtifactService = inmemory.NewService()
 	}
 	rt := &Runtime{
-		cfg:           cfg,
-		artifacts:     opts.ArtifactService,
-		appName:       appName,
-		sessions:      sessions,
-		counter:       counter,
+		registry:  opts.ModelRegistry,
+		cfg:       cfg,
+		artifacts: opts.ArtifactService,
+		appName:   appName,
+		sessions:  sessions,
+
 		injectedModel: opts.Model != nil,
-		model:         mdl,
+		model:         initialModel(cfg, opts.Model),
 		exec:          newCommandExecutor(cfg, filepath.Join(os.TempDir(), "grape-core-sandbox"), dataDir, opts.Platform, opts.External),
 		tools:         append([]tool.Tool(nil), opts.Tools...),
 		specs:         append([]ToolSpec(nil), opts.ToolSpecs...),
@@ -279,7 +288,11 @@ func New(opts Options) (*Runtime, error) {
 		if opts.EvolutionReviewer != nil {
 			eopts = append(eopts, evolution.WithReviewer(opts.EvolutionReviewer))
 		}
-		rt.evolution = evolution.NewService(mdl, eopts...)
+		var reviewerModel model.Model = rt.model
+		if !rt.injectedModel {
+			reviewerModel = rt.model.inner
+		}
+		rt.evolution = evolution.NewService(reviewerModel, eopts...)
 	}
 	if err := rt.collectExtensions(opts.PluginManager, dataDir, opts.PluginTools); err != nil {
 		_ = sessions.Close()
@@ -468,7 +481,11 @@ func (rt *Runtime) buildSubagent(spec SubagentSpec, ws string) (tool.Tool, error
 		}
 		tools = append(tools, nested)
 	}
-	opts, err := rt.executionOptions(ws, spec.Instruction, spec.Model, tools, true)
+	pinned := spec.Model
+	if pinned != nil && rt.registry != nil {
+		pinned = &countingModel{inner: pinned}
+	}
+	opts, err := rt.executionOptions(ws, spec.Instruction, pinned, tools, true)
 	if err != nil {
 		return nil, err
 	}
@@ -650,14 +667,10 @@ func (rt *Runtime) Config() config.Config { return rt.cfg }
 
 // ModelCalls reports how many times the wrapped model was invoked.
 func (rt *Runtime) ModelCalls() int64 {
-	if rt.counter == nil {
+	if rt.model == nil {
 		return 0
 	}
-	n := rt.counter.calls.Load()
-	for _, m := range rt.namedModels {
-		n += m.calls.Load()
-	}
-	return n
+	return rt.model.calls.Load()
 }
 
 // Start implements agent.Runtime.
@@ -710,12 +723,33 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		unlock()
 		return nil, err
 	}
-	input, err := rt.inputMessage(req)
+	if rt.registry != nil && req.ModelRef == nil && req.ModelName == "" {
+		ref, e := rt.registry.Default(ctx, infra.Scope{App: rt.appName, User: req.UserID})
+		if e != nil {
+			unlock()
+			return nil, e
+		}
+		req.ModelRef = &ref
+	}
+	if req.ModelRef != nil {
+		ref := *req.ModelRef
+		req.ModelRef = &ref
+	}
+	selected, caps, key, err := rt.selectModel(ctx, req)
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	owner := ""
+	if req.ModelRef != nil {
+		owner = req.ModelRef.ConnectionID
+	}
+	input, err := inputMessage(req, caps, owner)
 	if err != nil {
 		unlock()
 		return nil, agent.Invalid("attachments", err)
 	}
-	schema, output, err := rt.outputOption(req.Output)
+	schema, output, err := outputOption(req.Output, caps)
 	if err != nil {
 		unlock()
 		return nil, agent.Invalid("output", err)
@@ -723,6 +757,11 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	runID := uuid.NewString()
 	runCtx, cancel := context.WithCancel(ctx)
 	st := newRunState(runID, req.SessionID, req.Mode)
+	st.connectionID = owner
+	st.secrets = rt.secrets
+	if key != "" {
+		st.secrets = append(append([]string(nil), rt.secrets...), key)
+	}
 	st.permission = req.Permission
 	st.requireApproval = req.RequireApproval
 	st.compaction = rt.cfg.Context.Compaction
@@ -736,6 +775,9 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		}
 		runCtx = context.WithValue(runCtx, artifactScopeKey{}, store)
 	}
+	if selected != nil {
+		runCtx = context.WithValue(runCtx, turnModelKey{}, selected)
+	}
 	runCtx = withState(runCtx, st)
 	runCtx = context.WithValue(runCtx, workspaceKey{}, workspace)
 	runOpts := []trpcagent.RunOption{
@@ -748,14 +790,8 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 			"mode": string(req.Mode),
 		}),
 	}
-	if req.ModelName != "" {
-		if m := rt.namedModels[req.ModelName]; m != nil {
-			runOpts = append(runOpts, trpcagent.WithModel(m))
-		} else if req.ModelName != rt.model.Info().Name {
-			cancel()
-			unlock()
-			return nil, agent.Invalid("model_name", fmt.Errorf("unknown configured model %q", req.ModelName))
-		}
+	if selected != nil {
+		runOpts = append(runOpts, trpcagent.WithModel(selected))
 	}
 	if output != nil {
 		runOpts = append(runOpts, output)
@@ -821,7 +857,7 @@ func classifyRunError(err error) error {
 func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID string, st *runState, in <-chan *event.Event, out *eventBox, h *runHandle, unlock func()) {
 	defer rt.finishSession(req.UserID, req.SessionID, runID, st, unlock)
 	defer out.close()
-	conv := newConverter(runID, req.SessionID, rt.maxField, rt.secrets)
+	conv := newConverter(runID, req.SessionID, rt.maxField, st.secrets)
 	conv.schema = st.outputSchema
 	conv.outputAuthor = rootAgentName
 	if req.AgentID != "" {
@@ -831,6 +867,7 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 	}
 	terminal := false
 	var providerFailure *model.ResponseError
+	modelResponded := false
 	emit := func(evt agent.Event) {
 		if evt.RunID == "" {
 			evt.RunID = runID
@@ -855,6 +892,27 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 			evt.Payload = agent.MustPayload(agent.TerminalPayload{Status: string(evt.Kind), Reason: agent.ReasonError, Error: "missing, schema-invalid or redacted structured output"})
 		}
 		if evt.Terminal() {
+			if req.ModelRef != nil && rt.registry != nil {
+				class := ""
+				if value := st.httpClass.Load(); value != nil {
+					class = *value
+				}
+				var body agent.TerminalPayload
+				if json.Unmarshal(evt.Payload, &body) == nil {
+					body.ConnectionID = req.ModelRef.ConnectionID
+					body.Model = req.ModelRef.ModelID
+					if evt.Kind == agent.EventFailed {
+						body.ModelError = class
+						if st.attachmentMismatch.Load() {
+							body.ModelError = "attachment_scope"
+						}
+					}
+					evt.Payload = agent.MustPayload(body)
+				}
+				if modelResponded && evt.Kind == agent.EventCompleted || evt.Kind == agent.EventFailed && class == "model_not_found" {
+					_ = rt.registry.RecordResult(ctx, modelaccess.Native{}, *req.ModelRef, evt.Kind == agent.EventCompleted)
+				}
+			}
 			if h != nil {
 				h.noteResult(evt, ctx.Err() == context.Canceled)
 			}
@@ -901,6 +959,7 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 				}
 				if evt.Error == nil && evt.IsFinalResponse() && len(evt.Choices) > 0 {
 					providerFailure = nil
+					modelResponded = true
 				}
 			}
 			if ctx.Err() != nil {
@@ -1334,6 +1393,7 @@ func (h *runHandle) noteResult(evt agent.Event, startCanceled bool) {
 		defer close(h.resultDone)
 	}
 	h.result = agent.RunStatus{
+		ConnectionID: body.ConnectionID, Model: body.Model, ModelError: body.ModelError,
 		Status:  body.Status,
 		Error:   body.Error,
 		Reason:  body.Reason,

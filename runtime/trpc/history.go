@@ -47,7 +47,7 @@ func (rt *Runtime) SessionHistory(ctx context.Context, userID, sessionID string,
 			if msg.Role == "user" {
 				for i, p := range msg.ContentParts {
 					if a, ok := attachmentPart(p); ok {
-						row.Attachments = append(row.Attachments, agent.AttachmentInfo{Ref: agent.AttachmentRef{EventID: evt.ID, Choice: ci, Part: i}, Kind: a.Kind, Name: clean(a.Name), MIME: a.MIME, FileID: clean(a.FileID), Size: len(a.Data)})
+						row.Attachments = append(row.Attachments, agent.AttachmentInfo{Ref: agent.AttachmentRef{EventID: evt.ID, Choice: ci, Part: i}, Kind: a.Kind, Name: clean(a.Name), MIME: a.MIME, ConnectionID: a.ConnectionID, FileID: clean(a.FileID), Size: len(a.Data)})
 					}
 				}
 			}

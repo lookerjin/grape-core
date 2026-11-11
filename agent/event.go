@@ -110,21 +110,27 @@ const (
 // the consumer has read it. A result that already exists is kept when the
 // stream is abandoned.
 type RunStatus struct {
-	Status   string `json:"status,omitempty"`
-	Error    string `json:"error,omitempty"`
-	Reason   string `json:"reason,omitempty"`
-	Scope    string `json:"scope,omitempty"`
-	AgentID  string `json:"agent_id,omitempty"`
-	Cause    string `json:"cause,omitempty"`
-	Delivery string `json:"delivery,omitempty"`
+	ConnectionID string `json:"connection_id,omitempty"`
+	Model        string `json:"model,omitempty"`
+	ModelError   string `json:"model_error,omitempty"`
+	Status       string `json:"status,omitempty"`
+	Error        string `json:"error,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	Scope        string `json:"scope,omitempty"`
+	AgentID      string `json:"agent_id,omitempty"`
+	Cause        string `json:"cause,omitempty"`
+	Delivery     string `json:"delivery,omitempty"`
 }
 
 type TerminalPayload struct {
-	Status  string `json:"status"`
-	Error   string `json:"error,omitempty"`
-	Reason  string `json:"reason,omitempty"`
-	Scope   string `json:"scope,omitempty"`
-	AgentID string `json:"agent_id,omitempty"`
+	ConnectionID string `json:"connection_id,omitempty"`
+	Model        string `json:"model,omitempty"`
+	ModelError   string `json:"model_error,omitempty"`
+	Status       string `json:"status"`
+	Error        string `json:"error,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	Scope        string `json:"scope,omitempty"`
+	AgentID      string `json:"agent_id,omitempty"`
 }
 
 // ErrorPayload is the body of an error event.

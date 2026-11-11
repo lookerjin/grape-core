@@ -17,6 +17,7 @@ type SubagentCall struct {
 // ContextStatus measures the last root request after native history projection.
 // Byte counts cover message text and text parts; attachments and tool schemas are excluded.
 type ContextStatus struct {
+	ConnectionID                                            string
 	Model                                                   string
 	ContextWindow, Messages, Tools                          int
 	SystemBytes, UserBytes, AssistantBytes, ToolResultBytes int

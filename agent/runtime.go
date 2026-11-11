@@ -24,6 +24,7 @@ const (
 // RunRequest starts one turn. UserID and SessionID identify the session.
 // RunID is assigned by the runtime and is not part of the request.
 type RunRequest struct {
+	ModelRef *ModelRef `json:"model_ref,omitempty"`
 	// Permission may narrow the runtime ceiling. RequireApproval adds an approval gate.
 	Permission      string        `json:"permission,omitempty"`
 	RequireApproval bool          `json:"require_approval,omitempty"`
@@ -130,4 +131,10 @@ type ModelInfo struct {
 	Name, Provider                      string
 	ContextWindow                       int
 	KnownAdapter, Multipart, JSONSchema bool
+}
+
+// ModelRef identifies a model on one specific connection.
+type ModelRef struct {
+	ConnectionID string `json:"connection_id"`
+	ModelID      string `json:"model_id"`
 }

@@ -1,0 +1,10 @@
+version: 1
+sources:
+  - id: models-dev
+    enabled: true
+    kind: http
+    url: https://models.dev/api.json
+    format: modelsdev-provider-v1
+    priority: 100
+    timeout: 8s
+    max_bytes: 16777216

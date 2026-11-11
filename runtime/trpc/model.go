@@ -2,7 +2,9 @@ package trpcruntime
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	infra "github.com/lookerjin/grape-core/model"
 	"os"
 	"sync/atomic"
 
@@ -19,45 +21,50 @@ import (
 
 // countingModel counts GenerateContent calls without changing behavior.
 type countingModel struct {
-	inner model.Model
-	calls atomic.Int64
+	inner  model.Model
+	calls  atomic.Int64
+	owner  string
+	caps   *agent.ModelInfo
+	shared *atomic.Int64
 }
 
 func (m *countingModel) GenerateContent(ctx context.Context, req *model.Request) (<-chan *model.Response, error) {
-	m.calls.Add(1)
+	if m.shared != nil {
+		m.shared.Add(1)
+	} else {
+		m.calls.Add(1)
+	}
+	checked, err := projectFiles(req, m.owner, m.caps)
+	if err != nil {
+		if st := stateFrom(ctx); st != nil {
+			st.attachmentMismatch.Store(errors.Is(err, infra.ErrAttachmentScope))
+		}
+		return nil, err
+	}
+	req = checked
 	stateFrom(ctx).noteProjection(ctx, m.Info(), req)
 	return m.inner.GenerateContent(ctx, req)
 }
 
 func (m *countingModel) Info() model.Info { return m.inner.Info() }
 
-// buildModel returns the injected model or a tRPC provider model.
-func buildModel(cfg config.Config, override model.Model) (model.Model, *countingModel, error) {
-	var inner model.Model
-	if override != nil {
-		inner = override
-	} else {
-		built, err := newProviderModel(cfg)
-		if err != nil {
-			return nil, nil, err
-		}
-		inner = built
+func initialModel(cfg config.Config, injected model.Model) *countingModel {
+	if injected == nil {
+		injected = unboundModel{name: cfg.Model.Name}
 	}
-	wrapped := &countingModel{inner: inner}
-	return wrapped, wrapped, nil
+	return &countingModel{inner: injected}
 }
 
 func newProviderModel(cfg config.Config) (model.Model, error) {
-	if cfg.Model.APIKeyEnv == "" {
-		return nil, agent.Invalid("model.api_key_env", fmt.Errorf("api_key_env is required when no model is injected"))
-	}
-	key := os.Getenv(cfg.Model.APIKeyEnv)
+	return providerWithKey(cfg, os.Getenv(cfg.Model.APIKeyEnv))
+}
+func providerWithKey(cfg config.Config, key string) (model.Model, error) {
 	if key == "" {
-		return nil, agent.Invalid("model.api_key_env", fmt.Errorf("environment %s is empty", cfg.Model.APIKeyEnv))
+		return nil, infra.ErrCredentialUnavailable
 	}
 	name := cfg.Model.Name
 	if name == "" {
-		return nil, agent.Invalid("model.name", fmt.Errorf("model name is required"))
+		return nil, infra.ErrNotConfigured
 	}
 	switch cfg.Model.Provider {
 	case "gemini":

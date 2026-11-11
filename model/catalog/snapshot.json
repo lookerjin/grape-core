@@ -1,0 +1,280 @@
+{
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "npm": "@ai-sdk/openai",
+    "models": {
+      "gpt-5.4-mini": {
+        "id": "gpt-5.4-mini",
+        "name": "GPT-5.4 mini",
+        "family": "gpt-mini",
+        "reasoning": true,
+        "tool_call": true,
+        "structured_output": true,
+        "last_updated": "2026-03-17",
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        },
+        "cost": {
+          "input": 0.75,
+          "output": 4.5,
+          "cache_read": 0.075
+        }
+      }
+    }
+  },
+  "anthropic": {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "npm": "@ai-sdk/anthropic",
+    "models": {
+      "claude-sonnet-4-5": {
+        "id": "claude-sonnet-4-5",
+        "name": "Claude Sonnet 4.5 (latest)",
+        "family": "claude-sonnet",
+        "reasoning": true,
+        "tool_call": true,
+        "structured_output": true,
+        "last_updated": "2025-09-29",
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "pdf"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        },
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        }
+      }
+    }
+  },
+  "google": {
+    "id": "google",
+    "name": "Google",
+    "npm": "@ai-sdk/google",
+    "models": {
+      "gemini-2.5-flash-lite": {
+        "id": "gemini-2.5-flash-lite",
+        "name": "Gemini 2.5 Flash-Lite",
+        "family": "gemini-flash-lite",
+        "reasoning": true,
+        "tool_call": true,
+        "structured_output": true,
+        "last_updated": "2025-06-17",
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "audio",
+            "video",
+            "pdf"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        },
+        "cost": {
+          "input": 0.1,
+          "output": 0.4,
+          "cache_read": 0.01,
+          "input_audio": 0.3
+        }
+      }
+    }
+  },
+  "deepseek": {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "api": "https://api.deepseek.com",
+    "npm": "@ai-sdk/openai-compatible",
+    "models": {
+      "deepseek-v4-pro": {
+        "id": "deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro",
+        "family": "deepseek-thinking",
+        "reasoning": true,
+        "tool_call": true,
+        "structured_output": true,
+        "last_updated": "2026-08-22",
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "limit": {
+          "context": 1048576,
+          "output": 393216
+        },
+        "cost": {
+          "input": 0.66,
+          "output": 1.98,
+          "reasoning": 1.98,
+          "cache_read": 0.022
+        }
+      }
+    }
+  },
+  "alibaba": {
+    "id": "alibaba",
+    "name": "Alibaba",
+    "api": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    "npm": "@ai-sdk/openai-compatible",
+    "models": {
+      "qwen3-max": {
+        "id": "qwen3-max",
+        "name": "Qwen3 Max",
+        "family": "qwen",
+        "reasoning": false,
+        "tool_call": true,
+        "last_updated": "2025-09-23",
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "limit": {
+          "context": 262144,
+          "output": 65536
+        },
+        "cost": {
+          "input": 1.2,
+          "output": 6
+        }
+      }
+    }
+  },
+  "zai": {
+    "id": "zai",
+    "name": "Z.AI",
+    "api": "https://api.z.ai/api/paas/v4",
+    "npm": "@ai-sdk/openai-compatible",
+    "models": {
+      "glm-5": {
+        "id": "glm-5",
+        "name": "GLM-5",
+        "family": "glm",
+        "reasoning": true,
+        "tool_call": true,
+        "last_updated": "2026-02-12",
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "limit": {
+          "context": 204800,
+          "output": 131072
+        },
+        "cost": {
+          "input": 1,
+          "output": 3.2,
+          "cache_read": 0.2,
+          "cache_write": 0
+        }
+      }
+    }
+  },
+  "moonshotai": {
+    "id": "moonshotai",
+    "name": "Moonshot AI",
+    "api": "https://api.moonshot.ai/v1",
+    "npm": "@ai-sdk/openai-compatible",
+    "models": {
+      "kimi-k2.6": {
+        "id": "kimi-k2.6",
+        "name": "Kimi K2.6",
+        "family": "kimi-k2",
+        "reasoning": true,
+        "tool_call": true,
+        "structured_output": true,
+        "last_updated": "2026-04-20",
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "limit": {
+          "context": 262144,
+          "output": 262144
+        },
+        "cost": {
+          "input": 0.95,
+          "output": 4,
+          "cache_read": 0.16
+        }
+      }
+    }
+  },
+  "minimax": {
+    "id": "minimax",
+    "name": "MiniMax (minimax.io)",
+    "api": "https://api.minimax.io/anthropic/v1",
+    "npm": "@ai-sdk/anthropic",
+    "models": {
+      "MiniMax-M2": {
+        "id": "MiniMax-M2",
+        "name": "MiniMax-M2",
+        "family": "minimax",
+        "reasoning": true,
+        "tool_call": true,
+        "last_updated": "2025-10-27",
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "limit": {
+          "context": 204800,
+          "output": 131072
+        },
+        "cost": {
+          "input": 0.3,
+          "output": 1.2
+        }
+      }
+    }
+  }
+}

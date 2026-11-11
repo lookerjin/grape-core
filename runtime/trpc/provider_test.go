@@ -3,8 +3,11 @@ package trpcruntime
 import (
 	"context"
 	"encoding/json"
+	"github.com/lookerjin/grape-core/agent"
+	infra "github.com/lookerjin/grape-core/model"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/lookerjin/grape-core/config"
@@ -12,6 +15,21 @@ import (
 )
 
 func TestNativeProviderRequests(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	reg, err := infra.Open(infra.Options{Scope: infra.Scope{App: "wire", User: "user"}, Database: filepath.Join(dir, "models.db"), Store: &infra.MemoryStore{}, AllowLoopbackHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	conf := config.Default()
+	stream := false
+	conf.Model.Generation.Stream = &stream
+	rt, err := New(Options{AppName: "wire", Config: &conf, DataDir: dir, ModelRegistry: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
 	for _, tc := range []struct{ provider, path, header, input, response string }{
 		{"anthropic", "/v1/messages", "X-Api-Key", "messages", `{"id":"one","model":"demo","role":"assistant","type":"message","content":[{"type":"text","text":"native reply"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}`},
 		{"gemini", "/v1beta/models/demo:generateContent", "X-Goog-Api-Key", "contents", `{"candidates":[{"content":{"role":"model","parts":[{"text":"native reply"}]},"finishReason":"STOP"}]}`},
@@ -51,6 +69,23 @@ func TestNativeProviderRequests(t *testing.T) {
 				for _, choice := range r.Choices {
 					reply += choice.Message.Content
 				}
+			}
+			protocol := infra.Messages
+			if tc.provider == "gemini" {
+				protocol = infra.Gemini
+			}
+			c, err := reg.AddKey(ctx, infra.Provider{ID: tc.provider, Protocol: protocol, Endpoint: server.URL}, tc.provider, "test-native-key")
+			if err != nil {
+				t.Fatal(err)
+			}
+			h, err := rt.Start(ctx, agent.RunRequest{UserID: "user", SessionID: "shared", Message: "hello", ModelRef: &agent.ModelRef{ConnectionID: c.ID, ModelID: "demo"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range h.Events() {
+			}
+			if status := h.Status(); status.Status != "completed" || status.ConnectionID != c.ID {
+				t.Fatal(status)
 			}
 			if reply != "native reply" {
 				t.Fatalf("reply %q", reply)

@@ -10,6 +10,6 @@ This repository is a single Go module, `github.com/lookerjin/grape-core`. It is 
 - `llmagent.WithEnableCodeExecutionResponseProcessor(false)` is mandatory. Skills must not fall back to an implicit local code executor.
 - `workspace_write` uses the managed OS sandbox. If the preflight fails, command execution returns `agent.ErrSandboxUnavailable`. It must not fall back to a host shell.
 - Windows has no managed native sandbox in this tree. That path returns `agent.ErrSandboxUnavailable`. Do not describe Job Objects, WSL, or Docker as that backend.
-- API keys are read from the environment or an injected model. They are not written into config files, events, or journals.
+- Model credentials come from trusted environment references, scoped credential stores or an injected model. Catalog data never selects credential destinations. They are not written into config files, events, or journals.
 - Default data directory: `~/.grape-core` on Unix, `%AppData%\grape-core` on Windows.
 - Memory and Evolution stay off unless the config enables them.

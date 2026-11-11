@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,6 +18,10 @@ import (
 )
 
 type runState struct {
+	httpClass                 atomic.Pointer[string]
+	attachmentMismatch        atomic.Bool
+	connectionID              string
+	secrets                   []string
 	children                  map[string]*childCall
 	projection                agent.ContextStatus
 	hasProjection, compaction bool

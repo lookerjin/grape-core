@@ -14,10 +14,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lookerjin/grape-core/agent"
+	infra "github.com/lookerjin/grape-core/model"
 )
 
 // TaskHost runs work on a context it owns. Runtime.Start still uses the
 // caller context. Cancelling some other context does not stop a hosted task.
+type backgroundModelKey struct{}
+
 type TaskHost struct {
 	rt    *Runtime
 	index string
@@ -156,6 +159,17 @@ func (h *TaskHost) clearCancel(id string) {
 // Start launches req on a host-owned context and returns immediately.
 func (h *TaskHost) Start(req agent.RunRequest) (agent.Task, error) {
 	// Start runs asynchronously. Retain no caller-owned attachment or schema buffers.
+	if h.rt.registry != nil && req.ModelRef == nil && req.ModelName == "" {
+		ref, e := h.rt.registry.Default(context.Background(), infra.Scope{App: h.rt.appName, User: req.UserID})
+		if e != nil {
+			return agent.Task{}, e
+		}
+		req.ModelRef = &ref
+	}
+	if req.ModelRef != nil {
+		ref := *req.ModelRef
+		req.ModelRef = &ref
+	}
 	req.Attachments = slices.Clone(req.Attachments)
 	for i := range req.Attachments {
 		req.Attachments[i].Data = bytes.Clone(req.Attachments[i].Data)
@@ -191,7 +205,7 @@ func (h *TaskHost) Start(req agent.RunRequest) (agent.Task, error) {
 	}
 	go func() {
 		defer h.wg.Done()
-		h.run(ctx, task, req)
+		h.run(context.WithValue(ctx, backgroundModelKey{}, true), task, req)
 	}()
 	return task, nil
 }

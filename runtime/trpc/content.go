@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/lookerjin/grape-core/agent"
+	infra "github.com/lookerjin/grape-core/model"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -25,12 +26,11 @@ var schemaName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
 // The OpenAI adapter infers three variant protocols from their official hosts,
 // even for an openai_compatible config. Some variants omit binary content.
-func (rt *Runtime) protocol() string {
-	provider := rt.cfg.Model.Provider
+func modelProtocol(provider, baseURL string) string {
 	if provider != "" && provider != "openai" && provider != "openai_compatible" {
 		return provider
 	}
-	endpoint, err := url.Parse(rt.cfg.Model.BaseURL)
+	endpoint, err := url.Parse(baseURL)
 	if err != nil {
 		return provider
 	}
@@ -45,7 +45,7 @@ func (rt *Runtime) protocol() string {
 	return provider
 }
 
-func (rt *Runtime) inputMessage(req agent.RunRequest) (model.Message, error) {
+func inputMessage(req agent.RunRequest, caps agent.ModelInfo, owner string) (model.Message, error) {
 	msg := model.NewUserMessage(req.Message)
 	if len(req.Attachments) == 0 {
 		return msg, nil
@@ -53,8 +53,8 @@ func (rt *Runtime) inputMessage(req agent.RunRequest) (model.Message, error) {
 	if len(req.Attachments) > 16 {
 		return msg, fmt.Errorf("at most 16 attachments")
 	}
-	provider := rt.protocol()
-	if !rt.injectedModel && !rt.modelInfo(rt.counter).Multipart {
+	provider := caps.Provider
+	if caps.KnownAdapter && !caps.Multipart {
 		return msg, fmt.Errorf("attachment support is not established for provider %q", provider)
 	}
 	if req.Message != "" {
@@ -71,10 +71,17 @@ func (rt *Runtime) inputMessage(req agent.RunRequest) (model.Message, error) {
 			return msg, fmt.Errorf("invalid display name")
 		}
 		if a.FileID != "" {
-			if a.Kind != "file" || len(a.Data) != 0 || !fileIDPattern.MatchString(a.FileID) || (!rt.injectedModel && provider != "openai" && provider != "" && provider != "openai_compatible") {
+			if a.ConnectionID != owner {
+				return msg, infra.ErrAttachmentScope
+			}
+			id := a.FileID
+			if owner != "" {
+				id = "grape-file/" + owner + "/" + id
+			}
+			if a.Kind != "file" || len(a.Data) != 0 || !fileIDPattern.MatchString(a.FileID) || (caps.KnownAdapter && provider != "openai" && provider != "" && provider != "openai_compatible") {
 				return msg, fmt.Errorf("unsupported provider file reference")
 			}
-			msg.ContentParts = append(msg.ContentParts, model.ContentPart{Type: model.ContentTypeFile, File: &model.File{Name: a.Name, FileID: a.FileID, MimeType: mt}})
+			msg.ContentParts = append(msg.ContentParts, model.ContentPart{Type: model.ContentTypeFile, File: &model.File{Name: a.Name, FileID: id, MimeType: mt}})
 			continue
 		}
 		if len(a.Data) == 0 || len(a.Data) > 8<<20 || total+len(a.Data) > 16<<20 {
@@ -94,7 +101,7 @@ func (rt *Runtime) inputMessage(req agent.RunRequest) (model.Message, error) {
 			if a.Name == "" {
 				return msg, fmt.Errorf("inline file requires name")
 			}
-			if !rt.injectedModel && provider == "anthropic" && mt != "application/pdf" && mt != "text/plain" {
+			if caps.KnownAdapter && provider == "anthropic" && mt != "application/pdf" && mt != "text/plain" {
 				return msg, fmt.Errorf("unsupported Anthropic document MIME")
 			}
 			msg.AddFileData(a.Name, bytes.Clone(a.Data), mt)
@@ -105,11 +112,11 @@ func (rt *Runtime) inputMessage(req agent.RunRequest) (model.Message, error) {
 	return msg, nil
 }
 
-func (rt *Runtime) outputOption(out *agent.OutputSchema) (*jsonschema.Schema, trpcagent.RunOption, error) {
+func outputOption(out *agent.OutputSchema, caps agent.ModelInfo) (*jsonschema.Schema, trpcagent.RunOption, error) {
 	if out == nil {
 		return nil, nil, nil
 	}
-	if !rt.injectedModel && !rt.modelInfo(rt.counter).JSONSchema {
+	if caps.KnownAdapter && !caps.JSONSchema {
 		return nil, nil, fmt.Errorf("provider does not expose native schema mode")
 	}
 	var doc map[string]any
@@ -137,7 +144,8 @@ func attachmentPart(p model.ContentPart) (agent.Attachment, bool) {
 		return agent.Attachment{Kind: "image", MIME: "image/" + strings.TrimPrefix(p.Image.Format, "image/"), Data: p.Image.Data}, true
 	}
 	if p.File != nil && (len(p.File.Data) > 0 || p.File.FileID != "") {
-		return agent.Attachment{Kind: "file", Name: p.File.Name, MIME: p.File.MimeType, FileID: p.File.FileID, Data: p.File.Data}, true
+		owner, id := splitFileID(p.File.FileID)
+		return agent.Attachment{ConnectionID: owner, Kind: "file", Name: p.File.Name, MIME: p.File.MimeType, FileID: id, Data: p.File.Data}, true
 	}
 	return agent.Attachment{}, false
 }
