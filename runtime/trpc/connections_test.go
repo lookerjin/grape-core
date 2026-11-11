@@ -135,10 +135,10 @@ func TestConnectionsAndScopedAttachments(t *testing.T) {
 		t.Fatal("attachment ownership lost after restart")
 	}
 	marks, err := rt.Checkpoints(ctx, "u", "s")
-	if err != nil || len(marks) != 3 {
+	if err != nil || len(marks) != 4 || !marks[0].Baseline {
 		t.Fatal(marks, err)
 	}
-	child, err := rt.ForkSession(ctx, "u", "s", marks[2].RunID)
+	child, err := rt.ForkSession(ctx, "u", "s", marks[3].RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestConnectionsAndScopedAttachments(t *testing.T) {
 	if aCalls.Load() != 3 || bCalls.Load() != 1 {
 		t.Fatalf("wire calls %d %d", aCalls.Load(), bCalls.Load())
 	}
-	if e := rt.RewindSession(ctx, "u", "s", marks[1].RunID); e != nil {
+	if e := rt.RewindSession(ctx, "u", "s", marks[2].RunID); e != nil {
 		t.Fatal(e)
 	}
 	if _, e := rt.ReadAttachment(ctx, "u", "s", fileRef); e == nil {

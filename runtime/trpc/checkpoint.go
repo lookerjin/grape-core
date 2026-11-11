@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lookerjin/grape-core/agent"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	sqlitesession "trpc.group/trpc-go/trpc-agent-go/session/sqlite"
 )
 
@@ -37,6 +38,32 @@ func (rt *Runtime) checkpointScope(user, id string) error {
 	}
 	return nil
 }
+
+// ensureBaseline is called under the session lock after request validation,
+// before Runner.Run can append input or execute a tool.
+func (rt *Runtime) ensureBaseline(ctx context.Context, user, id string) error {
+	key := session.Key{AppName: rt.appName, UserID: user, SessionID: id}
+	sess, err := rt.sessions.GetSession(ctx, key, session.WithEventNum(1))
+	if err != nil {
+		return err
+	}
+	if sess == nil {
+		if _, err = rt.sessions.CreateSession(ctx, key, nil); err != nil {
+			return err
+		}
+	}
+	// Never invent an original boundary for pre-existing conversation or writes.
+	// A baseline at event/file zero is meaningful only for a genuinely empty session.
+	_, err = rt.turnDB.ExecContext(ctx, `INSERT OR IGNORE INTO grape_turns(state_id,run_id,last_event,last_track,last_file,state)
+	SELECT s.id,?,0,0,0,s.state FROM session_states s WHERE `+sessionScope+`
+	AND NOT EXISTS(SELECT 1 FROM session_events WHERE `+sessionScope+`)
+	AND NOT EXISTS(SELECT 1 FROM session_track_events WHERE `+sessionScope+`)
+	AND NOT EXISTS(SELECT 1 FROM grape_file_changes WHERE state_id=s.id)
+	AND NOT EXISTS(SELECT 1 FROM grape_turns WHERE state_id=s.id)`,
+		agent.SessionBaselineID, rt.appName, user, id, rt.appName, user, id, rt.appName, user, id)
+	return err
+}
+
 func (rt *Runtime) commitTurn(ctx context.Context, user, id, run string) error {
 	res, err := rt.turnDB.ExecContext(ctx, `INSERT INTO grape_turns(state_id,run_id,last_event,last_track,last_file,state)
 	SELECT s.id,?,(SELECT MAX(id) FROM session_events WHERE `+sessionScope+` AND json_extract(CAST(event AS TEXT),'$.requestID')=?),
@@ -71,10 +98,11 @@ func (rt *Runtime) boundary(ctx context.Context, tx *sql.Tx, user, id, run strin
 	if err != nil {
 		return b, agent.Wrap(agent.ErrSession, "checkpoint", err)
 	}
+	b.Baseline = b.RunID == agent.SessionBaselineID
 	return b, nil
 }
 
-// Checkpoints lists successfully committed conversation boundaries oldest first.
+// Checkpoints lists the original baseline, when known, followed by successful turn boundaries.
 func (rt *Runtime) Checkpoints(ctx context.Context, user, id string) ([]agent.TurnCheckpoint, error) {
 	if err := rt.checkpointScope(user, id); err != nil {
 		return nil, err
@@ -90,12 +118,13 @@ func (rt *Runtime) Checkpoints(ctx context.Context, user, id string) ([]agent.Tu
 		if err = rows.Scan(&b.RunID, &b.ParentSession, &b.ParentRun); err != nil {
 			return nil, err
 		}
+		b.Baseline = b.RunID == agent.SessionBaselineID
 		out = append(out, b)
 	}
 	return out, rows.Err()
 }
 
-// ForkSession creates a new session from a completed turn in one SQLite transaction.
+// ForkSession creates a new session from a baseline or completed turn in one SQLite transaction.
 func (rt *Runtime) ForkSession(ctx context.Context, user, id, run string) (string, error) {
 	if err := rt.checkpointScope(user, id); err != nil {
 		return "", err

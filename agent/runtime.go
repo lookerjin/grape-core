@@ -149,8 +149,14 @@ type ModelRef struct {
 	ModelID      string `json:"model_id"`
 }
 
-// TurnCheckpoint identifies a completed conversation prefix. Forks carry their source.
+// SessionBaselineID identifies the persisted state before a new session's first turn.
+// Pass it to the existing fork, preview and rewind APIs like a completed Run ID.
+const SessionBaselineID = "baseline"
+
+// TurnCheckpoint identifies a conversation boundary. Baseline is not a completed Run.
+// Forks carry their source.
 type TurnCheckpoint struct {
+	Baseline      bool   `json:"baseline,omitempty"`
 	RunID         string `json:"run_id"`
 	ParentSession string `json:"parent_session,omitempty"`
 	ParentRun     string `json:"parent_run,omitempty"`
@@ -166,7 +172,9 @@ type SideAnswer struct {
 // FileRestorePlan is bound to the session, checkpoint, change history and observed file versions.
 type FileRestorePlan struct {
 	Digest string
-	Files  []FileRestoreItem
+	// TrackingScope names the write sources represented by this plan.
+	TrackingScope []string
+	Files         []FileRestoreItem
 }
 type FileRestoreItem struct{ Root, Path, Expected, Actual, Target, Conflict, Action string }
 
@@ -178,3 +186,6 @@ type RecoveryRecord struct {
 	ID, RunID, Kind, Status, Detail string
 	CreatedAt                       time.Time
 }
+
+// RecoveryLimits describes fixed storage bounds. Session byte caps count encoded database blobs.
+type RecoveryLimits struct{ FileBytes, SessionChangeBytes, SessionBackupBytes int }

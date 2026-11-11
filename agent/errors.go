@@ -5,6 +5,7 @@ import "errors"
 // Sentinel errors distinguish the public failure classes. Wrap them with
 // [Error] so callers can use errors.Is and still read the operation.
 var (
+	ErrCheckpointLimit    = errors.New("checkpoint storage limit exceeded")
 	ErrInvalidConfig      = errors.New("invalid config")
 	ErrPermissionDenied   = errors.New("permission denied")
 	ErrSandboxUnavailable = errors.New("sandbox unavailable")

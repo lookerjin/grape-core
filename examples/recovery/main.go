@@ -33,12 +33,18 @@ func run() error {
 		return e
 	}
 	defer os.RemoveAll(dir)
+	written := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var q struct {
 			Messages []struct{ Role, Content string }
 		}
 		if e := json.NewDecoder(r.Body).Decode(&q); e != nil || len(q.Messages) == 0 {
 			http.Error(w, "invalid request", 400)
+			return
+		}
+		if q.Messages[len(q.Messages)-1].Role == "tool" {
+			close(written)
+			<-r.Context().Done()
 			return
 		}
 		msg := map[string]any{"role": "assistant", "content": "remembered baseline"}
@@ -82,25 +88,45 @@ func run() error {
 		return e
 	}
 	defer rt.Close()
-	turn := func(msg string) (string, error) {
-		h, e := rt.Start(ctx, agent.RunRequest{UserID: "local", SessionID: "main", Message: msg})
-		if e != nil {
-			return "", e
-		}
-		for range h.Events() {
-		}
-		if h.Status().Status != "completed" {
-			return "", fmt.Errorf("run: %+v", h.Status())
-		}
-		return h.ID(), nil
-	}
-	base, e := turn("baseline")
+	h, e := rt.Start(ctx, agent.RunRequest{UserID: "local", SessionID: "main", Message: "edit"})
 	if e != nil {
 		return e
 	}
-	if _, e = turn("edit"); e != nil {
+	select {
+	case <-written:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if e = h.Cancel(); e != nil {
 		return e
 	}
+	for range h.Events() {
+	}
+	if h.Status().Status != "cancelled" {
+		return fmt.Errorf("expected cancellation: %+v", h.Status())
+	}
+	marks, e := rt.Checkpoints(ctx, "local", "main")
+	if e != nil {
+		return e
+	}
+	if len(marks) != 1 || !marks[0].Baseline {
+		return errors.New("first-turn baseline missing")
+	}
+	base := marks[0].RunID
+	fmt.Println("first turn:", h.Status().Status, "checkpoint:", base)
+	if e = rt.Close(); e != nil {
+		return e
+	}
+	rt, e = core.New(core.Options{AppName: "recovery", ModelRegistry: reg, Config: &cfg, DataDir: dir, TurnCheckpoints: true})
+	if e != nil {
+		return e
+	}
+	defer rt.Close()
+	marks, e = rt.Checkpoints(ctx, "local", "main")
+	if e != nil || len(marks) != 1 || !marks[0].Baseline {
+		return errors.New("baseline lost after restart")
+	}
+	fmt.Println("baseline restored after runtime restart")
 	fork, e := rt.ForkSession(ctx, "local", "main", base)
 	if e != nil {
 		return e

@@ -20,6 +20,8 @@ type FileImage struct {
 
 const MaxImageBytes = 1 << 20
 
+var ErrImageTooLarge = errors.New("file image exceeds size limit")
+
 func (i FileImage) Digest() string {
 	if !i.Exists {
 		return "absent"
@@ -60,7 +62,7 @@ func (r *Directory) Image(path string) (FileImage, error) {
 		return image, err
 	}
 	if len(data) > MaxImageBytes {
-		return image, fmt.Errorf("snapshot exceeds %d bytes", MaxImageBytes)
+		return image, fmt.Errorf("%w: %d bytes", ErrImageTooLarge, MaxImageBytes)
 	}
 	return FileImage{true, data, actual.Mode().Perm()}, nil
 }
@@ -89,7 +91,7 @@ func (r *Directory) ReplaceImage(path, expected string, next FileImage) error {
 		return r.root.Remove(name)
 	}
 	if len(next.Data) > MaxImageBytes {
-		return fmt.Errorf("snapshot exceeds %d bytes", MaxImageBytes)
+		return fmt.Errorf("%w: %d bytes", ErrImageTooLarge, MaxImageBytes)
 	}
 	dir := filepath.Dir(name)
 	if err = r.root.MkdirAll(dir, 0755); err != nil {

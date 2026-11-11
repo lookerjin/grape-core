@@ -67,6 +67,9 @@ func (rt *Runtime) trackWrite(ctx context.Context, d *coding.Directory, path str
 	}
 	path = filepath.Clean(path)
 	before, err := d.Image(path)
+	if errors.Is(err, coding.ErrImageTooLarge) {
+		return agent.Wrap(agent.ErrCheckpointLimit, "file", err)
+	}
 	if err != nil {
 		return err
 	}
@@ -75,7 +78,7 @@ func (rt *Runtime) trackWrite(ctx context.Context, d *coding.Directory, path str
 		return err
 	}
 	if len(after.Data) > coding.MaxImageBytes {
-		return errors.New("change exceeds checkpoint size")
+		return agent.Wrap(agent.ErrCheckpointLimit, "file", coding.ErrImageTooLarge)
 	}
 	expected := after.Digest()
 	if before.Digest() == expected {
@@ -91,7 +94,7 @@ func (rt *Runtime) trackWrite(ctx context.Context, d *coding.Directory, path str
 		return err
 	}
 	if n, e := res.RowsAffected(); e != nil || n != 1 {
-		return errors.New("session missing or checkpoint storage limit exceeded")
+		return agent.Wrap(agent.ErrCheckpointLimit, "session changes", errors.New("checkpoint could not be reserved"))
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -113,7 +116,7 @@ type restoreFile struct {
 }
 
 func (rt *Runtime) restorePlan(ctx context.Context, user, id, run string) (agent.FileRestorePlan, []restoreFile, error) {
-	var plan agent.FileRestorePlan
+	plan := agent.FileRestorePlan{TrackingScope: []string{"save_file", "replace_content"}}
 	if err := rt.checkpointScope(user, id); err != nil {
 		return plan, nil, err
 	}
@@ -318,7 +321,7 @@ func (rt *Runtime) RestoreFiles(ctx context.Context, user, id, run, digest strin
 			res, e := rt.turnDB.ExecContext(ctx, `INSERT INTO grape_backups SELECT ?,?,?,?,?,?,?,'prepared' WHERE COALESCE((SELECT SUM(length(b.image)) FROM grape_backups b JOIN grape_recoveries r1 ON r1.id=b.op JOIN grape_recoveries r2 ON r1.state_id=r2.state_id WHERE r2.id=?),0)+?<=67108864`, r.ID, f.Root, f.Path, raw, f.first, f.last, f.Target, r.ID, len(raw))
 			if e == nil {
 				if n, _ := res.RowsAffected(); n != 1 {
-					return errors.New("backup limit reached")
+					return agent.Wrap(agent.ErrCheckpointLimit, "backups", errors.New("backup could not be reserved"))
 				}
 			}
 			if e != nil {
@@ -444,4 +447,9 @@ func (rt *Runtime) RecoveryBackups(ctx context.Context, user, id, op string) ([]
 		out = append(out, b)
 	}
 	return out, rows.Err()
+}
+
+// RecoveryLimits reports the current fixed limits without scanning the workspace.
+func (rt *Runtime) RecoveryLimits() agent.RecoveryLimits {
+	return agent.RecoveryLimits{FileBytes: coding.MaxImageBytes, SessionChangeBytes: 32 << 20, SessionBackupBytes: 64 << 20}
 }

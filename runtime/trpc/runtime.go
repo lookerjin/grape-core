@@ -846,6 +846,13 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		// runner. Grape does not keep its own agent registry.
 		runOpts = append(runOpts, trpcagent.WithAgentByName(req.AgentID))
 	}
+	if rt.turnDB != nil {
+		if err := rt.ensureBaseline(runCtx, req.UserID, req.SessionID); err != nil {
+			cancel()
+			unlock()
+			return nil, agent.Wrap(agent.ErrSession, "baseline", err)
+		}
+	}
 	events, err := rt.runner.Run(
 		runCtx,
 		req.UserID,
@@ -1345,7 +1352,12 @@ func (rt *Runtime) ListSessions(ctx context.Context, userID string) ([]agent.Ses
 
 // DeleteSession removes one session.
 func (rt *Runtime) DeleteSession(ctx context.Context, userID, sessionID string) error {
-	err := rt.sessions.DeleteSession(ctx, session.Key{
+	unlock, err := rt.lockSession(ctx, userID, sessionID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	err = rt.sessions.DeleteSession(ctx, session.Key{
 		AppName:   rt.appName,
 		UserID:    userID,
 		SessionID: sessionID,
