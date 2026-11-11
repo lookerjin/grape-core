@@ -57,21 +57,22 @@ func TestOAuthAgentLifecycle(t *testing.T) {
 			}
 		case "/me":
 			fmt.Fprint(w, `{"sub":"provider-account"}`)
-		case "/v1/models":
+		case "/v1/account/models":
 			if r.Header.Get("Authorization") != "Bearer renewed" {
 				t.Error("wrong discovery credential")
 			}
-			fmt.Fprint(w, `{"data":[{"id":"research"}]}`)
-		case "/v1/chat/completions":
+			fmt.Fprint(w, `{"models":["research"]}`)
+		case "/v1/tenant/infer":
 			if r.Header.Get("Authorization") != "Bearer renewed" {
 				t.Error("wrong inference credential")
 			}
 			requests.Add(1)
 			var req struct {
+				Effort   string `json:"reasoning_effort"`
 				Stream   bool
 				Messages []struct{ Role string }
 			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !req.Stream {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !req.Stream || req.Effort != "high" {
 				t.Error("invalid streaming request")
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -88,6 +89,11 @@ func TestOAuthAgentLifecycle(t *testing.T) {
 	defer s.Close()
 	uri = s.URL
 	p := infra.NewOAuthProvider(infra.Provider{ID: "fixture", Protocol: infra.Chat, Endpoint: s.URL + "/v1"}, oauth2.Config{ClientID: "our-app", Scopes: []string{"inference-api"}, Endpoint: oauth2.Endpoint{AuthURL: s.URL + "/authorize", TokenURL: s.URL + "/token", DeviceAuthURL: s.URL + "/device"}}, s.URL+"/me", "inference-api")
+	p = p.WithInferenceRoutes(infra.InferenceRoutes{Generate: "/tenant/infer", Models: "/account/models", DecodeModels: func(raw json.RawMessage) ([]string, error) {
+		var v struct{ Models []string }
+		e := json.Unmarshal(raw, &v)
+		return v.Models, e
+	}})
 	o := infra.Options{Database: filepath.Join(t.TempDir(), "registry"), Scope: infra.Scope{App: "local", User: "u"}, AllowLoopbackHTTP: true, Store: &infra.MemoryStore{}, OAuth: []infra.OAuthProvider{p}}
 	reg, e := infra.Open(o)
 	if e != nil {
@@ -168,7 +174,7 @@ func TestOAuthAgentLifecycle(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer rt.Close()
-	h, e := rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "s", Message: "list files", ModelRef: &ref})
+	h, e := rt.Start(ctx, agent.RunRequest{UserID: "u", SessionID: "s", Message: "list files", Reasoning: &agent.ReasoningOptions{Effort: "high"}, ModelRef: &ref})
 	if e != nil {
 		t.Fatal(e)
 	}

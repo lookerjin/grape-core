@@ -26,9 +26,14 @@ const (
 
 // Usage is optional token accounting copied from the model response.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens,omitempty"`
-	CompletionTokens int `json:"completion_tokens,omitempty"`
-	TotalTokens      int `json:"total_tokens,omitempty"`
+	// The pinned provider adapters cannot distinguish an omitted detail from an exact zero.
+	Source           string `json:"source,omitempty"`
+	CacheReadTokens  *int   `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens *int   `json:"cache_write_tokens,omitempty"`
+	ReasoningTokens  *int   `json:"reasoning_tokens,omitempty"`
+	PromptTokens     int    `json:"prompt_tokens,omitempty"`
+	CompletionTokens int    `json:"completion_tokens,omitempty"`
+	TotalTokens      int    `json:"total_tokens,omitempty"`
 }
 
 // Event is one item in a run stream.

@@ -2,7 +2,7 @@ package model
 
 import (
 	"context"
-	"encoding/json"
+
 	"errors"
 	"fmt"
 	"io"
@@ -65,10 +65,22 @@ func (r *Registry) Discover(ctx context.Context, id string) ([]AccountModel, err
 	if e != nil {
 		return nil, e
 	}
-	if b.Provider.Protocol != Chat {
+	route := "/models"
+	decode := defaultModelIDs
+	c, _, e := r.connection(ctx, r.db, id)
+	if e != nil {
+		return nil, e
+	}
+	if c.Method == "oauth" {
+		w := r.oauth[c.Provider.ID].inferenceRoutes()
+		route = w.Models
+		if w.DecodeModels != nil {
+			decode = w.DecodeModels
+		}
+	} else if b.Provider.Protocol != Chat {
 		return nil, errors.New("models endpoint not supported for this protocol")
 	}
-	q, e := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(b.Provider.Endpoint, "/")+"/models", nil)
+	q, e := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(b.Provider.Endpoint, "/")+route, nil)
 	if e != nil {
 		return nil, e
 	}
@@ -87,9 +99,9 @@ func (r *Registry) Discover(ctx context.Context, id string) ([]AccountModel, err
 	if e != nil || len(data) > limit {
 		return nil, errors.New("invalid model discovery response")
 	}
-	var body struct{ Data []struct{ ID string } }
-	if json.Unmarshal(data, &body) != nil || body.Data == nil {
-		return nil, errors.New("invalid models list")
+	ids, e := decode(data)
+	if e != nil {
+		return nil, errors.New("invalid model discovery response")
 	}
 	known, e := r.Models(ctx, id)
 	if e != nil {
@@ -99,9 +111,9 @@ func (r *Registry) Discover(ctx context.Context, id string) ([]AccountModel, err
 	for _, v := range known {
 		entries[v.ID] = v
 	}
-	for _, v := range body.Data {
-		if v.ID != "" && entries[v.ID].ID == "" {
-			entries[v.ID] = AccountModel{ID: v.ID, Availability: "unknown", Source: "provider"}
+	for _, id := range ids {
+		if id != "" && entries[id].ID == "" {
+			entries[id] = AccountModel{ID: id, Availability: "unknown", Source: "provider"}
 		}
 	}
 	out := make([]AccountModel, 0, len(entries))

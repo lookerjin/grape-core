@@ -129,6 +129,9 @@ func (st *runState) noteProjection(ctx context.Context, m model.Info, req *model
 		return
 	}
 	status := agent.ContextStatus{ConnectionID: st.connectionID, Model: m.Name, ContextWindow: m.ContextWindow, Messages: len(req.Messages), Tools: len(req.Tools), CompactionEnabled: st.compaction}
+	if n, e := model.NewSimpleTokenCounter().CountTokensRange(ctx, req.Messages, 0, len(req.Messages)); e == nil {
+		status.EstimatedMessageTokens = &n
+	}
 	for _, msg := range req.Messages {
 		n := len(msg.Content)
 		for _, p := range msg.ContentParts {

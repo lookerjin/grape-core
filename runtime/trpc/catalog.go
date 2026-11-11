@@ -7,6 +7,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 
 	"github.com/lookerjin/grape-core/agent"
+	infra "github.com/lookerjin/grape-core/model"
 )
 
 func (rt *Runtime) prepareModels(injected bool) error {
@@ -38,5 +39,23 @@ func (rt *Runtime) modelInfo(i model.Info) agent.ModelInfo {
 func capabilities(i model.Info, p string, known bool) agent.ModelInfo {
 	multi := known && slices.Contains([]string{"", "openai", "openai_compatible", "gemini", "anthropic"}, p)
 
-	return agent.ModelInfo{Name: i.Name, ContextWindow: i.ContextWindow, Provider: p, KnownAdapter: known, Multipart: multi, JSONSchema: multi && p != "anthropic"}
+	effort, budget := reasoningSupport(p, i.Name, known)
+	return agent.ModelInfo{ReasoningEffortSupport: effort, ThinkingBudgetSupport: budget, Name: i.Name, ContextWindow: i.ContextWindow, Provider: p, KnownAdapter: known, Multipart: multi, JSONSchema: multi && p != "anthropic"}
+}
+
+// ConnectionModelInfo describes the native wire adapter without contacting
+// the provider or resolving credentials. It does not establish entitlement.
+func ConnectionModelInfo(c infra.Connection, name string) agent.ModelInfo {
+	protocol := ""
+	switch c.Provider.Protocol {
+	case infra.Chat:
+		protocol = modelProtocol("openai_compatible", c.Provider.Endpoint)
+	case infra.Messages:
+		protocol = "anthropic"
+	case infra.Gemini:
+		protocol = "gemini"
+	default:
+		return capabilities(unboundModel{name}.Info(), "unknown", false)
+	}
+	return capabilities(unboundModel{name}.Info(), protocol, true)
 }

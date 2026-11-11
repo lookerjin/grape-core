@@ -21,10 +21,17 @@ const (
 	PermissionDangerFullAccess = "danger_full_access"
 )
 
+// ReasoningOptions selects one provider-native control for this turn. Zero uses provider defaults.
+type ReasoningOptions struct {
+	Effort       string `json:"effort,omitempty"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
 // RunRequest starts one turn. UserID and SessionID identify the session.
 // RunID is assigned by the runtime and is not part of the request.
 type RunRequest struct {
-	ModelRef *ModelRef `json:"model_ref,omitempty"`
+	Reasoning *ReasoningOptions `json:"reasoning,omitempty"`
+	ModelRef  *ModelRef         `json:"model_ref,omitempty"`
 	// Permission may narrow the runtime ceiling. RequireApproval adds an approval gate.
 	Permission      string        `json:"permission,omitempty"`
 	RequireApproval bool          `json:"require_approval,omitempty"`
@@ -128,9 +135,10 @@ type HistoryToolCall struct {
 
 // ModelInfo describes a configured model and the request features its adapter exposes.
 type ModelInfo struct {
-	Name, Provider                      string
-	ContextWindow                       int
-	KnownAdapter, Multipart, JSONSchema bool
+	ReasoningEffortSupport, ThinkingBudgetSupport string
+	Name, Provider                                string
+	ContextWindow                                 int
+	KnownAdapter, Multipart, JSONSchema           bool
 }
 
 // ModelRef identifies a model on one specific connection.

@@ -330,14 +330,34 @@ func (c *converter) base(evt *event.Event, kind agent.EventKind, payload json.Ra
 	if requestID != "" {
 		ev.RunID = requestID
 	}
-	if usage != nil && (usage.TotalTokens > 0 || usage.PromptTokens > 0 || usage.CompletionTokens > 0) {
-		ev.Usage = &agent.Usage{
-			PromptTokens:     usage.PromptTokens,
-			CompletionTokens: usage.CompletionTokens,
-			TotalTokens:      usage.TotalTokens,
-		}
-	}
+	ev.Usage = publicUsage(usage)
 	return ev
+}
+
+func publicUsage(u *model.Usage) *agent.Usage {
+	if u == nil {
+		return nil
+	}
+	read := u.PromptTokensDetails.CacheReadTokens
+	if read == 0 {
+		read = u.PromptTokensDetails.CachedTokens
+	}
+	write := u.PromptTokensDetails.CacheCreationTokens
+	reason := u.CompletionTokensDetails.ReasoningTokens
+	if u.TotalTokens == 0 && u.PromptTokens == 0 && u.CompletionTokens == 0 && read == 0 && write == 0 && reason == 0 {
+		return nil
+	}
+	out := &agent.Usage{Source: "provider", PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, TotalTokens: u.TotalTokens}
+	if read > 0 {
+		out.CacheReadTokens = &read
+	}
+	if write > 0 {
+		out.CacheWriteTokens = &write
+	}
+	if reason > 0 {
+		out.ReasoningTokens = &reason
+	}
+	return out
 }
 
 func textOf(evt *event.Event) (string, bool, bool) {

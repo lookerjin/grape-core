@@ -360,14 +360,21 @@ func (r *Registry) resolve(ctx context.Context, scope Scope, ref Ref, background
 		if q.URL.Scheme != u.Scheme || !strings.EqualFold(q.URL.Host, u.Host) || q.URL.User != nil {
 			return nil, errors.New("credential target mismatch")
 		}
+		q = q.Clone(q.Context())
 		if c.Method == "oauth" {
 			base := strings.TrimRight(u.EscapedPath(), "/")
 			p := q.URL.EscapedPath()
-			if !(q.Method == "POST" && p == base+"/chat/completions" || q.Method == "GET" && p == base+"/models") {
+			adapter := r.oauth[c.Provider.ID]
+			routes := adapter.inferenceRoutes()
+			switch {
+			case q.Method == "POST" && p == base+adapter.nativeGeneratePath():
+				q.URL.Path = strings.TrimRight(u.Path, "/") + routes.Generate
+				q.URL.RawPath = ""
+			case q.Method == "GET" && p == base+routes.Models:
+			default:
 				return nil, errors.New("request outside OAuth inference scope")
 			}
 		}
-		q = q.Clone(q.Context())
 		for _, name := range []string{"Authorization", "X-Api-Key", "X-Goog-Api-Key", "Cookie", "OpenAI-Project", "OpenAI-Organization"} {
 			q.Header.Del(name)
 		}
@@ -375,7 +382,9 @@ func (r *Registry) resolve(ctx context.Context, scope Scope, ref Ref, background
 		case Chat:
 			q.Header.Set("Authorization", "Bearer "+key)
 		case Messages:
-			q.Header.Set("X-Api-Key", key)
+			if c.Method != "oauth" {
+				q.Header.Set("X-Api-Key", key)
+			}
 		case Gemini:
 			q.Header.Set("X-Goog-Api-Key", key)
 		}

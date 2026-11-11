@@ -21,11 +21,12 @@ import (
 
 // countingModel counts GenerateContent calls without changing behavior.
 type countingModel struct {
-	inner  model.Model
-	calls  atomic.Int64
-	owner  string
-	caps   *agent.ModelInfo
-	shared *atomic.Int64
+	reasoning *model.GenerationConfigPatch
+	inner     model.Model
+	calls     atomic.Int64
+	owner     string
+	caps      *agent.ModelInfo
+	shared    *atomic.Int64
 }
 
 func (m *countingModel) GenerateContent(ctx context.Context, req *model.Request) (<-chan *model.Response, error) {
@@ -42,6 +43,11 @@ func (m *countingModel) GenerateContent(ctx context.Context, req *model.Request)
 		return nil, err
 	}
 	req = checked
+	if m.reasoning != nil {
+		copyReq := *req
+		copyReq.GenerationConfig = model.ApplyGenerationConfigPatch(req.GenerationConfig, *m.reasoning)
+		req = &copyReq
+	}
 	stateFrom(ctx).noteProjection(ctx, m.Info(), req)
 	return m.inner.GenerateContent(ctx, req)
 }

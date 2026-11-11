@@ -166,6 +166,10 @@ func (h *TaskHost) Start(req agent.RunRequest) (agent.Task, error) {
 		}
 		req.ModelRef = &ref
 	}
+	if req.Reasoning != nil {
+		opt := *req.Reasoning
+		req.Reasoning = &opt
+	}
 	if req.ModelRef != nil {
 		ref := *req.ModelRef
 		req.ModelRef = &ref

@@ -108,3 +108,10 @@ func contains(s, sub string) bool {
 		return false
 	})()))
 }
+
+func TestUsageDetailsPreserveUnknown(t *testing.T) {
+	u := publicUsage(&model.Usage{TotalTokens: 111, PromptTokensDetails: model.PromptTokensDetails{CachedTokens: 12}, CompletionTokensDetails: model.CompletionTokensDetails{ReasoningTokens: 3}})
+	if u.Source != "provider" || *u.CacheReadTokens != 12 || *u.ReasoningTokens != 3 || u.CacheWriteTokens != nil {
+		t.Fatal(u)
+	}
+}

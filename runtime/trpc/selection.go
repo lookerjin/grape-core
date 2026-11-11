@@ -60,6 +60,7 @@ func (rt *Runtime) selectModel(ctx context.Context, q agent.RunRequest) (model.M
 		if e != nil {
 			return nil, caps, "", e
 		}
+		caps = rt.modelInfo(m.Info())
 		return &countingModel{inner: m, shared: &rt.model.calls}, caps, k, nil
 	}
 	if rt.registry == nil || rt.fixed != nil || rt.injectedModel || q.ModelName != "" {

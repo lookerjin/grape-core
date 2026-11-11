@@ -740,6 +740,18 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		unlock()
 		return nil, err
 	}
+	if req.Reasoning != nil && *req.Reasoning != (agent.ReasoningOptions{}) {
+		m, ok := selected.(*countingModel)
+		if !ok {
+			unlock()
+			return nil, agent.Invalid("reasoning", fmt.Errorf("requires a Core-managed model"))
+		}
+		m.reasoning, err = reasoningPatch(caps, *req.Reasoning, rt.cfg.Model.Generation.MaxTokens)
+		if err != nil {
+			unlock()
+			return nil, err
+		}
+	}
 	owner := ""
 	if req.ModelRef != nil {
 		owner = req.ModelRef.ConnectionID

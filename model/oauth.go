@@ -23,6 +23,7 @@ import (
 
 // OAuthProvider binds a registered product client to its authorized inference service.
 type OAuthProvider struct {
+	routes          InferenceRoutes
 	provider        Provider
 	config          oauth2.Config
 	requiredScope   string
@@ -50,8 +51,12 @@ func (p OAuthProvider) validate(local bool) error {
 	if (p.issuer != "" || p.jwksURL != "" || hasScope(strings.Join(p.config.Scopes, " "), "openid")) && (!validEndpoint(p.issuer, local) || !validEndpoint(p.jwksURL, local)) {
 		return errors.New("openid scope requires a trusted issuer and signing keys endpoint")
 	}
-	if p.provider.ID == "" || p.provider.Protocol != Chat || p.config.ClientID == "" || p.requiredScope == "" || !hasScope(strings.Join(p.config.Scopes, " "), p.requiredScope) {
+	if p.provider.ID == "" || (p.provider.Protocol != Chat && p.provider.Protocol != Messages) || p.config.ClientID == "" || p.requiredScope == "" || !hasScope(strings.Join(p.config.Scopes, " "), p.requiredScope) {
 		return errors.New("invalid OAuth registration or requested scope")
+	}
+	routes := p.inferenceRoutes()
+	if !validRoute(routes.Generate) || !validRoute(routes.Models) || routes.Generate == routes.Models {
+		return errors.New("invalid OAuth inference routes")
 	}
 	endpoints := []string{p.provider.Endpoint, p.identityURL, p.config.Endpoint.AuthURL, p.config.Endpoint.TokenURL}
 	if p.config.Endpoint.DeviceAuthURL != "" {
@@ -65,7 +70,12 @@ func (p OAuthProvider) validate(local bool) error {
 	return nil
 }
 func (p OAuthProvider) registration() string {
-	b, _ := json.Marshal([]string{p.provider.ID, p.provider.Endpoint, p.config.ClientID, p.config.Endpoint.AuthURL, p.config.Endpoint.TokenURL, p.identityURL, p.issuer, p.jwksURL, p.requiredScope})
+	ids := []string{p.provider.ID, p.provider.Endpoint, p.config.ClientID, p.config.Endpoint.AuthURL, p.config.Endpoint.TokenURL, p.identityURL, p.issuer, p.jwksURL, p.requiredScope}
+	if p.provider.Protocol != Chat || p.routes.Generate != "" || p.routes.Models != "" {
+		r := p.inferenceRoutes()
+		ids = append(ids, string(p.provider.Protocol), r.Generate, r.Models)
+	}
+	b, _ := json.Marshal(ids)
 	return fmt.Sprintf("%x", sha256.Sum256(b))
 }
 
