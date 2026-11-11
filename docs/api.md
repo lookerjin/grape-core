@@ -15,7 +15,7 @@ run, err := rt.Start(ctx, agent.RunRequest{
 })
 for evt := range run.Events() {
     // evt.Kind is text_delta, text, tool_start, tool_end,
-    // permission_request, completed, failed, cancelled, or raw.
+    // permission_request, artifact, structured_output, completed, failed, cancelled, or raw.
 }
 ```
 
@@ -43,7 +43,7 @@ Approvals are `agent.ApprovalRequest` values delivered to an `agent.Decider`. Th
 
 Sessions are tRPC SQLite sessions. `ListSessions` and `DeleteSession` return grape-core structs, not tRPC sessions. Re-open the same database path to continue a session.
 
-Use `rt.SessionHistory(ctx, userID, sessionID, eventLimit)` (or `agent.SessionHistoryReader`) to read the stored conversation in chronological order. The runtime scopes the query to its app name and the supplied user. A missing session returns `agent.ErrSession`. A positive limit selects recent persisted events before projecting messages, so the returned message count can differ. Zero uses the SQLite service limit. The projection includes text and tool calls/results, masks configured secrets, and omits streaming partials, runner metadata, reasoning and binary attachments.
+Use `rt.SessionHistory(ctx, userID, sessionID, eventLimit)` (or `agent.SessionHistoryReader`) to read the stored conversation in chronological order. The runtime scopes the query to its app name and the supplied user. A missing session returns `agent.ErrSession`. A positive limit selects recent persisted events before projecting messages, so the returned message count can differ. Zero uses the SQLite service limit. The projection includes text and tool calls/results, masks configured secrets, and includes attachment metadata and references, and omits streaming partials, runner metadata, reasoning and raw attachment bytes.
 
 Model context settings apply to the root and Core-built child agents. `context.max_history_messages` maps to tRPC's `WithMaxHistoryRuns`, which counts projected messages and can drop orphaned tool results at the boundary. Zero keeps the available history. `context.compaction: true` activates native prompt-side compaction for oversized historical tool results. Add a positive `context.oversized_tool_result_tokens` to also shorten oversized current results. By default compaction is off. Neither setting rewrites the stored conversation or starts a summarization model call.
 
@@ -51,6 +51,32 @@ Model keys come from `model.api_key_env`. `gemini` selects the Gemini Developer 
 
 Errors wrap the sentinels in `agent`: `ErrInvalidConfig`, `ErrPermissionDenied`, `ErrSandboxUnavailable`, `ErrRunCancelled`, `ErrModel`, `ErrTool`, `ErrSession`, and `ErrPlugin`.
 
+
+
+### Attachments, structured responses and artifacts
+
+An embedding application can pass the following request to `rt.Start`, or pass it to `StartCommand` with an empty Message. Read `handle.Events()` through closure and check `handle.Status()`. `agent.EventStructured` carries the validated JSON value directly in `event.Payload`. A tool save emits `agent.EventArtifact` with name, version, size and MIME.
+
+```go
+req := agent.RunRequest{
+    UserID: userID, SessionID: sessionID, AgentID: "analyst",
+    Message: "Describe this image and the attached report.",
+    Attachments: []agent.Attachment{
+        {Kind: "image", MIME: "image/png", Data: pngBytes},
+        {Kind: "file", Name: "report.pdf", MIME: "application/pdf", FileID: providerFileID},
+    },
+    Output: &agent.OutputSchema{Name: "report", Strict: true, Schema: json.RawMessage(
+        `{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}`)},
+}
+handle, err := rt.Start(ctx, req)
+```
+
+* Attach inline PNG, JPEG, GIF or WebP images, or named files. Limits per turn are 16 attachments, 8 MiB per inline part and 16 MiB total. Inline image MIME must match the bytes. Native image parts have no display name. The SDK accepts data supplied by the caller and OpenAI-style uploaded file IDs (`file-...`). Paths and arbitrary URLs are outside this input protocol. The SDK opens no user-supplied path and fetches no URL.
+* SQLite retains the original input with the user event. `SessionHistory` returns attachment metadata and scoped references. `rt.ReadAttachment(ctx, userID, sessionID, ref)` reads the single anchor event and returns bytes or the original provider file ID. Inline data survives a runtime restart with the same database until its event expires or the session is deleted. Provider IDs retain the provider's account and expiry rules. The SDK does not download or renew them.
+* Built-in multipart adapters are OpenAI, OpenAI-compatible, Gemini and Anthropic. Provider IDs are supported by the OpenAI protocol. Anthropic inline documents are restricted to PDF and plain text. Known provider-specific variants selected by the adapter URL also use their restricted capability set. The remote model must accept the requested content and MIME. For injected models, the embedder supplies the capabilities. Input errors are returned by Start and endpoint rejections are reported by the run.
+* For structured output the runtime passes the object or array schema to tRPC's per-run JSON Schema option. Tools keep their normal execution path. OpenAI, compatible endpoints and Gemini have native schema request fields. Specific models and gateways can differ in enforcement. Strict is forwarded to the adapter. Grape validates the upstream parsed value locally before emitting the structured event. An unrecovered terminal provider API or stream error fails the run, including when the native runner drops that error from its completion event. A missing or invalid value fails an otherwise successful run. Cancellation and budget stops retain their own terminal reason. Schemas have a 64 KiB limit, support local references, and cannot load external schemas. tRPC parses untyped numbers as float64. Represent high-precision identifiers as strings.
+* Inject the caller-owned native backend in `trpcruntime.Options{ArtifactService: service}`. The service can be in-memory, S3, COS or another implementation. `store, err := rt.Artifacts(userID, sessionID)` binds the scope to the runtime app and those IDs. Authenticate the user before supplying these IDs. Use `store.Save(ctx, name, mime, data)`, `store.List(ctx)`, `store.Versions(ctx, name)`, `store.Read(ctx, name, &version)` (nil selects latest) and `store.Delete(ctx, name)` (all revisions). A registered tool uses `trpcruntime.ArtifactsFromContext(ctx)` or native callback artifact methods on its invocation. Installation does not expose a model-facing storage tool.
+* Names and scope IDs must be single path segments. The native shared user namespace and reserved session ID `user` are unavailable through this API. The embedding application owns deletion and backend shutdown. Deleting a conversation does not delete its separately stored artifacts. In-memory content lives with its service instance. A new runtime using the same persistent backend, app, user and session can read pinned revisions. Concurrent writers to one S3 artifact must coordinate externally, since the upstream S3 backend allocates versions by listing existing revisions.
 
 ### Current capability matrix
 
@@ -63,7 +89,7 @@ Errors wrap the sentinels in `agent`: `ErrInvalidConfig`, `ErrPermissionDenied`,
 | Goal promise marker | Unsupported | The old default marker is accepted for config compatibility. Custom markers previously had no effect and now fail validation. Use update_goal to change objective status. |
 | TaskHost | Implemented | One host per runtime. Repeated construction shares it. Closing stops new work and cancels active work. On restart, unfinished records become interrupted. Use a dedicated data directory per active task writer. Native in-process TaskRun v1.12.0 calls Runner.Run directly and defaults to a separate child session. Its RunOptions and RunContext extension points can carry policy and state explicitly, but direct delegation omits Grape's per-run state, permission policy, same-session lock and drain handling. TaskHost continues to enter through Runtime.Start. Cross-process ownership and automatic resume are unsupported. |
 | Skills, Rules, MCP, Hooks | Implemented | Rules feed instructions. Knowledge-only is the default. Executable Skills require a supported selected executor. Config grants gate plugin hooks and MCP launch. Fenced model output never selects an executor. |
-| Plugin agent and command Markdown | Discovery only | The resolved snapshot lists these components. Product code can interpret them. Installing a plugin does not register executable agents or commands. |
+| Plugin agents and commands | Implemented | Definitions from enabled plugins feed named runner factories and explicit StartCommand calls. See [plugin definitions](plugins.md). |
 | Memory and Evolution | Implemented, opt-in | Markdown recall and tRPC Evolution with a human gate. The embedder can supply a reviewer. |
 | Sandbox | Platform dependent | Managed commands require a successful preflight including exit status. Windows managed execution and external Skill executors are unsupported. See [sandbox boundaries](sandbox.md). |
 | Product interfaces | Outside the SDK | TUI, Desktop, Web and service policies are independent consumers. |
