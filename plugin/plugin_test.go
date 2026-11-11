@@ -272,7 +272,7 @@ func TestPluginComponentNamesDoNotCollide(t *testing.T) {
 	if !sawAlpha || !sawBeta {
 		t.Fatalf("components %#v", resolved.Components)
 	}
-	if len(resolved.DiscoveryOnly) != 2 || resolved.DiscoveryOnly[0] != KindCommand || resolved.DiscoveryOnly[1] != KindAgent {
+	if len(resolved.DiscoveryOnly) != 0 {
 		t.Fatalf("discovery %#v", resolved.DiscoveryOnly)
 	}
 }
@@ -296,4 +296,19 @@ func runOut(t *testing.T, dir, name string, args ...string) string {
 		t.Fatalf("%s: %v\n%s", name, err, out)
 	}
 	return string(out)
+}
+
+func TestCommandWholeArgumentsAreLiteral(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "find.md")
+	if err := os.WriteFile(path, []byte("---\nargument-hint: query\n---\nFind $ARGUMENTS."), 0644); err != nil {
+		t.Fatal(err)
+	}
+	d, err := ParseDefinition(Component{Kind: KindCommand, Name: "find", Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.Render(map[string]string{"ARGUMENTS": "{{unexpanded}}"})
+	if err != nil || got != "Find {{unexpanded}}." || d.ArgumentHint != "query" {
+		t.Fatalf("render %q hint %q: %v", got, d.ArgumentHint, err)
+	}
 }

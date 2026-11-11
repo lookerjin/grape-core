@@ -22,10 +22,11 @@ import (
 	"github.com/lookerjin/grape-core/plugin"
 	"github.com/lookerjin/grape-core/rules"
 	"github.com/lookerjin/grape-core/sandbox"
+	_ "github.com/mattn/go-sqlite3"
 	trpcagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/extension/goal"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-
+	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/evolution"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -37,8 +38,6 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 const defaultAppName = "grape-core"
@@ -63,6 +62,7 @@ type SubagentSpec struct {
 // Options configures a Runtime. Model, when set, replaces the configured
 // provider. Tests and the offline example inject a mock model here.
 type Options struct {
+	ArtifactService         artifact.Service
 	Config                  *config.Config
 	Model                   model.Model
 	DataDir                 string
@@ -76,6 +76,8 @@ type Options struct {
 	Platform      string
 	External      sandbox.Backend
 	PluginManager *plugin.Manager
+	// PluginTools grants named, policy-checked tools to each "plugin/agent" key.
+	PluginTools map[string][]ToolSpec
 	// FixedAgent replaces the grape agent. The caller controls that
 	// agent's tools, executor, and any calls it makes itself. The run
 	// policy is still attached for framework-scheduled tool calls.
@@ -112,37 +114,41 @@ type Options struct {
 // It owns the SQLite session service it opens. Close releases that database
 // and the runner. A caller-supplied model is not closed.
 type Runtime struct {
-	cfg          config.Config
-	appName      string
-	runner       runner.Runner
-	sessions     *sqlitesession.Service
-	counter      *countingModel
-	model        model.Model
-	exec         *commandExecutor
-	tools        []tool.Tool
-	specs        []ToolSpec
-	skillRoots   []string
-	ruleText     string
-	ruleSources  []rules.Source
-	globalRules  string
-	hookRunner   *hooks.Runner
-	pluginHooks  []hooks.Spec
-	mcpServers   []mcp.Server
-	resolved     plugin.Resolved
-	fixed        trpcagent.Agent
-	subagents    []SubagentSpec
-	trustedTools []tool.Tool
-	evolution    evolution.Service
-	mcpSets      []tool.ToolSet
-	mcpStatus    []mcp.Status
-	decider      agent.Decider
-	grantedHooks []hooks.Spec
-	reject       bool
-	journal      *journal.Writer
-	secrets      []string
-	maxField     int
-	instruction  string
-	nested       map[string]map[string]struct{}
+	artifacts     artifact.Service
+	cfg           config.Config
+	appName       string
+	runner        runner.Runner
+	sessions      *sqlitesession.Service
+	injectedModel bool
+	counter       *countingModel
+	model         model.Model
+	exec          *commandExecutor
+	tools         []tool.Tool
+	specs         []ToolSpec
+	skillRoots    []string
+	ruleText      string
+	ruleSources   []rules.Source
+	globalRules   string
+	hookRunner    *hooks.Runner
+	pluginHooks   []hooks.Spec
+	mcpServers    []mcp.Server
+	resolved      plugin.Resolved
+	definitions   []plugin.Definition
+	pluginTools   map[string][]tool.Tool
+	fixed         trpcagent.Agent
+	subagents     []SubagentSpec
+	trustedTools  []tool.Tool
+	evolution     evolution.Service
+	mcpSets       []tool.ToolSet
+	mcpStatus     []mcp.Status
+	decider       agent.Decider
+	grantedHooks  []hooks.Spec
+	reject        bool
+	journal       *journal.Writer
+	secrets       []string
+	maxField      int
+	instruction   string
+	nested        map[string]map[string]struct{}
 
 	mu    sync.Mutex
 	locks map[sessionKey]*countedLock
@@ -218,25 +224,27 @@ func New(opts Options) (*Runtime, error) {
 		appName = defaultAppName
 	}
 	rt := &Runtime{
-		cfg:          cfg,
-		appName:      appName,
-		sessions:     sessions,
-		counter:      counter,
-		model:        mdl,
-		exec:         newCommandExecutor(cfg, filepath.Join(os.TempDir(), "grape-core-sandbox"), dataDir, opts.Platform, opts.External),
-		tools:        append([]tool.Tool(nil), opts.Tools...),
-		specs:        append([]ToolSpec(nil), opts.ToolSpecs...),
-		decider:      opts.Decider,
-		grantedHooks: append([]hooks.Spec(nil), opts.Hooks...),
-		reject:       opts.RejectConcurrentSession,
-		secrets:      secretValues(cfg),
-		maxField:     cfg.Journal.MaxFieldBytes,
-		instruction:  instruction,
-		locks:        map[sessionKey]*countedLock{},
-		holds:        map[sessionKey]*sessionHold{},
-		fixed:        opts.FixedAgent,
-		subagents:    cloneSpecs(opts.Subagents),
-		nested:       nestedReadIndex(opts.NestedReads),
+		cfg:           cfg,
+		artifacts:     opts.ArtifactService,
+		appName:       appName,
+		sessions:      sessions,
+		counter:       counter,
+		injectedModel: opts.Model != nil,
+		model:         mdl,
+		exec:          newCommandExecutor(cfg, filepath.Join(os.TempDir(), "grape-core-sandbox"), dataDir, opts.Platform, opts.External),
+		tools:         append([]tool.Tool(nil), opts.Tools...),
+		specs:         append([]ToolSpec(nil), opts.ToolSpecs...),
+		decider:       opts.Decider,
+		grantedHooks:  append([]hooks.Spec(nil), opts.Hooks...),
+		reject:        opts.RejectConcurrentSession,
+		secrets:       secretValues(cfg),
+		maxField:      cfg.Journal.MaxFieldBytes,
+		instruction:   instruction,
+		locks:         map[sessionKey]*countedLock{},
+		holds:         map[sessionKey]*sessionHold{},
+		fixed:         opts.FixedAgent,
+		subagents:     cloneSpecs(opts.Subagents),
+		nested:        nestedReadIndex(opts.NestedReads),
 	}
 	if err := rt.prepareSurface(opts.TrustedAgents); err != nil {
 		_ = sessions.Close()
@@ -257,7 +265,7 @@ func New(opts Options) (*Runtime, error) {
 		}
 		rt.evolution = evolution.NewService(mdl, eopts...)
 	}
-	if err := rt.collectExtensions(opts.PluginManager, dataDir); err != nil {
+	if err := rt.collectExtensions(opts.PluginManager, dataDir, opts.PluginTools); err != nil {
 		_ = sessions.Close()
 		return nil, err
 	}
@@ -266,6 +274,22 @@ func New(opts Options) (*Runtime, error) {
 		// toolcallid canonicalizes tool call ids. llmflow already fills an
 		// empty response id before these callbacks run.
 		runner.WithPlugins(&hookPlugin{rt: rt}, toolcallid.New()),
+	}
+	for _, d := range rt.definitions {
+		if d.Kind != plugin.KindAgent {
+			continue
+		}
+		runnerOpts = append(runnerOpts, runner.WithAgentFactory(d.Name, func(ctx context.Context, ro trpcagent.RunOptions) (trpcagent.Agent, error) {
+			ws, _ := ro.RuntimeState["workspace"].(string)
+			options, err := rt.executionOptions(ws, d.Instruction, rt.model, rt.pluginTools[d.Name], false)
+			if err != nil {
+				return nil, err
+			}
+			return llmagent.New(d.Name, append(options, llmagent.WithDescription(d.Description))...), nil
+		}))
+	}
+	if rt.artifacts != nil {
+		runnerOpts = append(runnerOpts, runner.WithArtifactService(runnerArtifacts{}))
 	}
 	if rt.evolution != nil {
 		runnerOpts = append(runnerOpts, runner.WithEvolutionService(rt.evolution))
@@ -335,7 +359,7 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	if text, err := rt.ruleTextFor(ws); err == nil && text != "" {
 		instruction += "\n\nRules:\n" + text
 	}
-	opts, err := rt.executionOptions(ws, instruction, rt.model, tools)
+	opts, err := rt.executionOptions(ws, instruction, rt.model, tools, true)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +375,7 @@ func (rt *Runtime) agentFactory(ctx context.Context, ro trpcagent.RunOptions) (t
 	return llmagent.New(rootAgentName, opts...), nil
 }
 
-func (rt *Runtime) executionOptions(ws, instruction string, mdl model.Model, tools []tool.Tool) ([]llmagent.Option, error) {
+func (rt *Runtime) executionOptions(ws, instruction string, mdl model.Model, tools []tool.Tool, skillsEnabled bool) ([]llmagent.Option, error) {
 	if mdl == nil {
 		mdl = rt.model
 	}
@@ -369,6 +393,9 @@ func (rt *Runtime) executionOptions(ws, instruction string, mdl model.Model, too
 		llmagent.WithMaxLLMCalls(positiveLimit(rt.cfg.Context.MaxLLMCalls)),
 		llmagent.WithMaxToolIterations(positiveLimit(rt.cfg.Context.MaxToolIterations)),
 		llmagent.WithTools(tools),
+	}
+	if !skillsEnabled {
+		return opts, nil
 	}
 	repo, err := rt.skillRepository()
 	if err != nil {
@@ -408,7 +435,7 @@ func (rt *Runtime) buildSubagent(spec SubagentSpec, ws string) (tool.Tool, error
 		}
 		tools = append(tools, nested)
 	}
-	opts, err := rt.executionOptions(ws, spec.Instruction, spec.Model, tools)
+	opts, err := rt.executionOptions(ws, spec.Instruction, spec.Model, tools, true)
 	if err != nil {
 		return nil, err
 	}
@@ -605,7 +632,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 	if req.UserID == "" || req.SessionID == "" {
 		return nil, agent.Invalid("run", fmt.Errorf("user_id and session_id are required"))
 	}
-	if req.Message == "" {
+	if req.Message == "" && len(req.Attachments) == 0 {
 		return nil, agent.Invalid("run", fmt.Errorf("message is required"))
 	}
 	if req.Mode == "" {
@@ -638,9 +665,29 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		unlock()
 		return nil, agent.Invalid("workspace", err)
 	}
+	input, err := rt.inputMessage(req)
+	if err != nil {
+		unlock()
+		return nil, agent.Invalid("attachments", err)
+	}
+	schema, output, err := rt.outputOption(req.Output)
+	if err != nil {
+		unlock()
+		return nil, agent.Invalid("output", err)
+	}
 	runID := uuid.NewString()
 	runCtx, cancel := context.WithCancel(ctx)
 	st := newRunState(runID, req.SessionID, req.Mode)
+	st.outputSchema = schema
+	if rt.artifacts != nil {
+		store, e := rt.Artifacts(req.UserID, req.SessionID)
+		if e != nil {
+			cancel()
+			unlock()
+			return nil, e
+		}
+		runCtx = context.WithValue(runCtx, artifactScopeKey{}, store)
+	}
 	runCtx = withState(runCtx, st)
 	runCtx = context.WithValue(runCtx, workspaceKey{}, workspace)
 	runOpts := []trpcagent.RunOption{
@@ -648,8 +695,12 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		trpcagent.WithToolPermissionPolicyFunc(rt.toolPermission),
 		trpcagent.WithRuntimeState(map[string]any{
 			"workspace": workspace,
-			"mode":      string(req.Mode),
+
+			"mode": string(req.Mode),
 		}),
+	}
+	if output != nil {
+		runOpts = append(runOpts, output)
 	}
 	if req.AgentID != "" {
 		// tRPC resolves the name. An unknown name is an error from the
@@ -660,7 +711,7 @@ func (rt *Runtime) Start(ctx context.Context, req agent.RunRequest) (agent.RunHa
 		runCtx,
 		req.UserID,
 		req.SessionID,
-		model.NewUserMessage(req.Message),
+		input,
 		runOpts...,
 	)
 	if err != nil {
@@ -712,7 +763,15 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 	defer rt.finishSession(req.UserID, req.SessionID, runID, st, unlock)
 	defer out.close()
 	conv := newConverter(runID, req.SessionID, rt.maxField, rt.secrets)
+	conv.schema = st.outputSchema
+	conv.outputAuthor = rootAgentName
+	if req.AgentID != "" {
+		conv.outputAuthor = req.AgentID
+	} else if rt.fixed != nil {
+		conv.outputAuthor = rt.fixed.Info().Name
+	}
 	terminal := false
+	var providerFailure *model.ResponseError
 	emit := func(evt agent.Event) {
 		if evt.RunID == "" {
 			evt.RunID = runID
@@ -727,6 +786,14 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 				Status: string(agent.EventCancelled),
 				Error:  ctx.Err().Error(),
 			})
+		}
+		if evt.Kind == agent.EventCompleted && providerFailure != nil {
+			evt.Kind = agent.EventFailed
+			evt.Payload = agent.MustPayload(agent.TerminalPayload{Status: string(evt.Kind), Reason: agent.ReasonError, Error: conv.clean(providerFailure.Message)})
+		}
+		if evt.Kind == agent.EventCompleted && conv.schema != nil && !conv.validOutput {
+			evt.Kind = agent.EventFailed
+			evt.Payload = agent.MustPayload(agent.TerminalPayload{Status: string(evt.Kind), Reason: agent.ReasonError, Error: "missing, schema-invalid or redacted structured output"})
 		}
 		if evt.Terminal() {
 			if h != nil {
@@ -769,6 +836,14 @@ func (rt *Runtime) forward(ctx context.Context, req agent.RunRequest, runID stri
 				continue
 			}
 			rt.observeLimit(st, evt)
+			if evt != nil && evt.Response != nil && evt.InvocationID == st.rootInvocation() && !evt.IsRunnerCompletion() {
+				if evt.Done && evt.Error != nil && (evt.Error.Type == model.ErrorTypeAPIError || evt.Error.Type == model.ErrorTypeStreamError) {
+					providerFailure = evt.Error
+				}
+				if evt.Error == nil && evt.IsFinalResponse() && len(evt.Choices) > 0 {
+					providerFailure = nil
+				}
+			}
 			if ctx.Err() != nil {
 				conv.closeStatus = "cancelled"
 			}

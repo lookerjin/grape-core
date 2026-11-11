@@ -24,12 +24,14 @@ const (
 // RunRequest starts one turn. UserID and SessionID identify the session.
 // RunID is assigned by the runtime and is not part of the request.
 type RunRequest struct {
-	UserID    string `json:"user_id"`
-	SessionID string `json:"session_id"`
-	Workspace string `json:"workspace,omitempty"`
-	Message   string `json:"message"`
-	Mode      Mode   `json:"mode,omitempty"`
-	AgentID   string `json:"agent_id,omitempty"`
+	Attachments []Attachment  `json:"attachments,omitempty"`
+	Output      *OutputSchema `json:"output,omitempty"`
+	UserID      string        `json:"user_id"`
+	SessionID   string        `json:"session_id"`
+	Workspace   string        `json:"workspace,omitempty"`
+	Message     string        `json:"message"`
+	Mode        Mode          `json:"mode,omitempty"`
+	AgentID     string        `json:"agent_id,omitempty"`
 }
 
 // RunHandle is the handle for an in-flight run.
@@ -102,14 +104,15 @@ type SessionHistoryReader interface {
 
 // HistoryMessage is a persisted conversation message in chronological order.
 type HistoryMessage struct {
-	EventID   string            `json:"event_id"`
-	Time      time.Time         `json:"time"`
-	Author    string            `json:"author,omitempty"`
-	Role      string            `json:"role"`
-	Text      string            `json:"text,omitempty"`
-	ToolID    string            `json:"tool_id,omitempty"`
-	ToolName  string            `json:"tool_name,omitempty"`
-	ToolCalls []HistoryToolCall `json:"tool_calls,omitempty"`
+	Attachments []AttachmentInfo  `json:"attachments,omitempty"`
+	EventID     string            `json:"event_id"`
+	Time        time.Time         `json:"time"`
+	Author      string            `json:"author,omitempty"`
+	Role        string            `json:"role"`
+	Text        string            `json:"text,omitempty"`
+	ToolID      string            `json:"tool_id,omitempty"`
+	ToolName    string            `json:"tool_name,omitempty"`
+	ToolCalls   []HistoryToolCall `json:"tool_calls,omitempty"`
 }
 
 type HistoryToolCall struct {

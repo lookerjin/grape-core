@@ -10,6 +10,7 @@ import (
 type EventKind string
 
 const (
+	EventStructured        EventKind = "structured_output"
 	EventTextDelta         EventKind = "text_delta"
 	EventText              EventKind = "text"
 	EventToolStart         EventKind = "tool_start"

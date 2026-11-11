@@ -1,11 +1,13 @@
 package trpcruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -131,6 +133,16 @@ func (h *TaskHost) clearCancel(id string) {
 
 // Start launches req on a host-owned context and returns immediately.
 func (h *TaskHost) Start(req agent.RunRequest) (agent.Task, error) {
+	// Start runs asynchronously. Retain no caller-owned attachment or schema buffers.
+	req.Attachments = slices.Clone(req.Attachments)
+	for i := range req.Attachments {
+		req.Attachments[i].Data = bytes.Clone(req.Attachments[i].Data)
+	}
+	if req.Output != nil {
+		output := *req.Output
+		output.Schema = bytes.Clone(output.Schema)
+		req.Output = &output
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	task := agent.Task{
 		ID:        uuid.NewString(),

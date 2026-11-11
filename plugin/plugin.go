@@ -29,9 +29,10 @@ const (
 
 // Component is one file or directory inside an installed bundle.
 type Component struct {
-	Kind Kind   `json:"kind"`
-	Name string `json:"name"`
-	Path string `json:"path"`
+	Plugin string `json:"plugin,omitempty"` // Owning install, assigned during Resolve.
+	Kind   Kind   `json:"kind"`
+	Name   string `json:"name"`
+	Path   string `json:"path"`
 }
 
 // Manifest is the supported subset of a Claude-style plugin.json.
@@ -61,8 +62,7 @@ type Record struct {
 type Resolved struct {
 	Plugins    []Record
 	Components []Component
-	// DiscoveryOnly kinds are listed in Components and are not assembled
-	// into the agent. command and agent are discovery-only.
+	// Deprecated: retained for source compatibility.
 	DiscoveryOnly []Kind
 }
 
@@ -201,6 +201,7 @@ func Resolve(records []Record, policy string) (Resolved, error) {
 			return comps[i].Kind < comps[j].Kind
 		})
 		for _, comp := range comps {
+			comp.Plugin = rec.Name
 			key := string(comp.Kind) + "\x00" + comp.Name
 			prev, ok := seen[key]
 			if !ok {
@@ -232,9 +233,8 @@ func Resolve(records []Record, policy string) (Resolved, error) {
 		return components[i].Kind < components[j].Kind
 	})
 	return Resolved{
-		Plugins:       enabled,
-		Components:    components,
-		DiscoveryOnly: []Kind{KindCommand, KindAgent},
+		Plugins:    enabled,
+		Components: components,
 	}, nil
 }
 

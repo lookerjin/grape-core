@@ -1,19 +1,24 @@
 package trpcruntime
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
+	"github.com/lookerjin/grape-core/agent"
 	"github.com/lookerjin/grape-core/config"
 	"github.com/lookerjin/grape-core/hooks"
 	"github.com/lookerjin/grape-core/mcp"
 	"github.com/lookerjin/grape-core/plugin"
 	"github.com/lookerjin/grape-core/rules"
 	trpcskill "trpc.group/trpc-go/trpc-agent-go/skill"
+	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
-func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error {
+func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string, grants map[string][]ToolSpec) error {
 	configured, err := serversFromConfig(rt.cfg)
 	if err != nil {
 		return err
@@ -37,7 +42,7 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 				allow[name] = true
 			}
 			for i := range records {
-				records[i].Enabled = allow[records[i].Name]
+				records[i].Enabled = records[i].Enabled && allow[records[i].Name]
 			}
 		}
 		resolved, err := plugin.Resolve(records, rt.cfg.Plugins.Conflict)
@@ -62,7 +67,16 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 				}
 				hookSpecs = append(hookSpecs, specs...)
 			case plugin.KindCommand, plugin.KindAgent:
-				// Discovery only. There is no command template runner yet.
+				d, err := plugin.ParseDefinition(comp)
+				if err != nil {
+					return fmt.Errorf("%w: %s: %v", agent.ErrPlugin, comp.Name, err)
+				}
+				if d.Kind == plugin.KindAgent {
+					if err := rt.preparePluginAgent(d, grants); err != nil {
+						return err
+					}
+				}
+				rt.definitions = append(rt.definitions, d)
 			case plugin.KindMCP:
 				raw, err := os.ReadFile(comp.Path)
 				if err != nil {
@@ -115,6 +129,40 @@ func (rt *Runtime) collectExtensions(mgr *plugin.Manager, dataDir string) error 
 	return nil
 }
 
+func (rt *Runtime) preparePluginAgent(d plugin.Definition, grants map[string][]ToolSpec) error {
+	if rt.fixed != nil || d.Name == rootAgentName || len(rt.nested[d.Name]) > 0 {
+		return fmt.Errorf("%w: incompatible plugin agent %q", agent.ErrPlugin, d.Name)
+	}
+	for _, s := range rt.subagents {
+		if s.Name == d.Name {
+			return fmt.Errorf("%w: conflicting agent %q", agent.ErrPlugin, d.Name)
+		}
+	}
+	for _, t := range rt.trustedTools {
+		if t.Declaration().Name == d.Name {
+			return fmt.Errorf("%w: conflicting agent %q", agent.ErrPlugin, d.Name)
+		}
+	}
+	if rt.pluginTools == nil {
+		rt.pluginTools = make(map[string][]tool.Tool)
+	}
+	for _, name := range d.Tools {
+		var selected []ToolSpec
+		for _, spec := range grants[d.Plugin+"/"+d.Name] {
+			if spec.Tool != nil && spec.Tool.Declaration() != nil && spec.Tool.Declaration().Name == name && !spec.Trusted {
+				selected = append(selected, spec)
+			}
+		}
+		if len(selected) != 1 {
+			return fmt.Errorf("%w: agent %s requires a unique grant for %s", agent.ErrPlugin, d.Name, name)
+		}
+		if err := prepareTools(nil, selected); err != nil {
+			return err
+		}
+		rt.pluginTools[d.Name] = append(rt.pluginTools[d.Name], selected[0].Tool)
+	}
+	return nil
+}
 func hookAllowed(allow []string, name string) bool {
 	for _, item := range allow {
 		if item == name {
@@ -162,4 +210,38 @@ func (rt *Runtime) MCPServers() []mcp.Server {
 		out[i].Headers = masked
 	}
 	return out
+}
+
+// Definitions lists executable Markdown components from this runtime's snapshot.
+func (rt *Runtime) Definitions() []plugin.Definition {
+	out := slices.Clone(rt.definitions)
+	for i := range out {
+		out[i].Arguments = slices.Clone(out[i].Arguments)
+		out[i].Tools = slices.Clone(out[i].Tools)
+	}
+	return out
+}
+
+// StartCommand renders a named template into an ordinary user turn.
+func (rt *Runtime) StartCommand(ctx context.Context, name string, args map[string]string, req agent.RunRequest) (agent.RunHandle, error) {
+	var command *plugin.Definition
+	for i := range rt.definitions {
+		d := &rt.definitions[i]
+		if d.Kind == plugin.KindCommand && d.Name == name {
+			command = d
+			break
+		}
+	}
+	if command == nil {
+		return nil, fmt.Errorf("%w: unknown command %q", agent.ErrPlugin, name)
+	}
+	if req.Message != "" {
+		return nil, agent.Invalid("command", fmt.Errorf("message supplied twice"))
+	}
+	msg, err := command.Render(args)
+	if err != nil {
+		return nil, agent.Invalid("command", err)
+	}
+	req.Message = msg
+	return rt.Start(ctx, req)
 }

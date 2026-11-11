@@ -1,6 +1,7 @@
 package trpcruntime
 
 import (
+	"bytes"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/lookerjin/grape-core/agent"
 	"github.com/lookerjin/grape-core/internal/redact"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
@@ -15,6 +17,9 @@ import (
 // converter turns one tRPC event stream into grape-core events.
 // Sequence numbers belong to this run only.
 type converter struct {
+	schema       *jsonschema.Schema
+	outputAuthor string
+	validOutput  bool
 	runID        string
 	sessionID    string
 	seenTool     map[string]struct{}
@@ -44,6 +49,16 @@ func newConverter(runID, sessionID string, maxField int, secrets []string) *conv
 func (c *converter) convert(evt *event.Event) []agent.Event {
 	if evt == nil || evt.Response == nil {
 		return nil
+	}
+	if evt.StructuredOutput != nil && c.schema != nil && evt.Author == c.outputAuthor {
+		c.validOutput = c.schema.Validate(evt.StructuredOutput) == nil
+		if c.validOutput {
+			raw, err := json.Marshal(evt.StructuredOutput)
+			if err == nil && !c.containsJSONSecret(raw) {
+				return []agent.Event{c.base(evt, agent.EventStructured, raw)}
+			}
+			c.validOutput = false
+		}
 	}
 	if evt.IsRunnerCompletion() {
 		out := c.closeOpenTools(evt, c.closeStatus)
@@ -88,6 +103,20 @@ func (c *converter) convert(evt *event.Event) []agent.Event {
 		})))
 	}
 	return c.nonEmpty(out)
+}
+
+// JSON may escape a credential (for example '<' or a quotation mark).
+func (c *converter) containsJSONSecret(raw []byte) bool {
+	for _, secret := range c.secrets {
+		if len(secret) < 4 {
+			continue
+		}
+		encoded, _ := json.Marshal(secret)
+		if bytes.Contains(raw, encoded[1:len(encoded)-1]) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *converter) nonEmpty(in []agent.Event) []agent.Event {

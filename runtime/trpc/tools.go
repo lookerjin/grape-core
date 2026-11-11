@@ -11,19 +11,21 @@ import (
 	"github.com/lookerjin/grape-core/agent"
 	"github.com/lookerjin/grape-core/coding"
 	"github.com/lookerjin/grape-core/sandbox"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
 
 type runState struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	events   []agent.Event
-	runID    string
-	session  string
-	mode     agent.Mode
-	tools    int
-	stopping bool
+	outputSchema *jsonschema.Schema
+	mu           sync.Mutex
+	cond         *sync.Cond
+	events       []agent.Event
+	runID        string
+	session      string
+	mode         agent.Mode
+	tools        int
+	stopping     bool
 	// rootInv is the invocation ID captured for the run's root agent.
 	rootInv       string
 	llmCalls      int

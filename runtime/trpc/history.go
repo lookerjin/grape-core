@@ -31,7 +31,7 @@ func (rt *Runtime) SessionHistory(ctx context.Context, userID, sessionID string,
 		if evt.Response == nil || evt.IsPartial || evt.IsRunnerCompletion() {
 			continue
 		}
-		for _, choice := range evt.Choices {
+		for ci, choice := range evt.Choices {
 			msg := choice.Message
 			if msg.Role == "" {
 				continue
@@ -44,6 +44,13 @@ func (rt *Runtime) SessionHistory(ctx context.Context, userID, sessionID string,
 				}
 			}
 			row := agent.HistoryMessage{EventID: evt.ID, Time: evt.Timestamp, Author: clean(evt.Author), Role: string(msg.Role), Text: clean(text.String()), ToolID: clean(msg.ToolID), ToolName: clean(msg.ToolName)}
+			if msg.Role == "user" {
+				for i, p := range msg.ContentParts {
+					if a, ok := attachmentPart(p); ok {
+						row.Attachments = append(row.Attachments, agent.AttachmentInfo{Ref: agent.AttachmentRef{EventID: evt.ID, Choice: ci, Part: i}, Kind: a.Kind, Name: clean(a.Name), MIME: a.MIME, FileID: clean(a.FileID), Size: len(a.Data)})
+					}
+				}
+			}
 			for _, call := range msg.ToolCalls {
 				row.ToolCalls = append(row.ToolCalls, agent.HistoryToolCall{ID: clean(call.ID), Name: clean(call.Function.Name), Arguments: clean(string(call.Function.Arguments))})
 			}
